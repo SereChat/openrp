@@ -1,0 +1,181 @@
+//! Text fields for forms: a group of editors sharing focus, drawn as
+//! bordered boxes, with mouse placement and selection and the usual keys.
+//!
+//! Enter in a single-line field moves to the next field; in a multi-line
+//! one it starts a new line. Tab cycles through the fields.
+
+use arboard::Clipboard;
+use winit::event::KeyEvent;
+use winit::keyboard::{Key, ModifiersState, NamedKey};
+use winit::window::CursorIcon;
+
+use crate::editor::Editor;
+use crate::paint::{Painter, Rect, mix};
+use crate::text::TextLayout;
+use crate::theme;
+use crate::ui::{Ui, edit_key, id, move_line};
+
+/// Space between a field's border and its text.
+pub const FIELD_PAD: (f32, f32) = (12.0, 10.0);
+
+/// `N` text fields, one of them focused.
+pub struct Fields<const N: usize> {
+    editors: [Editor; N],
+    multiline: [bool; N],
+    focus: usize,
+    /// The field a mouse drag is selecting in.
+    selecting: Option<usize>,
+    /// Each field's layout and text origin from the last frame, for the
+    /// arrow keys.
+    layouts: [Option<(TextLayout, (f32, f32))>; N],
+    /// The focused field's caret, for placing the input method's window.
+    caret: Option<Rect>,
+}
+
+impl<const N: usize> Fields<N> {
+    /// Fields holding `editors`, the first focused; `multiline` says which
+    /// take several lines.
+    #[must_use]
+    pub fn new(editors: [Editor; N], multiline: [bool; N]) -> Self {
+        Self { editors, multiline, focus: 0, selecting: None, layouts: std::array::from_fn(|_| None), caret: None }
+    }
+
+    /// The text of field `index`.
+    #[must_use]
+    pub fn text(&self, index: usize) -> &str {
+        self.editors[index].text()
+    }
+
+    /// The editor of field `index`.
+    #[cfg(test)]
+    pub fn editor(&mut self, index: usize) -> &mut Editor {
+        &mut self.editors[index]
+    }
+
+    /// Text committed by an input method goes to the focused field.
+    pub fn insert(&mut self, text: &str) {
+        self.editors[self.focus].insert(text);
+    }
+
+    /// The focused field's caret, for the input method's window.
+    #[must_use]
+    pub fn caret(&self) -> Option<Rect> {
+        self.caret
+    }
+
+    /// Handles an editing key. Returns `false` for keys fields do not use
+    /// (Escape, shortcuts), so the caller may.
+    pub fn key(&mut self, event: &KeyEvent, mods: ModifiersState, cb: &mut Option<Clipboard>) -> bool {
+        let focus = self.focus;
+        match &event.logical_key {
+            Key::Named(NamedKey::Tab) => {
+                self.focus = if mods.shift_key() { (focus + N - 1) % N } else { (focus + 1) % N };
+                true
+            }
+            Key::Named(NamedKey::Enter) if self.multiline[focus] && !mods.control_key() && !mods.super_key() => {
+                self.editors[focus].insert("\n");
+                true
+            }
+            Key::Named(NamedKey::Enter) if focus + 1 < N && !mods.control_key() && !mods.super_key() => {
+                self.focus += 1;
+                true
+            }
+            Key::Named(key @ (NamedKey::ArrowUp | NamedKey::ArrowDown)) if self.multiline[focus] => {
+                if let Some((layout, _)) = &self.layouts[focus] {
+                    move_line(&mut self.editors[focus], layout, *key == NamedKey::ArrowUp, mods.shift_key());
+                }
+                true
+            }
+            _ => edit_key(&mut self.editors[focus], event, mods, cb),
+        }
+    }
+
+    /// Lays out field `index` for a box `width` wide: wrapped when it is
+    /// multi-line.
+    #[must_use]
+    pub fn layout(&self, p: &Painter, index: usize, width: f32) -> TextLayout {
+        let wrap = self.multiline[index].then_some(width - 2.0 * FIELD_PAD.0);
+        p.layout(self.editors[index].text(), theme::BODY, wrap)
+    }
+
+    /// Draws field `index` as a text box in `rect` showing `layout`, and
+    /// lets the mouse focus it, place the caret and select. `interactive`
+    /// is false where the pointer is outside the visible area.
+    #[allow(clippy::too_many_arguments, reason = "field geometry and content; a struct would only rename them")]
+    pub fn draw(&mut self, index: usize, p: &mut Painter, ui: &mut Ui, rect: Rect, layout: TextLayout, placeholder: &str, interactive: bool) {
+        let t = p.theme;
+        let origin = (rect.x + FIELD_PAD.0, rect.y + FIELD_PAD.1);
+        let byte_at = |ui: &Ui| layout.hit(ui.mouse.0 - origin.0, ui.mouse.1 - origin.1);
+        let hovered = interactive && ui.hovered(rect);
+        if hovered {
+            ui.cursor = CursorIcon::Text;
+            if ui.pressed {
+                self.focus = index;
+                self.selecting = Some(index);
+                let byte = byte_at(ui);
+                let editor = &mut self.editors[index];
+                editor.set_cursor(byte, ui.mods.shift_key());
+                if ui.clicks == 2 {
+                    editor.select_word();
+                }
+                ui.last_edit = ui.time;
+            }
+        }
+        if self.selecting == Some(index) {
+            if ui.down && ui.clicks < 2 {
+                let byte = byte_at(ui);
+                self.editors[index].set_cursor(byte, true);
+            } else if !ui.down {
+                self.selecting = None;
+            }
+        }
+
+        let focused = self.focus == index;
+        let focus = ui.anim(id(("field", rect.x.to_bits(), index)), f32::from(u8::from(focused)));
+        p.bordered(rect, t.bg, theme::RADIUS_SM, 1.0, mix(t.border_strong, t.border_focus, focus));
+        let editor = &self.editors[index];
+        let selection = editor.selection();
+        let line_h = layout.line_height();
+        if focused && !selection.is_empty() {
+            for (start, end, y) in layout.line_spans() {
+                let (from, to) = (selection.start.max(start), selection.end.min(end));
+                if from > to || (from == to && selection.end <= end) {
+                    continue;
+                }
+                let x0 = layout.caret(from).0;
+                // A selected line break shows as a small tail.
+                let x1 = if selection.end > end { layout.caret(to).0 + 6.0 } else { layout.caret(to).0 };
+                p.rect(Rect::new(origin.0 + x0, origin.1 + y, x1 - x0, line_h), t.selection, 2.0);
+            }
+        }
+        if editor.text().is_empty() {
+            let hint = p.layout(placeholder, theme::BODY, Some(rect.w - 2.0 * FIELD_PAD.0));
+            p.text(&hint, origin.0, origin.1, t.text_faint);
+        } else {
+            p.text(&layout, origin.0, origin.1, t.text);
+        }
+        if focused {
+            let (x, y) = layout.caret(editor.cursor());
+            self.caret = Some(Rect::new(origin.0 + x, origin.1 + y, 2.0, line_h));
+            if ui.caret_visible() && selection.is_empty() {
+                p.rect(Rect::new(origin.0 + x - 1.0, origin.1 + y + 3.0, 2.0, line_h - 6.0), t.accent, 0.0);
+            }
+        }
+        self.layouts[index] = Some((layout, origin));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn focus_moves_and_text_lands_in_the_focused_field() {
+        let mut fields = Fields::new([Editor::default(), Editor::default()], [false, true]);
+        fields.insert("Gale");
+        fields.focus = 1;
+        fields.insert("A hunter.");
+        assert_eq!((fields.text(0), fields.text(1)), ("Gale", "A hunter."));
+        assert!(fields.caret().is_none(), "no caret before the first draw");
+    }
+}
