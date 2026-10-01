@@ -295,14 +295,7 @@ impl Doc {
             let left = origin.0 + piece.x - self.scroll_of(piece);
             // Scrolled code stays inside its frame.
             let clip = piece.code.map(|(_, window)| p.push_clip(code_window(origin, piece, window)));
-            for (start, end, y) in piece.layout.line_spans() {
-                let (s, e) = (first.max(start), last.min(end));
-                let past_line = last > end || continues;
-                if s > e || (s == e && !past_line) {
-                    continue;
-                }
-                let x0 = piece.layout.caret(s).0;
-                let x1 = piece.layout.caret(e).0 + if past_line && e == end { 6.0 } else { 0.0 };
+            for (x0, x1, y) in piece.layout.selection_spans(first, last, continues) {
                 p.rect(Rect::new(left + x0, origin.1 + piece.y + y, x1 - x0, line_h), color, 2.0);
             }
             if let Some(clip) = clip {

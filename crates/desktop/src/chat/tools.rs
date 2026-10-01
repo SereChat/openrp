@@ -6,7 +6,9 @@
 //!   casts newcomers with a description in the same call (a required
 //!   field: models skip a separate tool far more often). One call can hold
 //!   several speakers, so a scene where three characters react plays out
-//!   in order. A cast member who acts moves into the scene.
+//!   in order. A cast member who acts moves into the scene; those in
+//!   `leave` move out. A non-empty `scene` (required, so the model weighs
+//!   it every turn) sets where the story is now and what it is like there.
 //! * `create_character`: someone joins the story's cast (only the story's:
 //!   the character library is the user's) without acting yet, or a member
 //!   without a description gets one.
@@ -48,6 +50,10 @@ pub fn tool_definitions() -> Vec<(&'static str, &'static str, Value)> {
             json!({
                 "type": "object",
                 "properties": {
+                    "scene": {
+                        "type": "string",
+                        "description": "Only when the scene is not set yet or changes this turn: where the characters are now and what it is like there (place, time of day, mood, weather), e.g. \"Peeta's kitchen, before dawn; warm bread, rain on the windows\". Empty otherwise."
+                    },
                     "introduce": {
                         "type": "array",
                         "description": "Every character in these lines who is not in the cast yet, described: only someone the user refers to, or the first character when no one is in the scene. Usually empty.",
@@ -72,9 +78,14 @@ pub fn tool_definitions() -> Vec<(&'static str, &'static str, Value)> {
                             },
                             "required": ["character", "text"]
                         }
+                    },
+                    "leave": {
+                        "type": "array",
+                        "description": "Cast members who leave the scene this turn: they walk off, or stay behind when the scene moves on. Usually empty.",
+                        "items": { "type": "string" }
                     }
                 },
-                "required": ["introduce", "lines"]
+                "required": ["scene", "introduce", "lines"]
             }),
         ),
         (
@@ -185,9 +196,10 @@ fn speakers(args: &Value) -> impl Iterator<Item = &str> {
     lines.filter_map(|l| l.get("character").and_then(Value::as_str)).map(str::trim).filter(|s| !s.is_empty())
 }
 
-/// Runs `call` in a story with this `cast` (which it may grow or change)
-/// and `player` (the user's character) and returns what the model is told.
-pub fn run(call: &ToolCall, cast: &mut Vec<CastMember>, player: Option<&str>) -> String {
+/// Runs `call` in a story with this `cast` (which it may grow or change),
+/// `scene` (which it may set) and `player` (the user's character) and
+/// returns what the model is told.
+pub fn run(call: &ToolCall, cast: &mut Vec<CastMember>, scene: &mut String, player: Option<&str>) -> String {
     let Ok(args) = serde_json::from_str::<Value>(&call.arguments) else {
         return "Error: the arguments were not valid JSON. Nothing happened; call it again.".to_owned();
     };
@@ -226,6 +238,22 @@ pub fn run(call: &ToolCall, cast: &mut Vec<CastMember>, player: Option<&str>) ->
             }
             if !arrived.is_empty() {
                 notes.push(format!("Moved into the scene: {}.", arrived.join(", ")));
+            }
+            // Leaving comes last: someone may speak, then walk off.
+            let mut left = Vec::new();
+            for name in args.get("leave").and_then(Value::as_array).into_iter().flatten().filter_map(Value::as_str) {
+                if let Some(member) = cast.iter_mut().find(|m| m.present && same(&m.name, name)) {
+                    member.present = false;
+                    left.push(member.name.clone());
+                }
+            }
+            if !left.is_empty() {
+                notes.push(format!("Left the scene: {}.", left.join(", ")));
+            }
+            let new_scene = field(&args, "scene");
+            if !new_scene.trim().is_empty() {
+                new_scene.trim().clone_into(scene);
+                notes.push("Scene set.".to_owned());
             }
             if for_player {
                 notes.push("Never speak or act for the user's character.".to_owned());
@@ -294,6 +322,11 @@ pub fn display<'a>(narration: &str, calls: impl Iterator<Item = (&'a str, &'a st
         let text = |value: &Value, key: &str| value.get(key).and_then(Value::as_str).map(str::trim).unwrap_or_default().to_owned();
         match name {
             SPEAK => {
+                // A new scene first, as it is written: it sets the stage.
+                let scene = plain(&text(&args, "scene"));
+                if !scene.is_empty() {
+                    push(&format!("*{scene}*"));
+                }
                 // Newcomers arrive before they act; announced once complete.
                 if !streaming {
                     for new in args.get("introduce").and_then(Value::as_array).into_iter().flatten() {
@@ -317,6 +350,14 @@ pub fn display<'a>(narration: &str, calls: impl Iterator<Item = (&'a str, &'a st
                         block.push_str(said_line);
                     }
                     push(&block);
+                }
+                if !streaming {
+                    for who in args.get("leave").and_then(Value::as_array).into_iter().flatten().filter_map(Value::as_str) {
+                        let who = plain(who);
+                        if !who.is_empty() {
+                            push(&format!("*{who} leaves the scene.*"));
+                        }
+                    }
                 }
             }
             CREATE_CHARACTER if !streaming => {
@@ -445,22 +486,26 @@ mod tests {
     #[test]
     fn tools_run_against_the_story() {
         let mut cast = vec![member("Katniss", true), member("Haymitch", false)];
-        let created = run(&call(CREATE_CHARACTER, &json!({ "name": "Cato", "description": "A career." })), &mut cast, Some("Gale"));
+        let mut scene = String::new();
+        let created = run(&call(CREATE_CHARACTER, &json!({ "name": "Cato", "description": "A career." })), &mut cast, &mut scene, Some("Gale"));
         assert!(created.contains("Cato joined"));
         assert!(cast.last().is_some_and(|m| m.name == "Cato" && m.present && !m.id.is_empty()));
-        assert!(run(&call(CREATE_CHARACTER, &json!({ "name": "cato", "description": "Again." })), &mut cast, None).contains("already"));
-        assert!(run(&call(CREATE_CHARACTER, &json!({ "name": "Gale", "description": "Me." })), &mut cast, Some("Gale")).contains("user's character"));
+        assert!(run(&call(CREATE_CHARACTER, &json!({ "name": "cato", "description": "Again." })), &mut cast, &mut scene, None).contains("already"));
         assert!(
-            run(&call(CREATE_CHARACTER, &json!({ "name": "Rue", "description": " " })), &mut cast, None).starts_with("Error"),
+            run(&call(CREATE_CHARACTER, &json!({ "name": "Gale", "description": "Me." })), &mut cast, &mut scene, Some("Gale"))
+                .contains("user's character")
+        );
+        assert!(
+            run(&call(CREATE_CHARACTER, &json!({ "name": "Rue", "description": " " })), &mut cast, &mut scene, None).starts_with("Error"),
             "never undescribed"
         );
         assert_eq!(cast.len(), 3);
 
         let lines =
             |who: &[&str]| json!({ "introduce": [], "lines": who.iter().map(|w| json!({ "character": w, "text": "Hi." })).collect::<Vec<_>>() });
-        assert_eq!(run(&call(SPEAK, &lines(&["Katniss", "Cato"])), &mut cast, Some("Gale")), "Spoken.");
+        assert_eq!(run(&call(SPEAK, &lines(&["Katniss", "Cato"])), &mut cast, &mut scene, Some("Gale")), "Spoken.");
         // Acting moves someone into the scene; a stranger is reported, not added.
-        let noted = run(&call(SPEAK, &lines(&["Haymitch", "Rue", "Gale", "Rue"])), &mut cast, Some("Gale"));
+        let noted = run(&call(SPEAK, &lines(&["Haymitch", "Rue", "Gale", "Rue"])), &mut cast, &mut scene, Some("Gale"));
         assert!(noted.contains("Moved into the scene: Haymitch.") && noted.contains("Not in the cast with a description: Rue."));
         assert!(noted.contains("Never speak or act for the user's character."));
         assert!(cast.iter().all(|m| m.present) && !cast.iter().any(|m| m.name == "Rue" || m.name == "Gale"));
@@ -469,7 +514,7 @@ mod tests {
         // Introduced in the same call, a newcomer is cast before they act.
         let introduced =
             json!({ "introduce": [{ "name": "Rue", "description": "A girl from District 11." }], "lines": [{ "character": "Rue", "text": "Hi." }] });
-        let spoken = run(&call(SPEAK, &introduced), &mut cast, None);
+        let spoken = run(&call(SPEAK, &introduced), &mut cast, &mut scene, None);
         assert!(spoken.starts_with("Spoken. Rue joined the cast") && !spoken.contains("Not in the cast"), "{spoken}");
         assert!(undescribed([&call(SPEAK, &introduced)].into_iter(), &cast, None).is_empty());
 
@@ -477,14 +522,27 @@ mod tests {
         cast.push(CastMember { id: "x".into(), name: "Rex".into(), present: true, ..CastMember::default() });
         assert_eq!(undescribed([&call(SPEAK, &lines(&["Rex"]))].into_iter(), &cast, None), ["Rex"]);
         assert_eq!(
-            run(&call(CREATE_CHARACTER, &json!({ "name": "Rex", "description": "A clone captain." })), &mut cast, None),
+            run(&call(CREATE_CHARACTER, &json!({ "name": "Rex", "description": "A clone captain." })), &mut cast, &mut scene, None),
             "Rex is now described."
         );
         assert!(undescribed([&call(SPEAK, &lines(&["Rex"]))].into_iter(), &cast, None).is_empty());
 
-        assert!(run(&call(SPEAK, &json!({ "lines": [] })), &mut cast, None).starts_with("Error"));
-        assert!(run(&ToolCall { call_id: "c".into(), name: SPEAK.into(), arguments: "{".into() }, &mut cast, None).starts_with("Error"));
-        assert!(run(&call("fly", &json!({})), &mut cast, None).starts_with("Error"));
+        assert!(run(&call(SPEAK, &json!({ "lines": [] })), &mut cast, &mut scene, None).starts_with("Error"));
+        assert!(run(&ToolCall { call_id: "c".into(), name: SPEAK.into(), arguments: "{".into() }, &mut cast, &mut scene, None).starts_with("Error"));
+        assert!(run(&call("fly", &json!({})), &mut cast, &mut scene, None).starts_with("Error"));
+        assert!(scene.is_empty(), "no call set a scene yet");
+
+        // Moving on: a new scene, and Haymitch stays behind after speaking.
+        let moved =
+            json!({ "scene": " The train, at dusk. ", "lines": [{ "character": "Haymitch", "text": "Go." }], "leave": ["haymitch", "Nobody"] });
+        let noted = run(&call(SPEAK, &moved), &mut cast, &mut scene, None);
+        assert!(noted.contains("Left the scene: Haymitch.") && noted.ends_with("Scene set."), "{noted}");
+        assert!(scene == "The train, at dusk." && cast.iter().any(|m| m.name == "Haymitch" && !m.present));
+        let shown = display("", [(SPEAK, moved.to_string().as_str())].into_iter(), false);
+        assert_eq!(shown, "*The train, at dusk.*\n\n**Haymitch**\n> Go.\n\n*haymitch leaves the scene.*\n\n*Nobody leaves the scene.*");
+        let kept = json!({ "scene": "", "lines": [{ "character": "Katniss", "text": "Hi." }] });
+        run(&call(SPEAK, &kept), &mut cast, &mut scene, None);
+        assert_eq!(scene, "The train, at dusk.", "an empty scene keeps the last one");
 
         assert!(shows_speech(&call(SPEAK, &lines(&["Katniss"]))));
         assert!(!shows_speech(&call(SPEAK, &json!({ "lines": [{ "character": "K", "text": " " }] }))));

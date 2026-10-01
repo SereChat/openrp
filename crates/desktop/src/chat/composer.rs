@@ -117,14 +117,8 @@ impl Chat {
         let clip = p.push_clip(Rect::new(text_area.x - 2.0, text_area.y, text_area.w + 4.0, text_area.h));
         let selection = self.composer.selection();
         if !selection.is_empty() && preedit.is_none() {
-            for (start, end, y) in layout.line_spans() {
-                let (from, to) = (selection.start.max(start), selection.end.min(end));
-                if from > to || (from == to && selection.end <= end) {
-                    continue;
-                }
-                let x0 = layout.caret(from).0;
-                // A selected line break shows as a small tail.
-                let x1 = if selection.end > end { layout.caret(to).0 + 6.0 } else { layout.caret(to).0 };
+            // A selected line break shows as a small tail.
+            for (x0, x1, y) in layout.selection_spans(selection.start, selection.end, false) {
                 p.rect(Rect::new(origin.0 + x0, origin.1 + y, x1 - x0, line_h), t.selection, 2.0);
             }
         }

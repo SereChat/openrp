@@ -49,6 +49,10 @@ pub struct Session {
     /// Who the user plays; `None` until they say.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub player: Option<Player>,
+    /// Where the story is now and what it is like (place, time, mood), as
+    /// the model last set it; empty until it does.
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub scene: String,
     /// Every turn, oldest first.
     pub messages: Vec<StoredMessage>,
 }
@@ -182,6 +186,57 @@ pub struct StoredMessage {
     /// The earlier messages stay in the session for the user.
     #[serde(default, skip_serializing_if = "is_default")]
     pub compaction: bool,
+    /// What a reply's tool calls changed in its story, so deleting or
+    /// regenerating it can undo that.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub change: Option<StoryChange>,
+}
+
+/// What a reply changed in its story: each cast member it touched, as they
+/// were before (`None` when it added them) and after, and the scene before
+/// and after when it set a new one.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct StoryChange {
+    /// (before, after) of each member it added or changed.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub cast: Vec<(Option<CastMember>, CastMember)>,
+    /// (before, after) of the scene, if it set one.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub scene: Option<(String, String)>,
+}
+
+impl StoryChange {
+    /// What turned `cast` and `scene` into `cast_after` and `scene_after`;
+    /// `None` when nothing changed. Tools never remove members.
+    #[must_use]
+    pub fn between(cast: &[CastMember], scene: &str, cast_after: &[CastMember], scene_after: &str) -> Option<Self> {
+        let changed = cast_after.iter().filter_map(|after| {
+            let before = cast.iter().find(|m| m.id == after.id);
+            (before != Some(after)).then(|| (before.cloned(), after.clone()))
+        });
+        let change = Self { cast: changed.collect(), scene: (scene != scene_after).then(|| (scene.to_owned(), scene_after.to_owned())) };
+        (change != Self::default()).then_some(change)
+    }
+
+    /// Undoes the change in `cast` and `scene`, except where something
+    /// changed them again since (the user, or a later reply not undone).
+    pub fn undo(&self, cast: &mut Vec<CastMember>, scene: &mut String) {
+        for (before, after) in self.cast.iter().rev() {
+            let Some(index) = cast.iter().position(|m| m == after) else { continue };
+            match before {
+                Some(before) => cast[index] = before.clone(),
+                None => {
+                    cast.remove(index);
+                }
+            }
+        }
+        if let Some((before, after)) = &self.scene
+            && scene == after
+        {
+            scene.clone_from(before);
+        }
+    }
 }
 
 impl StoredMessage {
@@ -199,6 +254,7 @@ impl StoredMessage {
             failed: false,
             tool_calls: Vec::new(),
             compaction: false,
+            change: None,
         }
     }
 }
@@ -599,5 +655,30 @@ mod tests {
         let json = serde_json::to_string(&StoredMessage::new(Role::User, "hi".into())).unwrap();
         assert_eq!(json, r#"{"role":"user","content":"hi"}"#);
         assert!(valid_id(&new_id()));
+    }
+
+    #[test]
+    fn story_changes_undo_what_nobody_changed_since() {
+        let member = |id: &str, present: bool| CastMember { id: id.into(), name: id.into(), present, ..CastMember::default() };
+        let cast = vec![member("a", true), member("b", false)];
+        // The reply moved b in, added c and set the scene.
+        let after = vec![member("a", true), member("b", true), member("c", true)];
+        let change = StoryChange::between(&cast, "", &after, "Dusk.").unwrap();
+        assert_eq!(change.cast.len(), 2);
+        assert!(StoryChange::between(&cast, "x", &cast, "x").is_none());
+
+        let (mut undone, mut scene) = (after.clone(), "Dusk.".to_owned());
+        change.undo(&mut undone, &mut scene);
+        assert_eq!((undone, scene.as_str()), (cast.clone(), ""));
+
+        // The user moved c out and set the scene since: those stay.
+        let (mut edited, mut scene) = (vec![member("a", true), member("b", true), member("c", false)], "Night.".to_owned());
+        change.undo(&mut edited, &mut scene);
+        assert_eq!((edited, scene.as_str()), (vec![member("a", true), member("b", false), member("c", false)], "Night."));
+
+        let mut message = StoredMessage::new(Role::Assistant, String::new());
+        message.change = Some(change);
+        let json = serde_json::to_string(&message).unwrap();
+        assert_eq!(serde_json::from_str::<StoredMessage>(&json).unwrap(), message);
     }
 }

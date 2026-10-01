@@ -4,7 +4,8 @@
 //! opens each member's menu (edit, delete; see `dialog.rs`) and adds
 //! characters: from the library, created or generated. Members are
 //! copies: what the library does later never changes a story. The strip
-//! also shows who the user plays, and opens the player form.
+//! also shows who the user plays, and opens the player form, and above
+//! the cast, the scene (set by the model, or by clicking it).
 
 use serechat::CastMember;
 use winit::window::CursorIcon;
@@ -20,6 +21,8 @@ use crate::ui::{Ui, id};
 const ROW_H: f32 = 34.0;
 /// Height of a chip.
 const CHIP_H: f32 = 26.0;
+/// Height of the scene row above the chips, always shown.
+const SCENE_H: f32 = 26.0;
 
 impl Chat {
     /// Starts a story in `world` and shows it.
@@ -43,7 +46,7 @@ impl Chat {
             conversation.cast.iter().filter(|m| m.present == present).map(|m| (m.name.as_str(), m.description.as_str())).collect::<Vec<_>>()
         };
         let player = conversation.player.as_ref().map(|p| (p.name.as_str(), p.description.as_str()));
-        super::stream::story_prompt(world, player, &member(true), &member(false))
+        super::stream::story_prompt(world, player, &member(true), &member(false), &conversation.scene)
     }
 
     /// Library characters that can still join the open story: (id, name).
@@ -137,11 +140,34 @@ impl Chat {
         let t = p.theme;
         let cast = conversation.cast.clone();
         let player = conversation.player.as_ref().map(|p| p.name.clone());
+        let scene = conversation.scene.clone();
 
-        // Lay the chips out first, wrapping, to know the strip's height.
+        // Where the story is, above the cast; clicking it edits it.
         let (left, right) = (main.x + 16.0, main.right() - 16.0);
         let label = p.layout("Cast", theme::CAPTION, None);
-        let row_start = left + label.width() + 12.0;
+        let scene_label = p.layout("Scene", theme::CAPTION, None);
+        let row_start = left + label.width().max(scene_label.width()) + 12.0;
+        let scene_row = Rect::new(row_start - 6.0, top + 5.0, right - row_start + 6.0, SCENE_H);
+        let scene_hovered = ui.hovered(scene_row);
+        let scene_hover = ui.anim(id("cast-scene"), f32::from(u8::from(scene_hovered)));
+        p.rect(scene_row, fade(t.hover, scene_hover), theme::RADIUS_SM);
+        p.text(&scene_label, left, scene_row.y + (SCENE_H - scene_label.height()) * 0.5, t.text_faint);
+        let (shown, color) = if scene.is_empty() {
+            ("Not set yet: the AI sets it as the story starts, or click to set it".to_owned(), t.text_faint)
+        } else {
+            (scene.split_whitespace().collect::<Vec<_>>().join(" "), mix(t.text_muted, t.text, scene_hover))
+        };
+        let mut text = p.layout(&shown, theme::SMALL, None);
+        text.truncate(p.fonts, scene_row.w - 12.0);
+        p.text(&text, row_start, scene_row.y + (SCENE_H - text.height()) * 0.5, color);
+        let mut edit_scene = false;
+        if scene_hovered {
+            ui.cursor = CursorIcon::Pointer;
+            edit_scene = ui.clicked(scene_row);
+        }
+
+        // Lay the chips out first, wrapping, to know the strip's height.
+        let top = top + SCENE_H;
         let mut at_x = row_start;
         let mut at_y = top + (ROW_H - CHIP_H) * 0.5 + 5.0;
         let mut place = |width: f32| {
@@ -183,7 +209,7 @@ impl Chat {
         }
 
         let (mut toggle, mut open_member) = (None, None);
-        let mut anchor = None;
+        let dots_of = |chip: Rect| Rect::new(chip.right() - 22.0, chip.y + 3.0, 19.0, 20.0);
         for (index, ((chip, text, path), member)) in chips.iter().zip(&cast).enumerate() {
             let hovered = ui.hovered(*chip);
             let menu_open = self.menu == Some(Menu::Member(index));
@@ -199,10 +225,7 @@ impl Chat {
             let color = if member.present { t.text } else { t.text_faint };
             p.text(text, photo.right() + 7.0, chip.y + (CHIP_H - text.height()) * 0.5, color);
             // The dots open the member's menu.
-            let dots = Rect::new(chip.right() - 22.0, chip.y + 3.0, 19.0, 20.0);
-            if menu_open {
-                anchor = Some(dots);
-            }
+            let dots = dots_of(*chip);
             let on_dots = hovered && dots.contains(ui.mouse);
             if hovered || menu_open {
                 let color = if on_dots || menu_open { t.text } else { t.text_faint };
@@ -245,7 +268,9 @@ impl Chat {
             }
         }
 
-        if edit_you {
+        if edit_scene {
+            self.edit_scene();
+        } else if edit_you {
             self.edit_player();
         } else if let Some(index) = toggle {
             self.change_cast(actions, |cast| cast[index].present = !cast[index].present);
@@ -253,6 +278,12 @@ impl Chat {
             self.menu = if self.menu == Some(Menu::Member(index)) { None } else { Some(Menu::Member(index)) };
             self.menu_scroll = 0.0;
         }
+        // Chosen after the clicks above, so a menu opened this frame is anchored
+        // (and its click counted as inside it) right away.
+        let anchor = match self.menu {
+            Some(Menu::Member(index)) => chips.get(index).map(|(chip, ..)| dots_of(*chip)),
+            _ => None,
+        };
         (bottom, anchor.unwrap_or(add))
     }
 }
@@ -280,7 +311,7 @@ mod tests {
         let mut actions = Vec::new();
         chat.library_menu_picked(0, &mut actions);
         chat.library_menu_picked(0, &mut actions);
-        assert!(actions.is_empty(), "a story nobody wrote in yet is not saved");
+        assert_eq!(actions.len(), 2, "a begun story is saved with every change");
         assert_eq!(chat.cast_choices().len(), 0, "everyone is cast");
         chat.library_menu_picked(0, &mut actions);
         assert!(chat.page == Page::Library(Kind::Character), "the last row leads to the characters");
@@ -296,7 +327,8 @@ mod tests {
         let (here, away) = prompt.split_once("# Characters elsewhere").unwrap();
         assert!(here.contains("## Katniss\n\nA hunter.") && away.contains("## Peeta"));
 
-        // The first message saves the story with its world, cast and player.
+        // Sending saves the story with its world, cast and player.
+        actions.clear();
         chat.composer.insert("I step into the arena.");
         chat.send(&mut actions);
         let Some(Action::SaveSession(session)) = actions.first() else { panic!("not saved") };

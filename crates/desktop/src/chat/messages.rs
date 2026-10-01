@@ -4,12 +4,15 @@
 use winit::window::CursorIcon;
 
 use super::stream::MAX_RETRIES;
-use super::{Chat, Entry, Load, PRIMARY_KEY, Page, ReasoningView, SelPos, model_name, usage_caption};
+use serechat::Role;
+
+use super::{Chat, Entry, Load, PRIMARY_KEY, Page, ReasoningView, SelPos, model_name, turns, usage_caption};
 use crate::app::Action;
 use crate::doc::{Doc, INK_MUTED, INK_TEXT};
+use crate::form::FIELD_PAD;
 use crate::library::{Kind, portrait};
 use crate::paint::{Painter, Rect, fade, mix};
-use crate::text::Align;
+use crate::text::{Align, TextLayout};
 use crate::theme;
 use crate::ui::{ButtonStyle, Ui, button, chevron, id, keycap, logo};
 
@@ -23,6 +26,10 @@ const META_H: f32 = 30.0;
 const REASONING_ROW: f32 = 30.0;
 /// Height of the retry status or Continue button under the messages.
 const FOOTER_H: f32 = 44.0;
+/// Height of the Save and Cancel row under replies being edited.
+const EDIT_BAR: f32 = 46.0;
+/// Smallest height of a reply being edited.
+const EDIT_MIN_H: f32 = 60.0;
 
 /// Where a laid-out document was drawn, for hit-testing after the frame.
 struct Target {
@@ -144,11 +151,41 @@ impl Chat {
         let retry = conversation.retry.as_ref().map(|r| format!("Retrying ({} of {MAX_RETRIES}): {}", r.attempt, r.error));
         let resumable = conversation.resumable();
         let footer_h = if retry.is_some() || resumable { FOOTER_H } else { 0.0 };
+        let busy = conversation.busy();
+
+        // Each turn's actions sit under its anchor: entry index -> its turn.
+        let mut anchors = vec![None; conversation.entries.len()];
+        let mut next = 0;
+        while next < conversation.entries.len() {
+            let turn = turns::turn(&conversation.entries, next);
+            anchors[turns::anchor(&conversation.entries, &turn)] = Some(turn.clone());
+            next = turn.end.max(next + 1);
+        }
+        // Replies being edited show a field each; the last one has the buttons.
+        let mut edit = self.turn_edit.as_mut().filter(|e| e.conversation == current);
+        let edit_ids = edit.as_ref().map(|e| e.entries.clone()).unwrap_or_default();
+        let mut edit_layouts: Vec<Option<TextLayout>> =
+            edit.as_ref().map(|e| (0..e.entries.len()).map(|k| Some(e.fields.layout(p, k, width))).collect()).unwrap_or_default();
+        let edit_heights: Vec<f32> = edit_layouts
+            .iter()
+            .enumerate()
+            .map(|(k, l)| {
+                let field = l.as_ref().map_or(0.0, |l| l.height() + 2.0 * FIELD_PAD.1).max(EDIT_MIN_H);
+                field + if k + 1 == edit_ids.len() { EDIT_BAR } else { 0.0 }
+            })
+            .collect();
+        let confirming = self.confirm_turn;
+        let editable: Vec<bool> = anchors.iter().map(|t| t.as_ref().is_some_and(|t| turns::has_editable(&conversation.entries, t))).collect();
+        // Regen sends the last prompt again: there must be one.
+        let regen_ok = conversation.entries.iter().any(|e| e.message.role == Role::User);
 
         // Measure everything (layouts are cached) to know the scroll range.
         let mut content_h = 24.0 + footer_h;
-        for entry in &mut conversation.entries {
-            content_h += entry.measure(p, width, live_entry == Some(entry.id), reasoning_view) + MESSAGE_GAP;
+        for (index, entry) in conversation.entries.iter_mut().enumerate() {
+            let editing = edit_ids.iter().position(|id| *id == entry.id);
+            let live = live_entry == Some(entry.id);
+            content_h +=
+                entry_height(entry, editing.map(|k| edit_heights[k]), anchors[index].is_some(), p, width, live, reasoning_view) + MESSAGE_GAP;
         }
         let max_scroll = (content_h - view.h).max(0.0);
 
@@ -209,19 +246,52 @@ impl Chat {
         let mut y = view.y + 24.0 - self.scroll.round();
         let mut targets = Vec::new();
         let mut effects = Effects::default();
+        let entry_count = conversation.entries.len();
+        let mut turn_top = y;
         for (index, entry) in conversation.entries.iter_mut().enumerate() {
             let live = live_entry == Some(entry.id);
-            let height = entry.measure(p, width, live, reasoning_view);
+            let editing = edit_ids.iter().position(|id| *id == entry.id);
+            let anchor = anchors[index].clone();
+            let height = entry_height(entry, editing.map(|k| edit_heights[k]), anchor.is_some(), p, width, live, reasoning_view);
             let area = Rect::new(x, y, width, height);
             y += height + MESSAGE_GAP;
+            if entry.message.role == Role::User || index == 0 {
+                turn_top = area.y;
+            }
             if area.bottom() < view.y || area.y > view.bottom() {
                 continue;
             }
+            // A turn's actions, while it is hovered and nothing is on its
+            // way or being edited.
+            let turn_hovered = in_view && ui.hovered(Rect::new(x, turn_top, width, area.bottom() - turn_top));
+            let actions_for = anchor.filter(|_| !busy && edit_ids.is_empty() && turn_hovered).map(|turn| TurnButtons {
+                edit: editable[index],
+                regen: turn.end == entry_count && regen_ok,
+                confirming: confirming == Some(entry.id),
+            });
+            effects.confirm_shown |= actions_for.as_ref().is_some_and(|b| b.confirming);
             let sel = |doc: u8, d: &Doc| selected_range(selection, index, doc, d);
+            if let Some(k) = editing {
+                let last = k + 1 == edit_ids.len();
+                let field = Rect::new(x, area.y, width, area.h - if last { EDIT_BAR } else { 0.0 });
+                if let (Some(edit), Some(layout)) = (edit.as_deref_mut(), edit_layouts[k].take()) {
+                    edit.fields.draw(k, p, ui, field, layout, "Empty: this reply is removed", in_view);
+                }
+                if last {
+                    let bar_y = field.bottom() + 10.0;
+                    let save = Rect::new(area.right() - 90.0, bar_y, 90.0, 30.0);
+                    effects.save_edit |= button(p, ui, save, "Save", ButtonStyle::Primary, in_view);
+                    effects.cancel_edit |= button(p, ui, Rect::new(save.x - 96.0, bar_y, 90.0, 30.0), "Cancel", ButtonStyle::Ghost, in_view);
+                    let tip = p.layout(&format!("{PRIMARY_KEY}+Enter to save, Esc to cancel"), theme::TINY, None);
+                    p.text(&tip, x, bar_y + (30.0 - tip.height()) * 0.5, t.text_faint);
+                }
+                continue;
+            }
             if entry.boxed() {
                 let (fill, border, color) =
                     if entry.message.failed { (fade(t.danger, 0.08), fade(t.danger, 0.4), t.danger) } else { (t.surface, t.border, t.text) };
-                p.bordered(area, fill, theme::RADIUS, 1.0, border);
+                let boxed = Rect::new(area.x, area.y, area.w, area.h - if anchors[index].is_some() { META_H } else { 0.0 });
+                p.bordered(boxed, fill, theme::RADIUS, 1.0, border);
                 let origin = (area.x + BOX_PAD.0, area.y + BOX_PAD.1);
                 if let Some(doc) = entry.doc.as_mut().filter(|_| !entry.display.is_empty()) {
                     if let Some((a, b)) = sel(1, doc) {
@@ -229,6 +299,10 @@ impl Chat {
                     }
                     doc.draw(p, ui, origin, color, in_view, None);
                     targets.push(Target { entry: index, doc: 1, origin, rect: Rect::new(origin.0, origin.1, width, doc.height) });
+                }
+                if let Some(buttons) = &actions_for {
+                    effects.turn =
+                        effects.turn.take().or(turn_buttons(p, ui, area.right(), boxed.bottom() + 6.0, buttons).map(|c| (c, index, entry.id)));
                 }
                 continue;
             }
@@ -333,11 +407,17 @@ impl Chat {
                 p.text(&caption, x, meta_y + (24.0 - caption.height()) * 0.5, t.text_faint);
             }
             let is_copied = copied.is_some_and(|(id, code, _)| id == entry.id && code.is_none());
-            if !entry.display.is_empty() && ((in_view && ui.hovered(area)) || is_copied) {
+            let has_copy = !entry.display.is_empty();
+            if has_copy && ((in_view && ui.hovered(area)) || is_copied) {
                 let label = if is_copied { "✓ Copied" } else { "Copy" };
                 if button(p, ui, Rect::new(area.right() - 72.0, meta_y, 72.0, 24.0), label, ButtonStyle::Ghost, true) {
                     effects.copy = Some((entry.id, None, entry.display.clone()));
                 }
+            }
+            // The turn's actions, left of Copy (which keeps its place).
+            if let Some(buttons) = &actions_for {
+                let right = area.right() - if has_copy { 76.0 } else { 0.0 };
+                effects.turn = effects.turn.take().or(turn_buttons(p, ui, right, meta_y, buttons).map(|c| (c, index, entry.id)));
             }
         }
         if let Some(status) = &retry {
@@ -417,6 +497,25 @@ impl Chat {
         if effects.resume {
             self.resume(current, actions);
         }
+        // A Delete awaiting confirmation is dropped once its turn is left.
+        if confirming.is_some() && !effects.confirm_shown {
+            self.confirm_turn = None;
+        }
+        match effects.turn {
+            Some((TurnClick::Edit, index, _)) => self.edit_turn(index),
+            Some((TurnClick::Regen, ..)) => self.regenerate(actions),
+            Some((TurnClick::Delete, index, id)) if confirming == Some(id) => {
+                self.confirm_turn = None;
+                self.delete_turn(index, actions);
+            }
+            Some((TurnClick::Delete, _, id)) => self.confirm_turn = Some(id),
+            None => {}
+        }
+        if effects.save_edit {
+            self.save_turn_edit(actions);
+        } else if effects.cancel_edit {
+            self.turn_edit = None;
+        }
 
         if max_scroll > 0.0 {
             let thumb_y = view.y + travel * (self.scroll / max_scroll);
@@ -452,6 +551,66 @@ struct Effects {
     link: Option<String>,
     /// The Continue button was clicked.
     resume: bool,
+    /// A turn's button: what, an entry of the turn and the anchor's id.
+    turn: Option<(TurnClick, usize, u64)>,
+    /// The Delete awaiting confirmation is still shown.
+    confirm_shown: bool,
+    /// The edited replies' Save or Cancel was clicked.
+    save_edit: bool,
+    cancel_edit: bool,
+}
+
+/// What a turn offers under its last reply.
+struct TurnButtons {
+    /// It has replies to edit.
+    edit: bool,
+    /// It is the last turn: its prompt can be sent again.
+    regen: bool,
+    /// Delete was clicked once and awaits confirmation.
+    confirming: bool,
+}
+
+/// A turn button that was clicked.
+#[derive(Clone, Copy)]
+enum TurnClick {
+    Edit,
+    Regen,
+    Delete,
+}
+
+/// Draws a turn's Edit, Regen and Delete buttons, ending at `right`, on
+/// the row at `y`. Returns the one clicked.
+fn turn_buttons(p: &mut Painter, ui: &mut Ui, right: f32, y: f32, buttons: &TurnButtons) -> Option<TurnClick> {
+    let mut right = right;
+    let mut clicked = None;
+    let delete = if buttons.confirming { ("Delete?", ButtonStyle::Danger, 72.0) } else { ("Delete", ButtonStyle::Ghost, 64.0) };
+    let row = [
+        (true, TurnClick::Delete, delete),
+        (buttons.regen, TurnClick::Regen, ("Regen", ButtonStyle::Ghost, 60.0)),
+        (buttons.edit, TurnClick::Edit, ("Edit", ButtonStyle::Ghost, 52.0)),
+    ];
+    for (shown, click, (label, style, width)) in row {
+        if !shown {
+            continue;
+        }
+        right -= width;
+        if button(p, ui, Rect::new(right, y, width, 24.0), label, style, true) {
+            clicked = Some(click);
+        }
+        right -= 4.0;
+    }
+    clicked
+}
+
+/// Height of `entry`: `edit_h` while it is being edited, otherwise its
+/// laid-out height, plus the actions row when it is a boxed turn anchor.
+#[allow(clippy::too_many_arguments, reason = "layout inputs; a struct would only rename them")]
+fn entry_height(entry: &mut Entry, edit_h: Option<f32>, anchor: bool, p: &Painter, width: f32, live: bool, view: ReasoningView) -> f32 {
+    if let Some(height) = edit_h {
+        return height;
+    }
+    let height = entry.measure(p, width, live, view);
+    if anchor && entry.boxed() { height + META_H } else { height }
 }
 
 /// A row that opens and closes a block, like "Thought for 12s".

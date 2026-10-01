@@ -156,7 +156,7 @@ struct Form {
     /// Not saved yet, so nothing to delete or play.
     new: bool,
     /// Name and description.
-    fields: Fields<2>,
+    fields: Fields,
     /// Portrait file name; empty for none.
     portrait: String,
     /// The image picker is open.

@@ -17,6 +17,7 @@ mod messages;
 mod sidebar;
 mod stream;
 mod tools;
+mod turns;
 
 use std::sync::atomic::Ordering;
 
@@ -304,6 +305,8 @@ struct Conversation {
     cast: Vec<CastMember>,
     /// Who the user plays; `None` until they say.
     player: Option<Player>,
+    /// Where the story is now and what it is like, as the model set it.
+    scene: String,
     /// Replies in a row that continued on their own after only calling
     /// tools; reset by every prompt.
     auto_rounds: u32,
@@ -334,6 +337,7 @@ impl Conversation {
             world: None,
             cast: Vec::new(),
             player: None,
+            scene: String::new(),
             auto_rounds: 0,
             repairing: false,
             load: Load::Loaded,
@@ -361,9 +365,10 @@ impl Conversation {
         }
     }
 
-    /// A new conversation nobody has written in yet (never saved or listed).
+    /// A new conversation that has not begun: no messages, and no player
+    /// yet (a story is saved and listed once the user says who they play).
     fn is_fresh(&self) -> bool {
-        self.load == Load::Loaded && self.entries.is_empty()
+        self.load == Load::Loaded && self.entries.is_empty() && self.player.is_none()
     }
 
     /// Snapshot for saving; the empty placeholder of a pending reply is skipped.
@@ -377,6 +382,7 @@ impl Conversation {
             world: self.world.clone(),
             cast: self.cast.clone(),
             player: self.player.clone(),
+            scene: self.scene.clone(),
             messages: self
                 .entries
                 .iter()
@@ -467,6 +473,9 @@ pub struct Chat {
     /// Dragging a message selection.
     dragging: bool,
     sidebar_scroll: f32,
+    /// Anchor entry of the turn whose Delete was clicked once, awaiting
+    /// confirmation.
+    confirm_turn: Option<u64>,
     /// Conversation whose delete button was clicked once, awaiting confirmation.
     confirm_delete: Option<u64>,
     /// What was just copied (entry, code block or whole message) and when.
@@ -475,6 +484,8 @@ pub struct Chat {
     /// The character dialog (who the user plays, or a cast member to
     /// edit, create or generate), for one conversation.
     character_form: Option<dialog::CharacterForm>,
+    /// Replies being edited, in one conversation.
+    turn_edit: Option<turns::TurnEdit>,
     /// The worlds and characters pages.
     library: LibraryView,
 }
@@ -513,9 +524,11 @@ impl Chat {
             dragging: false,
             sidebar_scroll: 0.0,
             confirm_delete: None,
+            confirm_turn: None,
             copied: None,
             library: LibraryView::default(),
             character_form: None,
+            turn_edit: None,
             spotlight: None,
         };
         for summary in sessions {
@@ -572,15 +585,11 @@ impl Chat {
 
     /// Opens an empty conversation in no world, reusing an empty one.
     fn new_conversation(&mut self) {
-        if let Some(fresh) = self.conversations.iter_mut().find(|c| c.is_fresh()) {
-            fresh.world = None;
-            fresh.cast.clear();
-            fresh.player = None;
-            let id = fresh.id;
-            self.select(id);
-            return;
-        }
-        let id = self.next_id();
+        // An unbegun one is replaced: the new story is listed first once begun.
+        let id = match self.conversations.iter().position(Conversation::is_fresh) {
+            Some(index) => self.conversations.remove(index).id,
+            None => self.next_id(),
+        };
         self.conversations.insert(0, Conversation::new(id));
         self.select(id);
     }
@@ -654,7 +663,7 @@ impl Chat {
     /// the same world, with the same cast and player.
     fn clear(&mut self, actions: &mut Vec<Action>) {
         let conversation = self.current();
-        if conversation.is_fresh() {
+        if conversation.entries.is_empty() || conversation.load != Load::Loaded {
             return;
         }
         let (id, world, cast, player) = (conversation.id, conversation.world.clone(), conversation.cast.clone(), conversation.player.clone());
@@ -663,6 +672,10 @@ impl Chat {
         fresh.world = world;
         fresh.cast = cast;
         fresh.player = player;
+        // The story begins again at once, so it is saved and listed again.
+        if !fresh.is_fresh() {
+            actions.push(Action::SaveSession(fresh.to_session()));
+        }
     }
 
     /// Stores the messages of a session read on a worker thread.
@@ -696,6 +709,7 @@ impl Chat {
         conversation.world = session.world;
         conversation.cast = cast;
         conversation.player = session.player;
+        conversation.scene = session.scene;
         conversation.load = Load::Loaded;
     }
 
@@ -738,10 +752,12 @@ impl Chat {
     /// Takes the composer text and starts a reply, if sending is possible.
     fn send(&mut self, actions: &mut Vec<Action>) {
         let has_content = !self.composer.text().trim().is_empty();
+        let editing = self.turn_edit().is_some();
         let conversation = self.current();
         // Sending into an unloaded session would save it without its history;
-        // a story starts with Play, in a world.
-        if conversation.load != Load::Loaded || conversation.busy() || !has_content || !conversation.playable() {
+        // a story starts with Play, in a world. Replies being edited are
+        // saved or cancelled first.
+        if conversation.load != Load::Loaded || conversation.busy() || !has_content || !conversation.playable() || editing {
             return;
         }
         let text = self.composer.take().trim().to_owned();
@@ -823,10 +839,15 @@ impl Chat {
             return;
         }
         match self.page {
-            Page::Chat => match self.character_form() {
-                Some(form) => form.fields.insert(text),
-                None => self.composer.insert(text),
-            },
+            Page::Chat => {
+                if let Some(form) = self.character_form() {
+                    form.fields.insert(text);
+                } else if let Some(edit) = self.turn_edit() {
+                    edit.fields.insert(text);
+                } else {
+                    self.composer.insert(text);
+                }
+            }
             Page::Library(_) => self.library.insert(text),
             Page::Settings => {}
         }
@@ -842,8 +863,9 @@ impl Chat {
     pub fn ime_area(&self) -> Option<Rect> {
         match self.page {
             Page::Library(_) => self.library.caret(),
-            _ => match &self.character_form {
-                Some(form) if form.conversation == self.current => form.fields.caret(),
+            _ => match (&self.character_form, &self.turn_edit) {
+                (Some(form), _) if form.conversation == self.current => form.fields.caret(),
+                (_, Some(edit)) if edit.conversation == self.current => edit.fields.caret(),
                 _ => self.caret_rect,
             },
         }
@@ -911,6 +933,15 @@ impl Chat {
             // The player form, while open, takes the keys.
             _ if self.character_form.as_ref().is_some_and(|f| f.conversation == self.current) => {
                 self.dialog_key(event, mods, cb, actions);
+            }
+            // So do replies being edited.
+            Key::Named(NamedKey::Escape) if self.turn_edit().is_some() => self.turn_edit = None,
+            Key::Named(NamedKey::Enter) if primary && self.turn_edit().is_some() => self.save_turn_edit(actions),
+            Key::Character(c) if primary && is(c, "s") && self.turn_edit().is_some() => self.save_turn_edit(actions),
+            _ if self.turn_edit().is_some() => {
+                if let Some(edit) = self.turn_edit() {
+                    edit.fields.key(event, mods, cb);
+                }
             }
             // Copy a message selection; otherwise the composer handles it.
             Key::Character(c) if primary && is(c, "c") && self.composer.selection().is_empty() && self.selection.is_some() => {
@@ -1249,6 +1280,7 @@ mod tests {
             world: None,
             cast: Vec::new(),
             player: None,
+            scene: String::new(),
             messages: vec![StoredMessage::new(Role::User, "hi".into()), reply],
         };
         let mut chat = Chat::new(None, Reasoning::Auto, vec![session.summary()]);
@@ -1441,8 +1473,8 @@ mod tests {
         let command = chat.commands()[chat.command_pick];
         chat.run_command(command, &mut actions);
         assert!(job.cancel.load(Ordering::Relaxed), "the running reply is stopped");
-        assert!(matches!(&actions[..], [Action::DeleteSession(_)]));
-        assert!(chat.current().is_fresh());
+        assert!(matches!(&actions[..], [Action::DeleteSession(_), Action::SaveSession(s)] if s.messages.is_empty() && s.player.is_some()));
+        assert!(chat.current().entries.is_empty() && chat.current().playable());
         assert!(chat.composer.text().is_empty());
 
         // Closing the menu keeps it closed until the text changes.

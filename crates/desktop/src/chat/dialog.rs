@@ -2,7 +2,8 @@
 //! before it begins; the "You" chip edits them later), and edits the
 //! story's cast: changing a member, creating one, or having the AI
 //! generate one, which then opens as a new member to review before it
-//! joins. Everything it changes belongs to the story only.
+//! joins. It also sets the scene by hand (click it in the cast strip).
+//! Everything it changes belongs to the story only.
 
 use arboard::Clipboard;
 use serechat::{CastMember, Error, Player, ToolCall, new_id};
@@ -43,14 +44,23 @@ pub(super) enum Subject {
         /// Why the last one failed.
         error: Option<String>,
     },
+    /// Where the story is now and what it is like there.
+    Scene,
+}
+
+impl Subject {
+    /// Shows one free-text field (the first) rather than name and description.
+    fn single(&self) -> bool {
+        matches!(self, Self::Generate { .. } | Self::Scene)
+    }
 }
 
 /// The character form of one conversation.
 pub(super) struct CharacterForm {
     /// The conversation it edits.
     pub conversation: u64,
-    /// Name and description (or the idea, when generating).
-    pub fields: Fields<2>,
+    /// Name and description (or the idea or scene alone).
+    pub fields: Fields,
     /// Who it describes.
     pub subject: Subject,
     /// A dialog that can be cancelled, not the first question of a story.
@@ -97,7 +107,7 @@ impl Chat {
 
     /// Opens the form as a dialog over the story.
     fn open_form(&mut self, subject: Subject, name: &str, description: &str) {
-        let fields = if matches!(subject, Subject::Generate { .. }) {
+        let fields = if subject.single() {
             Fields::new([text_editor(name), text_editor("")], [true, true])
         } else {
             Fields::new([name_editor(name), text_editor(description)], [false, true])
@@ -129,6 +139,12 @@ impl Chat {
         self.open_form(Subject::Generate { request: None, error: None }, "", "");
     }
 
+    /// Opens the form to set the scene by hand.
+    pub(super) fn edit_scene(&mut self) {
+        let scene = self.current().scene.clone();
+        self.open_form(Subject::Scene, &scene, "");
+    }
+
     /// Whether someone in the story other than `subject` is called `name`:
     /// the tools tell characters apart by name.
     fn name_taken(&mut self, subject: &Subject, name: &str) -> bool {
@@ -152,7 +168,8 @@ impl Chat {
             }
             return;
         }
-        if name.is_empty() || self.name_taken(&subject, &name) {
+        // The scene may be emptied: the model then sets it afresh.
+        if subject != Subject::Scene && (name.is_empty() || self.name_taken(&subject, &name)) {
             return;
         }
         self.character_form = None;
@@ -165,6 +182,7 @@ impl Chat {
                 }
             }
             Subject::NewMember => conversation.cast.push(CastMember { id: new_id(), name, description, portrait: String::new(), present: true }),
+            Subject::Scene => conversation.scene = name,
             Subject::Generate { .. } => {}
         }
         if !conversation.is_fresh() && conversation.load == Load::Loaded {
@@ -223,13 +241,13 @@ impl Chat {
         let Some(form) = self.character_form() else {
             return false;
         };
-        let generating = matches!(form.subject, Subject::Generate { .. });
+        let single = form.subject.single();
         match &event.logical_key {
             Key::Named(NamedKey::Escape) if form.editing => self.character_form = None,
             Key::Named(NamedKey::Enter) if primary => self.submit_form(actions),
             Key::Character(c) if primary && c.eq_ignore_ascii_case("s") => self.submit_form(actions),
-            // The idea is the only field shown.
-            Key::Named(NamedKey::Tab) if generating => {}
+            // The first field is the only one shown.
+            Key::Named(NamedKey::Tab) if single => {}
             _ => {
                 form.fields.key(event, mods, cb);
             }
@@ -251,7 +269,8 @@ impl Chat {
             Subject::Generate { request, error } => Some((request.is_some(), error.clone())),
             _ => None,
         };
-        let taken = generate.is_none() && !name.is_empty() && self.name_taken(&subject, &name);
+        let single = subject.single();
+        let taken = !single && !name.is_empty() && self.name_taken(&subject, &name);
         let Some(form) = self.character_form() else {
             return;
         };
@@ -278,6 +297,13 @@ impl Chat {
                 ["Idea", ""],
                 ["e.g. a grumpy innkeeper who knows more than she lets on", ""],
             ),
+            Subject::Scene => (
+                "The scene".to_owned(),
+                "Where the story is now and what it is like there. The AI reads it before every reply, and changes it when the story moves on.",
+                "Save",
+                ["Scene", ""],
+                ["e.g. Peeta's kitchen, before dawn; warm bread, rain on the windows", ""],
+            ),
         };
         let error = match &generate {
             Some((_, error)) => error.clone(),
@@ -288,11 +314,11 @@ impl Chat {
         let inner = width - 48.0;
         let note = p.layout(note, theme::SMALL, Some(inner));
         let note_h = (note.height() + 14.0).max(44.0);
-        // Generating shows the idea alone, in the first field.
-        let (body_field, body_min) = if generate.is_some() { (NAME, IDEA_MIN_H) } else { (DESCRIPTION, DESCRIPTION_MIN_H) };
+        // Generating and the scene show one field alone: the first.
+        let (body_field, body_min) = if single { (NAME, IDEA_MIN_H) } else { (DESCRIPTION, DESCRIPTION_MIN_H) };
         let body = form.fields.layout(p, body_field, inner);
         let body_h = (body.height() + 2.0 * FIELD_PAD.1).max(body_min);
-        let name_layout = generate.is_none().then(|| form.fields.layout(p, NAME, inner));
+        let name_layout = (!single).then(|| form.fields.layout(p, NAME, inner));
         let name_h = name_layout.as_ref().map_or(0.0, |l| l.line_height() + 2.0 * FIELD_PAD.1);
         let error = error.map(|e| p.layout(&e, theme::SMALL, Some(inner)));
         let error_h = error.as_ref().map_or(0.0, |e| e.height() + 12.0);
@@ -320,7 +346,7 @@ impl Chat {
             form.fields.draw(NAME, p, ui, Rect::new(x, y, inner, name_h), layout, hints[0], true);
             y += name_h + 20.0;
         }
-        let (label, hint) = if generate.is_some() { (labels[0], hints[0]) } else { (labels[1], hints[1]) };
+        let (label, hint) = if single { (labels[0], hints[0]) } else { (labels[1], hints[1]) };
         p.label(label, theme::LABEL, x, y, t.text);
         y += 22.0;
         form.fields.draw(body_field, p, ui, Rect::new(x, y, inner, body_h), body, hint, true);
@@ -333,7 +359,7 @@ impl Chat {
 
         let ready = match generate {
             Some((busy, _)) => !busy,
-            None => !name.is_empty() && !taken,
+            None => subject == Subject::Scene || (!name.is_empty() && !taken),
         };
         let shortcut = if cfg!(target_os = "macos") { "Cmd+Enter" } else { "Ctrl+Enter" };
         let tip = p.layout(&format!("{shortcut} to {}", submit.trim_end_matches('…').to_lowercase()), theme::TINY, None);
@@ -369,7 +395,9 @@ mod tests {
 
         chat.character_form().unwrap().fields.insert("  Gale ");
         chat.submit_form(&mut actions);
-        assert!(actions.is_empty(), "a story nobody wrote in is not saved yet");
+        // Begin saves the story at once, so it is listed before anyone writes.
+        assert!(matches!(&actions[..], [Action::SaveSession(s)] if s.messages.is_empty() && s.player.is_some()));
+        assert!(!chat.current().is_fresh());
         assert_eq!(chat.current().player.as_ref().map(|p| p.name.as_str()), Some("Gale"));
         assert!(chat.current().playable());
         chat.sync_character_form();
@@ -407,7 +435,8 @@ mod tests {
         chat.character_form().unwrap().fields.editor(DESCRIPTION).insert("From District 11.");
         chat.submit_form(&mut actions);
         assert_eq!(chat.current().cast[0].description, "From District 11.");
-        assert!(actions.is_empty(), "a story nobody wrote in is not saved yet");
+        assert_eq!(actions.len(), 2, "a begun story is saved with every change");
+        actions.clear();
 
         // Generating sends the idea, and its answer becomes a new member to review.
         chat.generate_member();
@@ -432,5 +461,30 @@ mod tests {
         let Some(Action::GenerateCharacter(job)) = actions.pop() else { panic!("not generated") };
         chat.character_generated(job.conversation, job.request, Ok(None));
         assert!(matches!(&chat.character_form().unwrap().subject, Subject::Generate { request: None, error: Some(_) }));
+    }
+
+    #[test]
+    fn the_scene_is_set_by_hand() {
+        let mut chat = Chat::new(None, Reasoning::Auto, Vec::new());
+        chat.play("w".into());
+        chat.current().player = Some(Player { name: "Gale".into(), description: String::new() });
+        chat.current().scene = "The Hob.".into();
+        let mut actions = Vec::new();
+
+        chat.edit_scene();
+        let form = chat.character_form().unwrap();
+        assert_eq!(form.fields.text(NAME), "The Hob.");
+        form.fields.insert(" Smoky.");
+        chat.submit_form(&mut actions);
+        assert!(chat.character_form.is_none());
+        assert!(matches!(&actions[..], [Action::SaveSession(s)] if s.scene == "The Hob. Smoky."));
+        let id = chat.current().id;
+        assert!(chat.instructions(id).contains("# The scene\n\nThe Hob. Smoky."), "the next reply reads it");
+
+        // Emptied, the model sets it afresh.
+        chat.edit_scene();
+        chat.character_form().unwrap().fields = Fields::new([text_editor(""), text_editor("")], [true, true]);
+        chat.submit_form(&mut actions);
+        assert!(chat.current().scene.is_empty());
     }
 }

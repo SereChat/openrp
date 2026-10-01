@@ -26,9 +26,11 @@ cargo clippy --workspace --all-targets
   (Ctrl/Cmd+S saves, Esc goes back).
 - **Stories**: **Play** on a world (Ctrl/Cmd+N opens the worlds) starts a session in it, which
   first asks who you play: your character's name and description (the **You** chip edits them
-  later). The strip under the header holds the story's cast: add characters from the library
-  (the story keeps its own copy, so editing or deleting them in the library changes no story),
-  click one to move them in or out of the scene, × to drop them. Deleting a world deletes its
+  later). **Begin** saves the story and lists it in the sidebar. The strip under the header
+  shows the current scene (click it to change it yourself) and holds the story's cast: **+ Add** brings in characters from the
+  library (the story keeps its own copy, so editing or deleting them in the library changes no
+  story), creates one, or has the AI generate one for you to review. Click a member to move
+  them in or out of the scene; its ⋯ menu edits or deletes them. Deleting a world deletes its
   stories.
 - **No narrator**: the story is told only through its characters. Every reply must call a tool
   (the request sets `tool_choice: required`); `speak` holds every line of the turn in one call,
@@ -39,9 +41,18 @@ cargo clippy --workspace --all-targets
   moment needs); they are introduced in the same `speak` call, each with a description. No
   one is cast without a description: if a model lets someone act without introducing them,
   the app makes it describe them next (`tool_choice` forced to `create_character`, at most 3
-  rounds). `create_character` also adds someone who matters but is not acting yet. The world,
-  your character, the characters present and those elsewhere make up its system prompt,
+  rounds). `create_character` also adds someone who matters but is not acting yet. When the
+  place or ambiance changes (you walk into a house, night falls), `speak` sets the new scene,
+  and members who stay behind or walk off go in its `leave`. The world,
+  your character, the characters present and those elsewhere, and the scene make up its system prompt,
   rebuilt for every reply.
+- **Edit, Regen, Delete**: hovering a turn (your message and everything that answered it)
+  shows them left of Copy. **Edit** makes all of its replies editable at once (the model then
+  sees your text instead of the tool calls); **Regen** sends the last prompt again;
+  **Delete** (click twice) removes the prompt and its replies. Each reply records what it
+  changed in the story (who joined or moved, the scene), so regenerating or deleting the last
+  turn rewinds that too, except what you changed yourself since. Deleting an earlier turn only
+  removes its messages. What removed replies cost stays counted.
 - **Reliable replies**: dropped connections, rate limits and server errors are retried
   automatically; when a conversation outgrows the model's context, the model summarises it
   and carries on from the summary (the full history stays visible). A reply that stops early

@@ -101,7 +101,10 @@ impl Chat {
                 age.width() + 18.0
             };
 
-            let mut title = p.layout(&conversation.title, theme::SMALL, None);
+            // A story nobody wrote in yet is named after its world.
+            let world = conversation.world.as_deref().and_then(|w| self.library.get(Kind::World, w)).map(|w| w.name.as_str());
+            let name = if conversation.title.is_empty() { world.unwrap_or("New story") } else { &conversation.title };
+            let mut title = p.layout(name, theme::SMALL, None);
             title.truncate(p.fonts, item.w - 10.0 - right_w);
             let color = if selected { t.text } else { mix(t.text_muted, t.text, hover) };
             p.text(&title, item.x + 10.0, item.y + (item_h - title.height()) * 0.5, color);

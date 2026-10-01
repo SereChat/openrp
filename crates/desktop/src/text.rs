@@ -365,12 +365,35 @@ impl TextLayout {
     /// in logical pixels relative to the layout origin.
     #[must_use]
     pub fn caret(&self, byte: usize) -> (f32, f32) {
-        let byte = byte as u32;
-        let row = self.lines.partition_point(|l| l.byte_start <= byte).saturating_sub(1);
+        let row = self.lines.partition_point(|l| l.byte_start as usize <= byte).saturating_sub(1);
+        (self.x_on_line(row, byte), row as f32 * self.line_height())
+    }
+
+    /// Logical `x` of byte offset `byte` measured on line `row`: where a
+    /// wrapped line ends and the next begins, the same byte is the end of
+    /// one and the start of the other.
+    fn x_on_line(&self, row: usize, byte: usize) -> f32 {
         let line = self.lines[row];
         let glyphs = &self.glyphs[line.start as usize..line.end as usize];
-        let x = glyphs.iter().find(|g| g.byte >= byte).map_or_else(|| glyphs.last().map_or(0.0, |g| g.x + g.advance), |g| g.x);
-        (x / self.scale, row as f32 * self.line_height())
+        let x = glyphs.iter().find(|g| g.byte as usize >= byte).map_or_else(|| glyphs.last().map_or(0.0, |g| g.x + g.advance), |g| g.x);
+        x / self.scale
+    }
+
+    /// The highlight of the bytes `from..to` on each visual line, as
+    /// logical `(x0, x1, y)`. A highlight that runs on past a line's end
+    /// (or, with `continues`, past the text's end) gets a small tail there.
+    pub fn selection_spans(&self, from: usize, to: usize, continues: bool) -> impl Iterator<Item = (f32, f32, f32)> + '_ {
+        let line_h = self.line_height();
+        self.lines.iter().enumerate().filter_map(move |(row, line)| {
+            let (start, end) = (line.byte_start as usize, line.byte_end as usize);
+            let (s, e) = (from.max(start), to.min(end));
+            let past_line = to > end || continues;
+            if s > e || (s == e && !past_line) {
+                return None;
+            }
+            let tail = if past_line && e == end { 6.0 } else { 0.0 };
+            Some((self.x_on_line(row, s), self.x_on_line(row, e) + tail, row as f32 * line_h))
+        })
     }
 
     /// Byte offset closest to the logical point `(x, y)`.
@@ -651,6 +674,18 @@ mod tests {
         for (start, _, _) in l.line_spans().skip(1) {
             assert!(start == 0 || "hello world hello world".as_bytes()[start - 1] == b' ');
         }
+    }
+
+    #[test]
+    fn selections_keep_every_wrapped_line() {
+        let text = "hello world hello world";
+        let l = layout(text, Some(100.0));
+        let spans: Vec<_> = l.selection_spans(2, text.len() - 2, false).collect();
+        assert_eq!(spans.len(), l.line_count(), "{spans:?}");
+        // The first line stays highlighted to its end, not collapsed to the
+        // start of the next line (which shares that byte).
+        assert!(spans.iter().all(|(x0, x1, _)| x1 > x0), "{spans:?}");
+        assert!(spans[0].1 > 50.0, "{spans:?}");
     }
 
     #[test]

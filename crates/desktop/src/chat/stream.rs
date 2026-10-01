@@ -21,7 +21,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
-use serechat::{Completion, Error, InputItem, Role, StoredMessage, StreamEvent, ToolChoice, ToolResult, Usage, unix_now};
+use serechat::{Completion, Error, InputItem, Role, StoredMessage, StoryChange, StreamEvent, ToolChoice, ToolResult, Usage, unix_now};
 
 use super::tools;
 use super::{Chat, Conversation, Entry, Load, Reasoning, StreamingCall};
@@ -61,6 +61,9 @@ const ROLEPLAY: &str = "You play every character in an interactive roleplay stor
     with a description, in the same call as their first lines. Never add bystanders, newcomers or interruptions on your own.\n\
     - A cast member elsewhere acts only when the user brings them in; they are then moved into the scene. Use create_character \
     only for someone the user refers to who does not act yet.\n\
+    - Keep track of the scene: where the characters are and what it is like there. When it is not set yet, or it changes (the \
+    user goes somewhere, time passes, the mood or weather turns), set speak's scene to the place and its ambiance; otherwise \
+    leave it empty. Cast members who stay behind or walk off go in speak's leave.\n\
     - Never speak, act or decide for the user's character. End where the user can respond.";
 /// Stands in for the description of a character who has none.
 const UNDESCRIBED: &str = "(Not described yet: keep them consistent with what they have said and done so far.)";
@@ -71,9 +74,16 @@ const NOBODY_HERE: &str = "No one is in the scene yet. Introduce who the user me
 
 /// The system prompt of a story in `world`, played by `player`, with the
 /// characters `present` in the scene and those `absent` from it (each a
-/// name and description). `None` for a plain chat. It changes only when
-/// the story's setup does, so the provider can cache it.
-pub(super) fn story_prompt(world: Option<(&str, &str)>, player: Option<(&str, &str)>, present: &[(&str, &str)], absent: &[(&str, &str)]) -> String {
+/// name and description), in `scene` (empty until the model sets it).
+/// `None` for a plain chat. It changes only when the story's setup or
+/// scene does, so the provider can cache it.
+pub(super) fn story_prompt(
+    world: Option<(&str, &str)>,
+    player: Option<(&str, &str)>,
+    present: &[(&str, &str)],
+    absent: &[(&str, &str)],
+    scene: &str,
+) -> String {
     let Some((name, description)) = world else {
         return PLAIN_CHAT.to_owned();
     };
@@ -97,8 +107,15 @@ pub(super) fn story_prompt(world: Option<(&str, &str)>, player: Option<(&str, &s
         "These characters belong to the story but are not in the current scene. They may be mentioned, but do not have them act here unless the story brings them in.",
         absent,
     );
-    if present.is_empty() {
-        let _ = write!(prompt, "\n\n# The scene\n\n{NOBODY_HERE}");
+    let scene = scene.trim();
+    if !scene.is_empty() || present.is_empty() {
+        prompt.push_str("\n\n# The scene");
+        if !scene.is_empty() {
+            let _ = write!(prompt, "\n\n{scene}");
+        }
+        if present.is_empty() {
+            let _ = write!(prompt, "\n\n{NOBODY_HERE}");
+        }
     }
     prompt
 }
@@ -414,7 +431,7 @@ impl Chat {
             Ok(_) if target.entries[index].message.compaction => self.compacted(id, index, active.incomplete.is_some(), actions),
             Ok(_) => {
                 let player = target.player.as_ref().map(|p| p.name.clone());
-                let Conversation { entries, cast, auto_rounds, repairing, .. } = target;
+                let Conversation { entries, cast, scene, auto_rounds, repairing, .. } = target;
                 let was_repair = std::mem::take(repairing);
                 let calls = &mut entries[index].message.tool_calls;
                 if let Some(reason) = &active.incomplete {
@@ -431,12 +448,15 @@ impl Chat {
                     message.failed = true;
                     entries.push(Entry::new(note_id, message));
                 } else {
+                    let (cast_before, scene_before) = (cast.clone(), scene.clone());
                     // New characters first, so they can speak in the reply that made them.
                     for creating in [true, false] {
                         for result in calls.iter_mut().filter(|r| (r.call.name == tools::CREATE_CHARACTER) == creating) {
-                            result.output = tools::run(&result.call, cast, player.as_deref());
+                            result.output = tools::run(&result.call, cast, scene, player.as_deref());
                         }
                     }
+                    // Kept so deleting or regenerating the reply can undo it.
+                    entries[index].message.change = StoryChange::between(&cast_before, &scene_before, cast, scene);
                 }
                 let complete = active.incomplete.is_none() && *auto_rounds < AUTO_ROUNDS;
                 // Everyone who acted this turn (since the user's message) must
@@ -605,17 +625,19 @@ mod tests {
 
     #[test]
     fn story_prompts() {
-        assert_eq!(story_prompt(None, None, &[], &[]), PLAIN_CHAT);
+        assert_eq!(story_prompt(None, None, &[], &[], ""), PLAIN_CHAT);
         // Nobody in the scene: the model is told to cast someone first.
-        let alone = story_prompt(Some(("Panem", "Twelve districts.")), None, &[], &[]);
+        let alone = story_prompt(Some(("Panem", "Twelve districts.")), None, &[], &[], "");
         assert!(alone.starts_with(ROLEPLAY) && alone.ends_with(&format!("# World: Panem\n\nTwelve districts.\n\n# The scene\n\n{NOBODY_HERE}")));
-        let away = story_prompt(Some(("Panem", "")), Some(("Gale", "A hunter.")), &[], &[("Peeta", "A baker.")]);
+        let away = story_prompt(Some(("Panem", "")), Some(("Gale", "A hunter.")), &[], &[("Peeta", "A baker.")], "");
         assert!(!away.contains("# Characters in the scene") && away.contains("# The user's character: Gale\n\nA hunter."));
         assert!(away.contains("## Peeta\n\nA baker.") && away.ends_with(NOBODY_HERE), "someone elsewhere is no one here");
-        let here = story_prompt(Some(("Panem", "")), None, &[("Katniss", "A hunter.")], &[]);
+        let here = story_prompt(Some(("Panem", "")), None, &[("Katniss", "A hunter.")], &[], "");
         assert!(here.ends_with("## Katniss\n\nA hunter.") && !here.contains(NOBODY_HERE));
-        let joined = story_prompt(Some(("Panem", "")), None, &[("Rue", " ")], &[]);
+        let joined = story_prompt(Some(("Panem", "")), None, &[("Rue", " ")], &[], "");
         assert!(joined.ends_with(&format!("## Rue\n\n{UNDESCRIBED}")), "someone who joined by speaking");
+        let kitchen = story_prompt(Some(("Panem", "")), None, &[("Katniss", "A hunter.")], &[], " The bakery, before dawn. ");
+        assert!(kitchen.ends_with("## Katniss\n\nA hunter.\n\n# The scene\n\nThe bakery, before dawn."));
     }
 
     #[test]

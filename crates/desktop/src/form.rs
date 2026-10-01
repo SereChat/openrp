@@ -18,26 +18,41 @@ use crate::ui::{Ui, edit_key, id, move_line};
 /// Space between a field's border and its text.
 pub const FIELD_PAD: (f32, f32) = (12.0, 10.0);
 
-/// `N` text fields, one of them focused.
-pub struct Fields<const N: usize> {
-    editors: [Editor; N],
-    multiline: [bool; N],
+/// Text fields, one of them focused.
+pub struct Fields {
+    editors: Vec<Editor>,
+    multiline: Vec<bool>,
     focus: usize,
     /// The field a mouse drag is selecting in.
     selecting: Option<usize>,
     /// Each field's layout and text origin from the last frame, for the
     /// arrow keys.
-    layouts: [Option<(TextLayout, (f32, f32))>; N],
+    layouts: Vec<Option<(TextLayout, (f32, f32))>>,
     /// The focused field's caret, for placing the input method's window.
     caret: Option<Rect>,
 }
 
-impl<const N: usize> Fields<N> {
+impl Fields {
     /// Fields holding `editors`, the first focused; `multiline` says which
     /// take several lines.
     #[must_use]
-    pub fn new(editors: [Editor; N], multiline: [bool; N]) -> Self {
-        Self { editors, multiline, focus: 0, selecting: None, layouts: std::array::from_fn(|_| None), caret: None }
+    pub fn new<const N: usize>(editors: [Editor; N], multiline: [bool; N]) -> Self {
+        Self { editors: editors.into(), multiline: multiline.into(), focus: 0, selecting: None, layouts: vec![None; N], caret: None }
+    }
+
+    /// Multi-line fields holding `texts` (at least one), the first focused.
+    #[must_use]
+    pub fn multiline(texts: &[String]) -> Self {
+        let editors: Vec<Editor> = texts
+            .iter()
+            .map(|text| {
+                let mut editor = Editor::default();
+                editor.insert(text);
+                editor
+            })
+            .collect();
+        let n = editors.len();
+        Self { editors, multiline: vec![true; n], focus: 0, selecting: None, layouts: vec![None; n], caret: None }
     }
 
     /// The text of field `index`.
@@ -69,14 +84,15 @@ impl<const N: usize> Fields<N> {
         let focus = self.focus;
         match &event.logical_key {
             Key::Named(NamedKey::Tab) => {
-                self.focus = if mods.shift_key() { (focus + N - 1) % N } else { (focus + 1) % N };
+                let n = self.editors.len();
+                self.focus = if mods.shift_key() { (focus + n - 1) % n } else { (focus + 1) % n };
                 true
             }
             Key::Named(NamedKey::Enter) if self.multiline[focus] && !mods.control_key() && !mods.super_key() => {
                 self.editors[focus].insert("\n");
                 true
             }
-            Key::Named(NamedKey::Enter) if focus + 1 < N && !mods.control_key() && !mods.super_key() => {
+            Key::Named(NamedKey::Enter) if focus + 1 < self.editors.len() && !mods.control_key() && !mods.super_key() => {
                 self.focus += 1;
                 true
             }
@@ -137,14 +153,8 @@ impl<const N: usize> Fields<N> {
         let selection = editor.selection();
         let line_h = layout.line_height();
         if focused && !selection.is_empty() {
-            for (start, end, y) in layout.line_spans() {
-                let (from, to) = (selection.start.max(start), selection.end.min(end));
-                if from > to || (from == to && selection.end <= end) {
-                    continue;
-                }
-                let x0 = layout.caret(from).0;
-                // A selected line break shows as a small tail.
-                let x1 = if selection.end > end { layout.caret(to).0 + 6.0 } else { layout.caret(to).0 };
+            // A selected line break shows as a small tail.
+            for (x0, x1, y) in layout.selection_spans(selection.start, selection.end, false) {
                 p.rect(Rect::new(origin.0 + x0, origin.1 + y, x1 - x0, line_h), t.selection, 2.0);
             }
         }
