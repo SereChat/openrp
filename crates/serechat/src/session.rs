@@ -61,6 +61,10 @@ pub struct Session {
     /// sent with every request.
     #[serde(skip_serializing_if = "String::is_empty")]
     pub note: String,
+    /// How many of `messages` the last memory review had read, so the next
+    /// one covers only what came after.
+    #[serde(skip_serializing_if = "is_default")]
+    pub reviewed: usize,
     /// Every turn, oldest first.
     pub messages: Vec<StoredMessage>,
 }

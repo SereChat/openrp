@@ -40,8 +40,8 @@ use crate::ui::{Ui, copy, edit_key, move_line};
 use composer::Command;
 pub use dialog::GenerateJob;
 use stream::{ActiveStream, Retry};
-pub use stream::{SendJob, input_items};
-pub use tools::{generator_tool, tool_definitions};
+pub use stream::{ReviewJob, SendJob, input_items};
+pub use tools::{generator_tool, remember_tool, tool_definitions};
 
 /// Model used until the user picks one.
 pub const DEFAULT_MODEL: &str = "claude-sonnet-5.5";
@@ -345,6 +345,10 @@ struct Conversation {
     memories: Vec<String>,
     /// The user's author's note: guidance for the whole story.
     note: String,
+    /// How many entries the last memory review had read.
+    reviewed: usize,
+    /// The memory review being waited for: its request id and model.
+    reviewing: Option<(u64, String)>,
     /// Replies in a row that continued on their own after only calling
     /// tools; reset by every prompt.
     auto_rounds: u32,
@@ -378,6 +382,8 @@ impl Conversation {
             scene: String::new(),
             memories: Vec::new(),
             note: String::new(),
+            reviewed: 0,
+            reviewing: None,
             auto_rounds: 0,
             repairing: false,
             load: Load::Loaded,
@@ -425,6 +431,7 @@ impl Conversation {
             scene: self.scene.clone(),
             memories: self.memories.clone(),
             note: self.note.clone(),
+            reviewed: self.reviewed,
             messages: self
                 .entries
                 .iter()
@@ -721,6 +728,7 @@ impl Chat {
             Command::Ooc => self.composer.insert("/ooc "),
             Command::Note => self.edit_note(),
             Command::Memory => self.edit_memories(),
+            Command::Memorize => self.review_memories(current, true, actions),
             Command::Duplicate => self.duplicate(current, false, actions),
             Command::Frame => self.duplicate(current, true, actions),
         }
@@ -755,6 +763,7 @@ impl Chat {
             session.messages.clear();
             session.memories.clear();
             session.scene.clear();
+            session.reviewed = 0;
         } else {
             if !session.title.is_empty() {
                 session.title.push_str(" (copy)");
@@ -829,6 +838,7 @@ impl Chat {
         conversation.scene = session.scene;
         conversation.memories = session.memories;
         conversation.note = session.note;
+        conversation.reviewed = session.reviewed;
         conversation.load = Load::Loaded;
         if let Some((id, frame)) = self.pending_duplicate.take_if(|(id, _)| *id == conversation_id) {
             self.duplicate(id, frame, actions);
@@ -1023,6 +1033,15 @@ impl Chat {
             Pick::Settings => self.show(Page::Settings),
             Pick::Worlds => self.show(Page::Library(Kind::World)),
             Pick::Characters => self.show(Page::Library(Kind::Character)),
+            Pick::World(id) => {
+                self.show(Page::Library(Kind::World));
+                self.library.open_form(Kind::World, &id);
+            }
+            Pick::Character(id) => {
+                self.show(Page::Library(Kind::Character));
+                self.library.open_form(Kind::Character, &id);
+            }
+            Pick::Play(world) => self.play(world),
             Pick::Theme(scheme) => actions.push(Action::SetTheme(scheme)),
             Pick::Session(session) => {
                 if let Some(id) = self.conversations.iter().find(|c| c.session_id == session).map(|c| c.id) {
@@ -1186,8 +1205,13 @@ impl Chat {
                     .conversations
                     .iter()
                     .filter(|c| !c.is_fresh())
-                    .map(|c| crate::spotlight::SessionRef { id: &c.session_id, title: &c.title, updated: c.updated })
+                    .map(|c| {
+                        let world = c.world.as_deref().and_then(|w| self.library.get(Kind::World, w)).map_or("", |w| w.name.as_str());
+                        crate::spotlight::SessionRef { id: &c.session_id, title: &c.title, world, updated: c.updated }
+                    })
                     .collect(),
+                worlds: self.library.list(Kind::World),
+                characters: self.library.list(Kind::Character),
                 models: &self.models,
                 model: &self.model,
                 scheme,
@@ -1415,6 +1439,7 @@ mod tests {
             scene: String::new(),
             memories: vec!["A fact.".into()],
             note: "Keep it light.".into(),
+            reviewed: 0,
             messages: vec![StoredMessage::new(Role::User, "hi".into()), reply],
         };
         let mut chat = Chat::new(None, Reasoning::Auto, vec![session.summary()]);
@@ -1627,6 +1652,46 @@ mod tests {
         let mut actions = Vec::new();
         chat.regenerate(&mut actions);
         assert!(chat.current().memories.is_empty());
+    }
+
+    #[test]
+    fn memories_are_reviewed_every_few_prompts() {
+        let review_of = |actions: Vec<Action>| actions.into_iter().find_map(|a| if let Action::ReviewMemories(job) = a { Some(job) } else { None });
+        let mut chat = new_chat();
+        let mut due = None;
+        for turn in 1..=8 {
+            let job = start(&mut chat, &format!("turn {turn}"));
+            due = review_of(finish_saying(&mut chat, &job, "Go on.", Completion::default()));
+            assert_eq!(due.is_some(), turn == 8, "turn {turn}");
+        }
+        let review = due.expect("a review after eight prompts");
+        assert!(review.transcript.starts_with("Gale: turn 1") && review.transcript.ends_with("Gale: Go on."));
+        let (id, memory) = (chat.current().id, r#"{"memories":["Gale trusts Peeta."]}"#);
+        let remember = |arguments: &str| ToolCall { call_id: "m".into(), name: tools::REMEMBER.into(), arguments: arguments.into() };
+
+        // One at a time, even when asked.
+        let mut actions = Vec::new();
+        chat.review_memories(id, true, &mut actions);
+        assert!(actions.is_empty());
+
+        // The answer joins the memories once; a repeat of it is stale.
+        chat.memories_reviewed(id, review.request, Ok((Some(remember(memory)), Usage::new(10, 5))), &mut actions);
+        assert!(matches!(&actions[..], [Action::SaveSession(s)] if s.memories == ["Gale trusts Peeta."] && s.reviewed == 16));
+        chat.memories_reviewed(id, review.request, Ok((Some(remember(r#"{"memories":["Stale."]}"#)), Usage::default())), &mut Vec::new());
+        assert_eq!(chat.current().memories, ["Gale trusts Peeta."]);
+
+        // Not due again at once; /memorize reads what came since.
+        let job = start(&mut chat, "turn 9");
+        assert!(review_of(finish_saying(&mut chat, &job, "Go on.", Completion::default())).is_none());
+        let mut actions = Vec::new();
+        chat.review_memories(id, true, &mut actions);
+        let forced = review_of(actions).expect("asked for");
+        assert!(forced.transcript.starts_with("Gale: turn 9") && forced.instructions.contains("- Gale trusts Peeta."));
+
+        // A failed review changes nothing and lets the next one run.
+        let error = Error::Response { code: None, message: "boom".into() };
+        chat.memories_reviewed(id, forced.request, Err(error), &mut Vec::new());
+        assert!(chat.current().reviewing.is_none() && chat.current().memories.len() == 1);
     }
 
     #[test]

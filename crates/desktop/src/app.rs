@@ -16,14 +16,14 @@ use std::time::{Duration, Instant};
 use arboard::Clipboard;
 use serechat::{
     AccessToken, Character, Client, Config, Error, InputItem, Library, Model, Portraits, ResponseRequest, Role, SearchHit, Session, SessionStore,
-    SessionSummary, StreamEvent, ToolCall, ToolChoice, ToolSpec, World,
+    SessionSummary, StreamEvent, ToolCall, ToolChoice, ToolSpec, Usage, World,
 };
 use winit::dpi::{LogicalPosition, LogicalSize};
 use winit::event::{ElementState, Ime, MouseButton, MouseScrollDelta, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoopProxy};
 use winit::window::{CursorIcon, Theme, UserAttentionType, Window};
 
-use crate::chat::{self, Chat, GenerateJob, Reasoning, ReasoningView, SendJob};
+use crate::chat::{self, Chat, GenerateJob, Reasoning, ReasoningView, ReviewJob, SendJob};
 use crate::gpu::{GpuError, Instance, Renderer};
 use crate::image::{self, ImageAtlas, ImageKey};
 use crate::library::Kind;
@@ -82,6 +82,15 @@ pub enum WorkerEvent {
         /// The call it made, if it made one.
         result: Result<Option<ToolCall>, Error>,
     },
+    /// The memory review answered.
+    MemoriesReviewed {
+        /// Conversation it was for.
+        conversation: u64,
+        /// Request id.
+        request: u64,
+        /// The call it made, if it made one, and what the request used.
+        result: Result<(Option<ToolCall>, Usage), Error>,
+    },
     /// The saved worlds and characters were read.
     Library {
         /// Every world, in no particular order.
@@ -122,6 +131,8 @@ pub enum Action {
     Send(SendJob),
     /// Ask the character generator for someone.
     GenerateCharacter(GenerateJob),
+    /// Ask the memory reviewer what a story must not forget.
+    ReviewMemories(ReviewJob),
     /// Persist a model choice.
     SelectModel(String),
     /// Persist a reasoning effort.
@@ -503,6 +514,9 @@ impl App {
             (WorkerEvent::CharacterGenerated { conversation, request, result }, Screen::Chat(chat)) => {
                 chat.character_generated(conversation, request, result);
             }
+            (WorkerEvent::MemoriesReviewed { conversation, request, result }, Screen::Chat(chat)) => {
+                chat.memories_reviewed(conversation, request, result, &mut actions);
+            }
             (WorkerEvent::SearchResults { generation, hits }, Screen::Chat(chat)) => chat.search_results(generation, hits),
             // Results for a screen that is no longer shown.
             _ => return,
@@ -568,6 +582,30 @@ impl App {
                     }
                 });
                 WorkerEvent::CharacterGenerated { conversation: job.conversation, request: job.request, result: result.map(|_| made) }
+            }),
+            // ponytail: like the generator, not streamed or cancellable; a
+            // failed review is dropped and the next one is a few prompts away.
+            Action::ReviewMemories(job) => self.spawn(move |client, _| {
+                let (name, description, parameters) = chat::remember_tool();
+                let request = ResponseRequest {
+                    model: &job.model,
+                    instructions: Some(&job.instructions),
+                    reasoning: job.reasoning,
+                    input: &[InputItem::text(Role::User, job.transcript)],
+                    tools: &[ToolSpec { name, description, parameters: &parameters }],
+                    tool_choice: Some(ToolChoice::Function(name)),
+                };
+                let (mut made, mut used) = (None, Usage::default());
+                let result = client.stream_response(&request, &AtomicBool::new(false), |event| {
+                    // A call cut off may be incomplete: not used.
+                    if let StreamEvent::Completed(completion) = event {
+                        used = completion.usage;
+                        if completion.incomplete.is_none() {
+                            made = completion.tool_calls.into_iter().next();
+                        }
+                    }
+                });
+                WorkerEvent::MemoriesReviewed { conversation: job.conversation, request: job.request, result: result.map(|_| (made, used)) }
             }),
             Action::SelectModel(model) => {
                 self.config.model = Some(model);

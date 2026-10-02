@@ -24,7 +24,7 @@ cargo clippy --workspace --all-targets
   someone the AI plays, kept in one library to cast in any story. Each has a name, a
   description and an optional portrait (PNG or JPEG), created and edited in a form
   (Ctrl/Cmd+S saves, Esc goes back).
-- **Stories**: **Play** on a world (Ctrl/Cmd+N opens the worlds) starts a session in it, which
+- **Stories**: Clicking a world (**Edit** opens its form) (Ctrl/Cmd+N opens the worlds) starts a session in it, which
   first asks who you play: your character's name and description (the **You** chip edits them
   later). **Begin** saves the story and lists it in the sidebar. The strip under the header
   shows the current scene (click it to change it yourself) and holds the story's cast: **+ Add** brings in characters from the
@@ -65,14 +65,18 @@ cargo clippy --workspace --all-targets
   and carries on from the summary (the full history stays visible). A reply that stops early
   (an error, Esc or closing the app) shows a **Continue** button. Replies keep streaming in
   chats you switch away from.
-- **Spotlight** (Ctrl/Cmd+K): one search over commands, sessions, models, themes and the full
-  text of every saved message.
+- **Spotlight** (Ctrl/Cmd+K): one search over commands, stories, worlds, characters, models,
+  themes and the full text of every saved message. A story also matches the name of its world,
+  so typing a world lists the stories played in it; a world opens its page or starts a story
+  (**Play**), and a character opens its form. Worlds and characters match by description too.
 - **Memories**: the AI keeps what the story must not forget (promises, secrets, injuries,
   changed relationships) with a `remember` tool, shown as a small note in the reply. They are
   sent with every request, so they survive summarising; **Memory** beside the scene lists
   them in a dialog where each can be edited or removed (×), and new ones added (Enter or
   **+ Add memory**). Regenerating or deleting the reply that remembered something forgets it
-  again.
+  again. Every 8 prompts a separate request reads the turns since the last time and adds what
+  the story must not forget (Memory shows "…" while it works; it is billed with the next
+  reply, and a failed one is skipped). `/memorize` runs it at once.
 - **Author's note and OOC**: **Note** beside the scene holds your guidance for the whole story
   (tone, pacing, limits), sent last in every request. For one reply only, end a message with a
   line starting `/ooc` (or send just `/ooc …` to nudge the story): the model is told it is your
@@ -83,7 +87,7 @@ cargo clippy --workspace --all-targets
   (replies are not billed twice), or as a **frame**: the world, your character, the cast and
   the author's note, ready for a new story.
 - **Slash commands** in the composer, completed as you type (Tab completes, Enter runs, Esc
-  dismisses): `/ooc`, `/note`, `/memory`, `/duplicate`, `/frame`, and `/clear`, which deletes
+  dismisses): `/ooc`, `/note`, `/memory`, `/memorize`, `/duplicate`, `/frame`, and `/clear`, which deletes
   the open story and starts it over in the same world, cast and note.
 - **Emoji and CJK**: colour emoji (Twemoji), and Chinese, Japanese and Korean text through the
   operating system's fonts, with input-method (IME) support for typing them.

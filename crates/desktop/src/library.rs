@@ -73,7 +73,7 @@ impl Kind {
     /// What the page holds, in a sentence.
     fn blurb(self) -> &'static str {
         match self {
-            Self::World => "Settings for your stories, like Panem or a galaxy far, far away. Press Play to start one.",
+            Self::World => "Settings for your stories, like Panem or a galaxy far, far away. Click one to play it.",
             Self::Character => "People the AI plays, ready to cast in any story. A story keeps its own copy.",
         }
     }
@@ -362,7 +362,6 @@ impl LibraryView {
     }
 
     /// Opens the form of record `id`, as clicking its card does.
-    #[cfg(test)]
     pub fn open_form(&mut self, kind: Kind, id: &str) {
         self.form = self.get(kind, id).cloned().map(|r| Form::new(kind, Some(r)));
     }
@@ -466,16 +465,18 @@ impl LibraryView {
             portrait(p, self.portrait_path(&record.portrait).as_deref(), &record.name, face, theme::RADIUS_SM);
             let text_x = face.right() + 14.0;
 
-            // Play on the right, for worlds.
+            // Edit on the right, for worlds: clicking the card plays instead.
             let mut right = card.right() - 14.0;
-            let mut on_play = false;
+            let mut on_edit = false;
             if kind == Kind::World {
-                let play_button = Rect::new(right - 72.0, card.y + (CARD_H - 30.0) * 0.5, 72.0, 30.0);
-                on_play = play_button.contains(ui.mouse);
-                if button(p, ui, play_button, "Play", ButtonStyle::Primary, interactive) {
-                    play = Some(record.id.clone());
+                let edit_button = Rect::new(right - 72.0, card.y + (CARD_H - 30.0) * 0.5, 72.0, 30.0);
+                on_edit = edit_button.contains(ui.mouse);
+                // Inert only where the mouse is over this button through the header
+                // (it is scrolled beneath): hovering the header or sidebar elsewhere must not dim it.
+                if button(p, ui, edit_button, "Edit", ButtonStyle::Primary, interactive || !on_edit) {
+                    opened = Some(index);
                 }
-                right = play_button.x - 14.0;
+                right = edit_button.x - 14.0;
             }
             let mut name = p.layout(&record.name, theme::LABEL, None);
             name.truncate(p.fonts, right - text_x);
@@ -484,10 +485,14 @@ impl LibraryView {
             let mut summary = p.layout(summary, theme::SMALL, None);
             summary.truncate(p.fonts, right - text_x);
             p.text(&summary, text_x, card.y + 43.0, t.text_muted);
-            if hovered && !on_play {
+            if hovered && !on_edit {
                 ui.cursor = CursorIcon::Pointer;
                 if ui.clicked(card) {
-                    opened = Some(index);
+                    if kind == Kind::World {
+                        play = Some(record.id.clone());
+                    } else {
+                        opened = Some(index);
+                    }
                 }
             }
         }
@@ -527,7 +532,7 @@ impl LibraryView {
         let mut play = false;
         if kind == Kind::World && !form.new {
             let play_button = Rect::new(right - 72.0, back.y, 72.0, 30.0);
-            play = button(p, ui, play_button, "Play", ButtonStyle::Secondary, true);
+            play = button(p, ui, play_button, "Play", ButtonStyle::Secondary, can_save);
             right = play_button.x - 8.0;
         }
         let mut duplicated = false;

@@ -24,6 +24,8 @@ pub(super) enum Command {
     Note,
     /// Opens the story's memories.
     Memory,
+    /// Has the AI add what the latest turns taught the story to its memories.
+    Memorize,
     /// Copies the story exactly.
     Duplicate,
     /// Copies the story's setup without what happened.
@@ -31,7 +33,7 @@ pub(super) enum Command {
 }
 
 impl Command {
-    const ALL: [Self; 6] = [Self::Ooc, Self::Note, Self::Memory, Self::Duplicate, Self::Frame, Self::Clear];
+    const ALL: [Self; 7] = [Self::Ooc, Self::Note, Self::Memory, Self::Memorize, Self::Duplicate, Self::Frame, Self::Clear];
 
     /// What follows the slash.
     pub(super) fn name(self) -> &'static str {
@@ -40,6 +42,7 @@ impl Command {
             Self::Ooc => "ooc",
             Self::Note => "note",
             Self::Memory => "memory",
+            Self::Memorize => "memorize",
             Self::Duplicate => "duplicate",
             Self::Frame => "frame",
         }
@@ -52,6 +55,7 @@ impl Command {
             Self::Ooc => "Tell the AI something out of character",
             Self::Note => "Author's note for the whole story",
             Self::Memory => "What the story remembers",
+            Self::Memorize => "Add the latest turns to the memories",
             Self::Duplicate => "Copy this story exactly",
             Self::Frame => "New story with this cast and setup",
         }

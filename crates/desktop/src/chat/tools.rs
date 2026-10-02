@@ -31,7 +31,7 @@
 use std::fmt::Write as _;
 
 use serde_json::{Value, json};
-use serechat::{CastMember, ToolCall, ToolResult, new_id};
+use serechat::{CastMember, Role, StoredMessage, ToolCall, ToolResult, new_id};
 
 /// The speech tool's name.
 pub const SPEAK: &str = "speak";
@@ -109,24 +109,31 @@ pub fn tool_definitions() -> Vec<(&'static str, &'static str, Value)> {
                 "required": ["name", "description"]
             }),
         ),
-        (
-            REMEMBER,
-            "Keep facts the story must not forget, in its memories (shown to you in every request, even after the conversation \
-             is summarised): promises, secrets revealed, decisions, injuries, how relationships changed, what someone now owns or \
-             knows. Call it in the same reply as speak, only for what matters later, never for what the memories already hold.",
-            json!({
-                "type": "object",
-                "properties": {
-                    "memories": {
-                        "type": "array",
-                        "description": "Each a short, self-contained fact naming who it is about, e.g. \"Katniss promised Prim she would come home.\"",
-                        "items": { "type": "string" }
-                    }
-                },
-                "required": ["memories"]
-            }),
-        ),
+        remember_tool(),
     ]
+}
+
+/// The memory tool as (name, description, JSON Schema of its arguments);
+/// the memory review is offered it alone.
+#[must_use]
+pub fn remember_tool() -> (&'static str, &'static str, Value) {
+    (
+        REMEMBER,
+        "Keep facts the story must not forget, in its memories (shown to you in every request, even after the conversation \
+         is summarised): promises, secrets revealed, decisions, injuries, how relationships changed, what someone now owns or \
+         knows. Call it in the same reply as speak, only for what matters later, never for what the memories already hold.",
+        json!({
+            "type": "object",
+            "properties": {
+                "memories": {
+                    "type": "array",
+                    "description": "Each a short, self-contained fact naming who it is about, e.g. \"Katniss promised Prim she would come home.\"",
+                    "items": { "type": "string" }
+                }
+            },
+            "required": ["memories"]
+        }),
+    )
 }
 
 /// A user's message in a story as shown (Markdown): what they wrote, with
@@ -187,7 +194,12 @@ pub fn generator_tool() -> (&'static str, &'static str, Value) {
 /// description), played by `player`, whose `cast` holds these names.
 #[must_use]
 pub fn generator_prompt(world: Option<(&str, &str)>, player: Option<&str>, cast: &[&str]) -> String {
-    let mut prompt = GENERATOR.to_owned();
+    with_story(GENERATOR, world, player, cast)
+}
+
+/// `instructions` followed by the story's world, player and cast names.
+fn with_story(instructions: &str, world: Option<(&str, &str)>, player: Option<&str>, cast: &[&str]) -> String {
+    let mut prompt = instructions.to_owned();
     if let Some((name, description)) = world {
         let _ = write!(prompt, "\n\n# World: {name}\n\n{description}");
     }
@@ -198,6 +210,67 @@ pub fn generator_prompt(world: Option<(&str, &str)>, player: Option<&str>, cast:
         let _ = write!(prompt, "\n\n# Already in the cast\n\n{}", cast.join(", "));
     }
     prompt
+}
+
+/// System instructions of the memory review, which can do one thing.
+const REVIEWER: &str = "You keep the memory of an interactive roleplay story. Below is a transcript of its latest turns. Your only \
+    job is to call remember once with the facts from it that the story must not forget, and write nothing else: promises, secrets \
+    revealed, decisions, injuries, how relationships changed, what someone now owns or knows, where things stand between \
+    characters. Fold several small events into one fact when they belong together. Each fact is short, self-contained and names \
+    who it is about. Never repeat or rephrase a memory that exists already, and skip anything that is only scenery or passing \
+    dialogue. If nothing deserves keeping, call remember with an empty list.";
+
+/// The memory review's system prompt for a story in `world` (name and
+/// description), played by `player`, with these `cast` names and the
+/// `memories` it holds already.
+#[must_use]
+pub fn reviewer_prompt(world: Option<(&str, &str)>, player: Option<&str>, cast: &[&str], memories: &[String]) -> String {
+    let mut prompt = with_story(REVIEWER, world, player, cast);
+    if !memories.is_empty() {
+        prompt.push_str("\n\n# Memories already kept\n");
+        for memory in memories {
+            let _ = write!(prompt, "\n- {memory}");
+        }
+    }
+    prompt
+}
+
+/// The latest `limit` characters of `messages` as a plain transcript for
+/// the memory review: one line per speaker, `player` for the user's
+/// messages, and scene changes in brackets. Out-of-character instructions,
+/// errors, summaries and the memories replies noted are left out.
+#[must_use]
+pub fn transcript(messages: &[StoredMessage], player: &str, limit: usize) -> String {
+    let mut out = String::new();
+    for message in messages.iter().filter(|m| !m.failed && !m.compaction) {
+        if message.role == Role::User {
+            let said = split_ooc(&message.content).0;
+            if !said.is_empty() {
+                let _ = writeln!(out, "{player}: {said}\n");
+            }
+            continue;
+        }
+        let mut shown = parts(message.tool_calls.iter().map(|r| (r.call.name.as_str(), r.call.arguments.as_str())), false);
+        if shown.is_empty() {
+            shown = parse(&message.content);
+        }
+        for part in shown {
+            match part {
+                Part::Said { character, text } => {
+                    let _ = writeln!(out, "{character}: {text}\n");
+                }
+                Part::Note(note) if !note.starts_with("Remembered: ") => {
+                    let _ = writeln!(out, "[{note}]\n");
+                }
+                Part::Note(_) => {}
+            }
+        }
+    }
+    let out = out.trim_end();
+    match out.char_indices().rev().nth(limit) {
+        Some((at, c)) => format!("…{}", &out[at + c.len_utf8()..]),
+        None => out.to_owned(),
+    }
 }
 
 /// The (name, description) a generator call made, if it made someone.
@@ -652,6 +725,27 @@ mod tests {
 
     fn member(name: &str, present: bool) -> CastMember {
         CastMember { id: name.to_lowercase(), name: name.into(), description: format!("{name}, described."), present, ..CastMember::default() }
+    }
+
+    #[test]
+    fn the_memory_review_reads_a_plain_transcript() {
+        let mut reply = StoredMessage::new(Role::Assistant, String::new());
+        let speak = json!({ "scene": "The woods.", "messages": [{ "character": "Katniss", "action": "lowers her bow", "text": "Stay back." }] });
+        reply.tool_calls = vec![ToolResult { call: call(SPEAK, &speak), output: String::new() }, ToolResult { call: call(REMEMBER, &json!({ "memories": ["x"] })), output: String::new() }];
+        let mut failed = StoredMessage::new(Role::Assistant, "Boom.".into());
+        failed.failed = true;
+        let old = StoredMessage::new(Role::Assistant, "**Peeta**: Hello.".into());
+        let messages = [StoredMessage::new(Role::User, "I wave.\n/ooc be brief".into()), reply, failed, old];
+        let text = transcript(&messages, "Gale", 10_000);
+        assert_eq!(text, "Gale: I wave.\n\n[The woods.]\n\nKatniss: *lowers her bow* Stay back.\n\nPeeta: Hello.");
+
+        // Only the end is kept, and never cut inside a character.
+        assert_eq!(transcript(&messages, "Gale", 6), "…Hello.");
+        assert_eq!(transcript(&[StoredMessage::new(Role::User, "ééé".into())], "G", 3), "…ééé");
+        assert!(transcript(&[], "Gale", 5).is_empty());
+
+        let prompt = reviewer_prompt(Some(("Panem", "Twelve districts.")), Some("Gale"), &["Katniss"], &["Rue is hurt.".to_owned()]);
+        assert!(prompt.starts_with(REVIEWER) && prompt.contains("# World: Panem") && prompt.ends_with("- Rue is hurt."));
     }
 
     #[test]

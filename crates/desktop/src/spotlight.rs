@@ -1,6 +1,7 @@
-//! Spotlight: a keyboard-first search over everything (commands, sessions,
-//! models and themes), plus full-text search of every saved message on a
-//! worker thread.
+//! Spotlight: a keyboard-first search over everything (commands, stories,
+//! worlds, characters, models and themes), plus full-text search of every
+//! saved message on a worker thread. A story also matches its world's name,
+//! so typing a world lists its stories.
 
 use arboard::Clipboard;
 use serechat::{Model, SearchHit};
@@ -10,6 +11,7 @@ use winit::window::CursorIcon;
 
 use crate::app::Action;
 use crate::editor::Editor;
+use crate::library::Record;
 use crate::paint::{Painter, Rect, hexa};
 use crate::text::Style;
 use crate::theme::{self, Scheme};
@@ -33,6 +35,12 @@ pub enum Pick {
     Worlds,
     /// Show the characters.
     Characters,
+    /// Open a world's page, with its stories, by id.
+    World(String),
+    /// Start a story in a world, by id.
+    Play(String),
+    /// Open a library character's form by id.
+    Character(String),
     /// Open a session by id.
     Session(String),
     /// Use a model.
@@ -45,6 +53,8 @@ pub struct SessionRef<'a> {
     pub id: &'a str,
     /// Title.
     pub title: &'a str,
+    /// Name of the world it is played in; empty for none.
+    pub world: &'a str,
     /// Last activity.
     pub updated: u64,
 }
@@ -53,6 +63,10 @@ pub struct SessionRef<'a> {
 pub struct Context<'a> {
     /// Saved sessions.
     pub sessions: Vec<SessionRef<'a>>,
+    /// The worlds in the library.
+    pub worlds: &'a [Record],
+    /// The characters in the library.
+    pub characters: &'a [Record],
     /// Available models.
     pub models: &'a [Model],
     /// Selected model id.
@@ -147,14 +161,16 @@ impl Spotlight {
         let mut rows = Vec::new();
         let mut group = |name: &'static str, mut items: Vec<Row>| {
             items.sort_by_key(|r| std::cmp::Reverse(r.score));
-            items.truncate(if query.is_empty() && name == "Sessions" { 8 } else { PER_GROUP });
+            // A world's stories can be many: sessions get a longer list.
+            items.truncate(if name == "Sessions" { 8 } else { PER_GROUP });
             rows.extend(items.into_iter().map(|r| Row { group: name, ..r }));
         };
-        // Titles match fuzzily; details only as plain substrings, or long
-        // descriptions would match almost any short query.
-        let row = |title: &str, detail: String, pick: Pick, extra: i32| {
-            let in_detail = || (!query.is_empty() && detail.to_lowercase().contains(&query)).then_some(100);
-            fuzzy(&query, title).or_else(in_detail).map(|score| Row { group: "", title: title.to_owned(), detail, pick, score: score + extra })
+        // Titles match fuzzily; `also` (a detail, a world's name, a long
+        // description) only as a plain substring, or it would match almost
+        // any short query.
+        let row = |title: &str, also: &str, detail: String, pick: Pick, extra: i32| {
+            let in_also = || (!query.is_empty() && also.to_lowercase().contains(&query)).then_some(100);
+            fuzzy(&query, title).or_else(in_also).map(|score| Row { group: "", title: title.to_owned(), detail, pick, score: score + extra })
         };
 
         let commands = [
@@ -163,12 +179,12 @@ impl Spotlight {
             ("Characters", "People the AI plays", Pick::Characters),
             ("Settings", "Appearance, usage, data and account", Pick::Settings),
         ];
-        group("Commands", commands.into_iter().filter_map(|(t, d, p)| row(t, d.to_owned(), p, 0)).collect());
+        group("Commands", commands.into_iter().filter_map(|(t, d, p)| row(t, d, d.to_owned(), p, 0)).collect());
         if !query.is_empty() {
             let themes = Scheme::ALL.into_iter().filter(|s| *s != cx.scheme);
             group(
                 "Commands",
-                themes.filter_map(|s| row(&format!("Theme: {}", s.label()), "Switch colour scheme".into(), Pick::Theme(s), -5)).collect(),
+                themes.filter_map(|s| row(&format!("Theme: {}", s.label()), "Switch colour scheme", "Switch colour scheme".into(), Pick::Theme(s), -5)).collect(),
             );
         }
         let now = serechat::unix_now();
@@ -179,11 +195,21 @@ impl Spotlight {
                 .filter_map(|s| {
                     // Recent sessions first when nothing is typed.
                     let recency = -((now.saturating_sub(s.updated) / 3600).min(10_000) as i32);
-                    row(s.title, ago(now, s.updated), Pick::Session(s.id.to_owned()), if query.is_empty() { recency } else { 0 })
+                    let detail = if s.world.is_empty() { ago(now, s.updated) } else { format!("{} · {}", s.world, ago(now, s.updated)) };
+                    row(s.title, s.world, detail, Pick::Session(s.id.to_owned()), if query.is_empty() { recency } else { 0 })
                 })
                 .collect(),
         );
+        // The library only shows once something is typed, like models: a
+        // world to open or play, and the characters. Descriptions match too.
         if !query.is_empty() {
+            let worlds = cx.worlds.iter().flat_map(|w| {
+                let open = row(&w.name, &w.description, "World".into(), Pick::World(w.id.clone()), 0);
+                let play = row(&format!("Play {}", w.name), "", "Start a story".into(), Pick::Play(w.id.clone()), -10);
+                open.into_iter().chain(play)
+            });
+            group("Worlds", worlds.collect());
+            group("Characters", cx.characters.iter().filter_map(|c| row(&c.name, &c.description, "Character".into(), Pick::Character(c.id.clone()), 0)).collect());
             group(
                 "Models",
                 cx.models
@@ -191,7 +217,7 @@ impl Spotlight {
                     .filter_map(|m| {
                         let name = if m.name.is_empty() { &m.id } else { &m.name };
                         let current = if m.id == cx.model { "Current model" } else { "Switch to this model" };
-                        row(name, current.into(), Pick::Model(m.id.clone()), -20)
+                        row(name, current, current.into(), Pick::Model(m.id.clone()), -20)
                     })
                     .collect(),
             );
@@ -282,7 +308,7 @@ impl Spotlight {
             p.rect(Rect::new(origin.0 + a, origin.1, b - a, text.height()), t.selection, 2.0);
         }
         if self.input.text().is_empty() {
-            p.label("Search sessions, models and commands…", style, origin.0, origin.1, t.text_faint);
+            p.label("Search stories, worlds, characters and commands…", style, origin.0, origin.1, t.text_faint);
         } else {
             p.text(&text, origin.0, origin.1, t.text);
         }
@@ -416,6 +442,13 @@ fn magnifier(p: &mut Painter, x: f32, y: f32, color: crate::paint::Color) {
 mod tests {
     use super::*;
 
+    /// A world and a character in the library.
+    fn library() -> (Vec<Record>, Vec<Record>) {
+        let world = serechat::World { id: "w1".into(), name: "Panem".into(), description: "Twelve districts under the Capitol.".into(), ..Default::default() };
+        let hunter = serechat::Character { id: "c1".into(), name: "Katniss".into(), description: "A hunter from District 12.".into(), ..Default::default() };
+        (vec![world.into()], vec![hunter.into()])
+    }
+
     #[test]
     fn fuzzy_ranks_prefixes_and_word_starts() {
         assert!(fuzzy("set", "Settings").unwrap() > fuzzy("set", "Reset view").unwrap());
@@ -428,8 +461,14 @@ mod tests {
 
     #[test]
     fn rows_group_and_filter() {
+        let (world, hunter) = library();
         let cx = Context {
-            sessions: vec![SessionRef { id: "s1", title: "Refactor the parser", updated: 0 }],
+            sessions: vec![
+                SessionRef { id: "s1", title: "Refactor the parser", world: "", updated: 0 },
+                SessionRef { id: "s3", title: "The Reaping", world: "Panem", updated: 0 },
+            ],
+            worlds: &world,
+            characters: &hunter,
             models: &[],
             model: "",
             scheme: Scheme::Dark,
@@ -448,5 +487,35 @@ mod tests {
         ];
         let rows = spotlight.rows(&cx);
         assert_eq!(rows.iter().filter(|r| r.group == "Messages").count(), 1);
+    }
+
+    #[test]
+    fn worlds_list_their_stories_and_the_library_is_searchable() {
+        let (world, hunter) = library();
+        let cx = Context {
+            sessions: vec![
+                SessionRef { id: "s1", title: "Refactor the parser", world: "", updated: 0 },
+                SessionRef { id: "s2", title: "The Reaping", world: "Panem", updated: 0 },
+            ],
+            worlds: &world,
+            characters: &hunter,
+            models: &[],
+            model: "",
+            scheme: Scheme::Dark,
+        };
+        let picks = |query: &str| {
+            let mut spotlight = Spotlight::default();
+            spotlight.input.insert(query);
+            spotlight.rows(&cx).into_iter().map(|r| (r.group, r.pick)).collect::<Vec<_>>()
+        };
+        // A world's name finds it, playing it, and the stories played in it.
+        let panem = picks("panem");
+        assert!(panem.contains(&("Sessions", Pick::Session("s2".into()))) && !panem.contains(&("Sessions", Pick::Session("s1".into()))));
+        assert_eq!(panem.iter().find(|(g, _)| *g == "Worlds").map(|(_, p)| p), Some(&Pick::World("w1".into())), "opening ranks above playing");
+        assert!(panem.contains(&("Worlds", Pick::Play("w1".into()))));
+        // Characters match by name or description; nothing from the library shows until something is typed.
+        assert_eq!(picks("katn"), [("Characters", Pick::Character("c1".into()))]);
+        assert!(picks("district 12").contains(&("Characters", Pick::Character("c1".into()))));
+        assert!(!picks("").iter().any(|(g, _)| matches!(*g, "Worlds" | "Characters")));
     }
 }

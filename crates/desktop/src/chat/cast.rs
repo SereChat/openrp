@@ -153,6 +153,7 @@ impl Chat {
         let player = conversation.player.as_ref().map(|p| p.name.clone());
         let scene = conversation.scene.clone();
         let (memories, has_note) = (conversation.memories.len(), !conversation.note.trim().is_empty());
+        let reviewing = conversation.reviewing.is_some();
 
         // Where the story is, above the cast; clicking it edits it.
         let (left, right) = (main.x + 16.0, main.right() - 16.0);
@@ -160,7 +161,8 @@ impl Chat {
         let scene_label = p.layout("Scene", theme::CAPTION, None);
         let row_start = left + label.width().max(scene_label.width()) + 12.0;
         // Right of the scene: what the story remembers, and the author's note.
-        let memory_label = if memories == 0 { "Memory".to_owned() } else { format!("Memory · {memories}") };
+        let updating = if reviewing { " …" } else { "" };
+        let memory_label = if memories == 0 { format!("Memory{updating}") } else { format!("Memory · {memories}{updating}") };
         let note_label = if has_note { "Note ✓" } else { "Note" };
         let widths = [&memory_label as &str, note_label].map(|l| p.layout(l, theme::LABEL, None).width() + 20.0);
         let note_button = Rect::new(right - widths[1], top + 5.0, widths[1], SCENE_H);

@@ -6,7 +6,9 @@
 //! which run when the reply completes; their results go back to the model
 //! with the next request. A reply that only called tools and showed
 //! nothing (say, it just created a character) is continued at once, up to
-//! [`AUTO_ROUNDS`] times in a row.
+//! [`AUTO_ROUNDS`] times in a row. Every [`REVIEW_EVERY`] prompts, a separate
+//! request reads the latest turns and adds what the story must not forget to
+//! its memories.
 //!
 //! Failures: dropped or silent connections, rate limits and server errors are
 //! retried after [`RETRY_DELAYS`]. A conversation whose last request used more
@@ -28,9 +30,17 @@ use serechat::{
 use super::tools;
 use super::{Chat, Conversation, Entry, Load, Reasoning, StreamingCall};
 use crate::app::Action;
+use crate::library::Kind;
 
 /// Replies in a row that may continue on their own after only calling tools.
 const AUTO_ROUNDS: u32 = 3;
+
+/// Prompts after which a story's memories are reviewed on their own.
+// ponytail: fixed; make it a setting if people want it sooner or later.
+const REVIEW_EVERY: usize = 8;
+/// Most characters of the latest turns a review reads. A story that was
+/// never reviewed (one from before reviews) is read from its end.
+const REVIEW_CHARS: usize = 40_000;
 
 /// Wait before each retry of a failed request; one retry per entry.
 const RETRY_DELAYS: [Duration; 5] =
@@ -221,6 +231,22 @@ pub struct SendJob {
     pub cancel: Arc<AtomicBool>,
 }
 
+/// Everything a worker thread needs to review a story's memories.
+pub struct ReviewJob {
+    /// Conversation it is for.
+    pub conversation: u64,
+    /// Identifies the request, so a stale result is dropped.
+    pub request: u64,
+    /// Model identifier.
+    pub model: String,
+    /// Reasoning effort, or `None` for the model default.
+    pub reasoning: Option<&'static str>,
+    /// The reviewer's system prompt.
+    pub instructions: String,
+    /// The latest turns, as plain text.
+    pub transcript: String,
+}
+
 /// Converts saved messages into API input, starting at the latest summary.
 /// A reply's tool calls follow its text, each with its result.
 #[must_use]
@@ -307,6 +333,64 @@ impl Chat {
         };
         let compaction = context_used(&conversation.entries) > limit;
         self.start_request(id, compaction, 0, actions);
+    }
+
+    /// Has the model add what the latest turns taught the story to its
+    /// memories, when [`REVIEW_EVERY`] prompts went by since the last time
+    /// or `force`d (and there is a prompt to read). The request runs apart
+    /// from the story: the user can carry on, and a failed one is not
+    /// retried until the next review is due.
+    pub(super) fn review_memories(&mut self, id: u64, force: bool, actions: &mut Vec<Action>) {
+        let request = self.next_id();
+        let reasoning = Some(self.reasoning_in_use()).filter(|r| *r != Reasoning::Auto).map(Reasoning::key);
+        let Some(conversation) = self.conversations.iter().find(|c| c.id == id) else {
+            return;
+        };
+        if conversation.world.is_none() || conversation.load != Load::Loaded || conversation.reviewing.is_some() {
+            return;
+        }
+        let from = conversation.reviewed.min(conversation.entries.len());
+        let unread: Vec<StoredMessage> = conversation.entries[from..].iter().map(|e| e.message.clone()).collect();
+        let prompts = unread.iter().filter(|m| m.role == Role::User && !m.failed).count();
+        if prompts == 0 || (!force && prompts < REVIEW_EVERY) {
+            return;
+        }
+        let world = conversation.world.as_deref().and_then(|w| self.library.get(Kind::World, w)).map(|w| (w.name.as_str(), w.description.as_str()));
+        let cast: Vec<&str> = conversation.cast.iter().map(|m| m.name.as_str()).collect();
+        let player = conversation.player.as_ref().map_or("The user", |p| p.name.as_str());
+        let transcript = tools::transcript(&unread, player, REVIEW_CHARS);
+        let instructions = tools::reviewer_prompt(world, conversation.player.as_ref().map(|p| p.name.as_str()), &cast, &conversation.memories);
+        let job = ReviewJob { conversation: id, request, model: self.model.clone(), reasoning, instructions, transcript };
+        if let Some(conversation) = self.find(id) {
+            conversation.reviewed = conversation.entries.len();
+            conversation.reviewing = Some((request, job.model.clone()));
+            actions.push(Action::ReviewMemories(job));
+        }
+    }
+
+    /// The review of `request` answered: what it found joins the story's
+    /// memories (once each), and the request is billed with its next reply.
+    /// An answer for a story deleted, or reviewed again since, is dropped.
+    pub fn memories_reviewed(&mut self, conversation: u64, request: u64, result: Result<(Option<ToolCall>, Usage), Error>, actions: &mut Vec<Action>) {
+        let Some(index) = self.conversations.iter().position(|c| c.id == conversation && c.reviewing.as_ref().is_some_and(|(r, _)| *r == request)) else {
+            return;
+        };
+        let Some((_, model)) = self.conversations[index].reviewing.take() else {
+            return;
+        };
+        // The user keeps their memories as they are when it failed.
+        let Ok((call, usage)) = result else {
+            return;
+        };
+        let cost = self.models.iter().find(|m| m.id == model).map_or(0.0, |m| m.cost(usage));
+        let conversation = &mut self.conversations[index];
+        conversation.carried_cost += cost;
+        if let Some(call) = call.filter(|c| c.name == tools::REMEMBER) {
+            tools::run(&call, &mut Vec::new(), &mut String::new(), &mut conversation.memories, None);
+        }
+        if conversation.load == Load::Loaded {
+            actions.push(Action::SaveSession(conversation.to_session()));
+        }
     }
 
     /// Adds the entry a request streams into and starts it. `attempt`
@@ -526,6 +610,8 @@ impl Chat {
                 actions.push(Action::SaveSession(target.to_session()));
                 if repair || carry_on {
                     self.request_reply(id, actions);
+                } else if active.incomplete.is_none() {
+                    self.review_memories(id, false, actions);
                 }
             }
         }
