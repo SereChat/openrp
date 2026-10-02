@@ -75,8 +75,8 @@ pub enum WorkerEvent {
     },
     /// The character generator answered.
     CharacterGenerated {
-        /// Conversation it was for.
-        conversation: u64,
+        /// Conversation it was for; `None` for the Characters page.
+        conversation: Option<u64>,
         /// Request id.
         request: u64,
         /// The call it made, if it made one.

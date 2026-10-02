@@ -23,7 +23,9 @@ cargo clippy --workspace --all-targets
   newest first. A world is a setting to play in (Panem, a galaxy far away); a character is
   someone the AI plays, kept in one library to cast in any story. Each has a name, a
   description and an optional portrait (PNG or JPEG), created and edited in a form
-  (Ctrl/Cmd+S saves, Esc goes back).
+  (Ctrl/Cmd+S saves, Esc goes back). A character's form has **Generate**: the AI writes a
+  name and a short description from whatever name or idea you typed (or anyone, if blank),
+  for you to review and save.
 - **Stories**: Clicking a world (**Edit** opens its form) (Ctrl/Cmd+N opens the worlds) starts a session in it, which
   first asks who you play: your character's name and description (the **You** chip edits them
   later). **Begin** saves the story and lists it in the sidebar. The strip under the header

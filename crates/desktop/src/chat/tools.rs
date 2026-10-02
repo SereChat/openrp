@@ -168,10 +168,13 @@ pub fn split_ooc(text: &str) -> (&str, Option<&str>) {
 const GENERATOR: &str = "You create characters for an interactive roleplay story. Your only job is to invent exactly one \
     character from the user's request and return them with one create_character call; write nothing else, and never continue \
     the story. The description is for the AI that will play them: who they are, their role, personality, appearance, how they \
-    speak and what they want, in a few short paragraphs. Fit the world below. Never create the user's character or anyone \
+    speak and what they want, in one short paragraph. Fit the world below, if any. Never create the user's character or anyone \
     already in the cast.";
 /// The request sent when the user asked for nobody in particular.
 pub const SURPRISE: &str = "Surprise me: someone this story would benefit from.";
+/// The request sent from the Characters page when the user asked for nobody
+/// in particular.
+pub const SURPRISE_LIBRARY: &str = "Surprise me: a memorable character to cast in any story.";
 
 /// The generator's only tool, as (name, description, JSON Schema).
 #[must_use]
@@ -183,7 +186,7 @@ pub fn generator_tool() -> (&'static str, &'static str, Value) {
             "type": "object",
             "properties": {
                 "name": { "type": "string", "description": "Their name, as they will be addressed." },
-                "description": { "type": "string", "description": "Who they are: role, personality, appearance, how they speak, what they want." }
+                "description": { "type": "string", "description": "Who they are, in one short paragraph: role, personality, appearance, how they speak, what they want." }
             },
             "required": ["name", "description"]
         }),

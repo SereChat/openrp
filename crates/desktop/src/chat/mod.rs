@@ -1156,6 +1156,7 @@ impl Chat {
                     Some(LibraryEvent::Play(world)) => self.play(world),
                     Some(LibraryEvent::WorldDeleted(world)) => self.delete_world_stories(&world, actions),
                     Some(LibraryEvent::Open(id)) => self.open(id, actions),
+                    Some(LibraryEvent::Generate(idea)) => self.generate_for_library(idea, actions),
                     None => {}
                 }
                 [Rect::default(); 4]

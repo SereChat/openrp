@@ -113,10 +113,18 @@ impl CharacterForm {
     }
 }
 
+/// The generator's answer as the name and description it made, or why
+/// there are none.
+fn made(result: Result<Option<ToolCall>, Error>) -> Result<(String, String), String> {
+    result
+        .map_err(|e| e.to_string())
+        .and_then(|call| call.as_ref().and_then(tools::generated).ok_or_else(|| "The model did not describe anyone. Try again.".to_owned()))
+}
+
 /// Everything a worker thread needs to generate one character.
 pub struct GenerateJob {
-    /// Conversation it is for.
-    pub conversation: u64,
+    /// Conversation it is for; `None` for the Characters page.
+    pub conversation: Option<u64>,
     /// Identifies the request, so a stale result is dropped.
     pub request: u64,
     /// Model identifier.
@@ -270,40 +278,50 @@ impl Chat {
 
     /// Asks the generator for someone matching `idea`.
     fn generate(&mut self, idea: String, actions: &mut Vec<Action>) {
-        let request = self.next_id();
-        let reasoning = Some(self.reasoning_in_use()).filter(|r| *r != Reasoning::Auto).map(Reasoning::key);
         let conversation = self.conversations.iter().find(|c| c.id == self.current).expect("the current conversation always exists");
         let world = conversation.world.as_deref().and_then(|w| self.library.get(Kind::World, w)).map(|w| (w.name.as_str(), w.description.as_str()));
         let cast: Vec<&str> = conversation.cast.iter().map(|m| m.name.as_str()).collect();
         let instructions = tools::generator_prompt(world, conversation.player.as_ref().map(|p| p.name.as_str()), &cast);
         let idea = if idea.is_empty() { tools::SURPRISE.to_owned() } else { idea };
-        actions.push(Action::GenerateCharacter(GenerateJob {
-            conversation: self.current,
-            request,
-            model: self.model.clone(),
-            reasoning,
-            instructions,
-            idea,
-        }));
+        let request = self.generate_job(Some(self.current), instructions, idea, actions);
         if let Some(form) = self.character_form() {
             form.subject = Subject::Generate { request: Some(request), error: None };
         }
     }
 
+    /// Asks the generator for a library character matching `idea`, for the
+    /// Characters page's form.
+    pub(super) fn generate_for_library(&mut self, idea: String, actions: &mut Vec<Action>) {
+        let idea = if idea.is_empty() { tools::SURPRISE_LIBRARY.to_owned() } else { idea };
+        let request = self.generate_job(None, tools::generator_prompt(None, None, &[]), idea, actions);
+        self.library.generating(request);
+    }
+
+    /// Pushes a generator request for `conversation` (`None`: the library)
+    /// and returns its id.
+    fn generate_job(&mut self, conversation: Option<u64>, instructions: String, idea: String, actions: &mut Vec<Action>) -> u64 {
+        let request = self.next_id();
+        let reasoning = Some(self.reasoning_in_use()).filter(|r| *r != Reasoning::Auto).map(Reasoning::key);
+        actions.push(Action::GenerateCharacter(GenerateJob { conversation, request, model: self.model.clone(), reasoning, instructions, idea }));
+        request
+    }
+
     /// The generator answered `request` with its call: the form becomes
     /// the new member to review, or shows why it failed. Results for a
-    /// form that was closed or changed since are dropped.
-    pub fn character_generated(&mut self, conversation: u64, request: u64, result: Result<Option<ToolCall>, Error>) {
+    /// form that was closed or changed since are dropped. `conversation`
+    /// is `None` for the Characters page's form.
+    pub fn character_generated(&mut self, conversation: Option<u64>, request: u64, result: Result<Option<ToolCall>, Error>) {
+        let Some(conversation) = conversation else {
+            self.library.generated(request, made(result));
+            return;
+        };
         let Some(form) = self.character_form.as_mut().filter(|f| f.conversation == conversation) else {
             return;
         };
         if !matches!(form.subject, Subject::Generate { request: Some(r), .. } if r == request) {
             return;
         }
-        let made = result
-            .map_err(|e| e.to_string())
-            .and_then(|call| call.as_ref().and_then(tools::generated).ok_or_else(|| "The model did not describe anyone. Try again.".to_owned()));
-        match made {
+        match made(result) {
             Ok((name, description)) => {
                 form.fields = Fields::new([name_editor(&name), text_editor(&description)], [false, true]);
                 form.subject = Subject::NewMember;

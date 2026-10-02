@@ -96,6 +96,8 @@ pub enum Event {
     WorldDeleted(String),
     /// Open the story (conversation) with this id.
     Open(u64),
+    /// Ask the generator for a character matching this idea (empty: any).
+    Generate(String),
 }
 
 /// A story played in the world being edited, for its page to list.
@@ -180,6 +182,10 @@ struct Form {
     error: Option<String>,
     /// Delete was clicked once and waits for a second click.
     confirm_delete: bool,
+    /// The generator request whose answer fills the form.
+    generating: Option<u64>,
+    /// Why the last generation failed.
+    generate_error: Option<String>,
 }
 
 impl Form {
@@ -197,6 +203,20 @@ impl Form {
             picking: false,
             error: None,
             confirm_delete: false,
+            generating: None,
+            generate_error: None,
+        }
+    }
+
+    /// What the generator is asked for: the name and description typed so
+    /// far; empty for anyone.
+    fn idea(&self) -> String {
+        let (name, description) = (self.fields.text(NAME).trim(), self.fields.text(DESCRIPTION).trim());
+        match (name.is_empty(), description.is_empty()) {
+            (true, true) => String::new(),
+            (false, true) => format!("Their name: {name}"),
+            (true, false) => description.to_owned(),
+            (false, false) => format!("Their name: {name}\n\n{description}"),
         }
     }
 
@@ -286,6 +306,25 @@ impl LibraryView {
     pub fn insert(&mut self, text: &str) {
         if let Some(form) = &mut self.form {
             form.fields.insert(text);
+        }
+    }
+
+    /// The open form waits for generator request `request`.
+    pub fn generating(&mut self, request: u64) {
+        if let Some(form) = &mut self.form {
+            (form.generating, form.generate_error) = (Some(request), None);
+        }
+    }
+
+    /// The generator answered `request` with a name and description, which
+    /// replace the form's, or why it could not. Answers for a form closed
+    /// since are dropped.
+    pub fn generated(&mut self, request: u64, made: Result<(String, String), String>) {
+        let Some(form) = self.form.as_mut().filter(|f| f.generating == Some(request)) else { return };
+        form.generating = None;
+        match made {
+            Ok((name, description)) => form.fields = Fields::new([name_editor(&name), text_editor(&description)], [false, true]),
+            Err(e) => form.generate_error = Some(e),
         }
     }
 
@@ -541,6 +580,14 @@ impl LibraryView {
             duplicated = button(p, ui, duplicate, "Duplicate", ButtonStyle::Secondary, can_save);
             right = duplicate.x - 8.0;
         }
+        let mut generate = false;
+        if kind == Kind::Character {
+            let w = if form.generating.is_some() { 120.0 } else { 96.0 };
+            let generate_button = Rect::new(right - w, back.y, w, 30.0);
+            let label = if form.generating.is_some() { "Generating…" } else { "Generate" };
+            generate = button(p, ui, generate_button, label, ButtonStyle::Secondary, form.generating.is_none());
+            right = generate_button.x - 8.0;
+        }
         let mut deleted = false;
         if !form.new {
             // Deleting a world takes its stories along; the label says so.
@@ -607,8 +654,19 @@ impl LibraryView {
         let name = form.fields.layout(p, NAME, fw);
         let name_h = name.line_height() + 2.0 * FIELD_PAD.1;
         form.fields.draw(NAME, p, ui, Rect::new(fx, top + 24.0, fw, name_h), name, &format!("Name this {}", kind.noun()), interactive);
-        let tip = format!("{} saves  ·  Esc goes back without saving", if cfg!(target_os = "macos") { "Cmd+S" } else { "Ctrl+S" });
-        p.label(&tip, theme::TINY, fx, top + 24.0 + name_h + 10.0, t.text_faint);
+        if let Some(error) = &form.generate_error {
+            let mut text = p.layout(error, theme::TINY, None);
+            text.truncate(p.fonts, fw);
+            p.text(&text, fx, top + 24.0 + name_h + 10.0, t.danger);
+        } else {
+            let save = if cfg!(target_os = "macos") { "Cmd+S" } else { "Ctrl+S" };
+            let tip = if kind == Kind::Character {
+                format!("{save} saves  ·  Esc discards  ·  Generate starts from what you typed")
+            } else {
+                format!("{save} saves  ·  Esc goes back without saving")
+            };
+            p.label(&tip, theme::TINY, fx, top + 24.0 + name_h + 10.0, t.text_faint);
+        }
 
         let mut y = below.max(top + 24.0 + name_h) + 28.0;
         p.label("Description", theme::LABEL, x, y, t.text);
@@ -656,6 +714,9 @@ impl LibraryView {
         self.content_h = y - top + 64.0;
 
         let id = form.id.clone();
+        if generate {
+            return Some(Event::Generate(form.idea()));
+        }
         if saved {
             self.save(actions);
         } else if duplicated {
@@ -758,5 +819,25 @@ mod tests {
         // A pick landing after the form closed changes nothing.
         view.portrait_picked(Ok(Some("late.png".into())));
         assert!(view.form.is_none());
+    }
+
+    #[test]
+    fn generating_a_character() {
+        let mut view = LibraryView { form: Some(Form::new(Kind::Character, None)), ..LibraryView::default() };
+        assert_eq!(view.form.as_ref().unwrap().idea(), "", "nothing typed: anyone");
+        view.form.as_mut().unwrap().fields.insert("Rue");
+        assert_eq!(view.form.as_ref().unwrap().idea(), "Their name: Rue");
+
+        // Only the answer to the pending request fills the form.
+        view.generating(7);
+        view.generated(6, Ok(("Cato".into(), "A career.".into())));
+        assert_eq!(view.form.as_ref().unwrap().fields.text(NAME), "Rue", "a stale answer is dropped");
+        view.generated(7, Err("No.".into()));
+        let form = view.form.as_ref().unwrap();
+        assert!(form.generating.is_none() && form.generate_error.as_deref() == Some("No."));
+        view.generating(8);
+        view.generated(8, Ok(("Rue".into(), "A tribute from District 11.".into())));
+        let form = view.form.as_ref().unwrap();
+        assert!(form.generate_error.is_none() && form.fields.text(DESCRIPTION) == "A tribute from District 11.");
     }
 }
