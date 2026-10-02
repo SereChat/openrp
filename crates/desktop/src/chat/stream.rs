@@ -1,4 +1,4 @@
-//! Reply streaming: sending a conversation, running the narrator's tool
+//! Reply streaming: sending a conversation, running a story's tool
 //! calls, retrying failed requests and compacting conversations that
 //! outgrow the context window.
 //!
@@ -21,7 +21,9 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
-use serechat::{Completion, Error, InputItem, Role, StoredMessage, StoryChange, StreamEvent, ToolChoice, ToolResult, Usage, unix_now};
+use serechat::{
+    Completion, Error, InputItem, Role, StoredMessage, StoryChange, StreamEvent, ToolCall, ToolChoice, ToolResult, Usage, new_id, unix_now,
+};
 
 use super::tools;
 use super::{Chat, Conversation, Entry, Load, Reasoning, StreamingCall};
@@ -51,9 +53,13 @@ const ROLEPLAY: &str = "You play every character in an interactive roleplay stor
     the story is told only through the characters, by what they say and do. Stay true to the world's premise, rules and tone, and \
     keep each character consistent with their description.\n\n\
     How to reply:\n\
-    - Every reply is one speak call holding every line of the turn, in the order things happen. Write nothing outside tool calls.\n\
-    - In each line, text is exactly what the character says, and action what they do as they say it (movement, expression, what \
-    they notice). A character who only acts gets a line with an action and empty text.\n\
+    - Every reply is one speak call. Write nothing outside tool calls: there is no narration, ever. Never describe events, \
+    surroundings or the passing of time in your own voice; the scene field holds the place and its ambiance, and everything \
+    else is shown through what the characters say and do.\n\
+    - Each responding character gets exactly one message in the speak call, holding everything they say and do this turn. \
+    Never give a character two messages. In it, action is what they do as they respond (movement, expression, what they \
+    notice) and text exactly what they say; a short action between their words goes in *asterisks*. A character who only \
+    acts gets an action and empty text.\n\
     - Only characters in the scene respond. Decide which of them do: whoever the user addresses, plus anyone else present who \
     would naturally react.\n\
     - Do not invent characters. Bring in someone new only when the user refers to a character who is not in the cast yet (\"I \
@@ -64,7 +70,18 @@ const ROLEPLAY: &str = "You play every character in an interactive roleplay stor
     - Keep track of the scene: where the characters are and what it is like there. When it is not set yet, or it changes (the \
     user goes somewhere, time passes, the mood or weather turns), set speak's scene to the place and its ambiance; otherwise \
     leave it empty. Cast members who stay behind or walk off go in speak's leave.\n\
+    - When something happens that the story must not forget (a promise, a secret revealed, a decision, an injury, a changed \
+    relationship), call remember in the same reply with short facts. Never repeat what the memories already hold.\n\
+    - A user message may end with an out-of-character instruction, marked OOC: it is the user talking to you, not their \
+    character speaking or acting. Follow it in this reply.\n\
+    - Follow the author's note, if there is one, in every reply.\n\
     - Never speak, act or decide for the user's character. End where the user can respond.";
+/// Opens the memories section of a story's prompt.
+const MEMORIES: &str = "Facts this story must not forget, kept with remember. They hold even when the conversation above no longer shows them.";
+/// Opens the author's note section of a story's prompt.
+const NOTE: &str = "The user's guidance for the whole story. Follow it in every reply.";
+/// Introduces an out-of-character instruction sent with a user message.
+const OOC: &str = "(OOC: the user's instruction for this reply, not something their character says or does.)";
 /// Stands in for the description of a character who has none.
 const UNDESCRIBED: &str = "(Not described yet: keep them consistent with what they have said and done so far.)";
 /// Added when nobody is in the scene: the first thing to do is cast someone.
@@ -74,15 +91,18 @@ const NOBODY_HERE: &str = "No one is in the scene yet. Introduce who the user me
 
 /// The system prompt of a story in `world`, played by `player`, with the
 /// characters `present` in the scene and those `absent` from it (each a
-/// name and description), in `scene` (empty until the model sets it).
-/// `None` for a plain chat. It changes only when the story's setup or
-/// scene does, so the provider can cache it.
+/// name and description), its `memories`, in `scene` (empty until the
+/// model sets it), with the user's author's `note` last. `None` for a
+/// plain chat. It changes only when the story's setup, memories or scene
+/// do, so the provider can cache it.
 pub(super) fn story_prompt(
     world: Option<(&str, &str)>,
     player: Option<(&str, &str)>,
     present: &[(&str, &str)],
     absent: &[(&str, &str)],
+    memories: &[String],
     scene: &str,
+    note: &str,
 ) -> String {
     let Some((name, description)) = world else {
         return PLAIN_CHAT.to_owned();
@@ -107,6 +127,12 @@ pub(super) fn story_prompt(
         "These characters belong to the story but are not in the current scene. They may be mentioned, but do not have them act here unless the story brings them in.",
         absent,
     );
+    if !memories.is_empty() {
+        let _ = write!(prompt, "\n\n# Memories\n\n{MEMORIES}\n");
+        for memory in memories {
+            let _ = write!(prompt, "\n- {memory}");
+        }
+    }
     let scene = scene.trim();
     if !scene.is_empty() || present.is_empty() {
         prompt.push_str("\n\n# The scene");
@@ -117,7 +143,21 @@ pub(super) fn story_prompt(
             let _ = write!(prompt, "\n\n{NOBODY_HERE}");
         }
     }
+    let note = note.trim();
+    if !note.is_empty() {
+        let _ = write!(prompt, "\n\n# Author's note\n\n{NOTE}\n\n{note}");
+    }
     prompt
+}
+
+/// A user message as the model reads it: what their character says and
+/// does, then any out-of-character instruction (see [`tools::split_ooc`]).
+fn user_text(text: &str) -> String {
+    match tools::split_ooc(text) {
+        ("", Some(ooc)) => format!("{OOC}\n\n{ooc}"),
+        (said, Some(ooc)) => format!("{said}\n\n{OOC}\n\n{ooc}"),
+        (said, None) => said.to_owned(),
+    }
 }
 /// Asks for the summary that replaces a conversation's history.
 const COMPACT_PROMPT: &str = "The conversation is about to exceed the context window, so everything above will be replaced by a \
@@ -173,7 +213,7 @@ pub struct SendJob {
     pub instructions: String,
     /// Conversation so far.
     pub history: Vec<StoredMessage>,
-    /// Offer the narrator's tools (stories do; plain chats don't).
+    /// Offer the story's tools (stories do; plain chats don't).
     pub tools: bool,
     /// `tool_choice`, or `None` to let the model decide.
     pub tool_choice: Option<ToolChoice<'static>>,
@@ -192,7 +232,9 @@ pub fn input_items(history: &[StoredMessage]) -> Vec<InputItem> {
             items.push(InputItem::text(Role::User, format!("{SUMMARY_INTRO}\n\n{}", message.content)));
             continue;
         }
-        if !message.content.is_empty() {
+        if message.role == Role::User {
+            items.push(InputItem::text(Role::User, user_text(&message.content)));
+        } else if !message.content.is_empty() {
             items.push(InputItem::text(message.role, message.content.clone()));
         }
         for result in &message.tool_calls {
@@ -226,14 +268,16 @@ fn compact_limit(window: u64) -> u64 {
 }
 
 impl Entry {
-    /// Folds speech whose call never completed (the reply was stopped or
-    /// failed) into the narration, so what the user saw stays.
+    /// Keeps calls that never completed (the reply was stopped or failed)
+    /// as calls that did not run, their arguments closed into valid JSON,
+    /// so the speech the user saw stays.
     fn keep_streamed_speech(&mut self) {
-        if self.streaming_calls.is_empty() {
-            return;
+        for call in std::mem::take(&mut self.streaming_calls) {
+            let Some(arguments) = tools::parse_partial(&call.arguments) else { continue };
+            let call = ToolCall { call_id: format!("call_{}", new_id()), name: call.name, arguments: arguments.to_string() };
+            let output = "Not run: the reply stopped before this call was complete.".to_owned();
+            self.message.tool_calls.push(ToolResult { call, output });
         }
-        let calls = std::mem::take(&mut self.streaming_calls);
-        self.message.content = tools::display(&self.message.content, calls.iter().map(|c| (c.name.as_str(), c.arguments.as_str())), true);
     }
 }
 
@@ -340,6 +384,7 @@ impl Chat {
         let Some(conversation) = Self::stream_target(&mut self.conversations, conversation, stream) else {
             return;
         };
+        let story = conversation.world.is_some();
         let Conversation { stream: Some(stream), entries, carried_cost, .. } = conversation else {
             return;
         };
@@ -364,6 +409,9 @@ impl Chat {
                 }
             }
             StreamEvent::Charged(usage) => stream.charged = usage,
+            // A story has no narrator: what its replies write outside their
+            // calls is dropped. A summary is text, though.
+            StreamEvent::Text(_) if story && !message.compaction => {}
             StreamEvent::Text(delta) => {
                 // Models often open with blank lines; don't render them.
                 let delta = if message.content.is_empty() { delta.trim_start() } else { &delta };
@@ -431,7 +479,7 @@ impl Chat {
             Ok(_) if target.entries[index].message.compaction => self.compacted(id, index, active.incomplete.is_some(), actions),
             Ok(_) => {
                 let player = target.player.as_ref().map(|p| p.name.clone());
-                let Conversation { entries, cast, scene, auto_rounds, repairing, .. } = target;
+                let Conversation { entries, cast, scene, memories, auto_rounds, repairing, .. } = target;
                 let was_repair = std::mem::take(repairing);
                 let calls = &mut entries[index].message.tool_calls;
                 if let Some(reason) = &active.incomplete {
@@ -448,15 +496,15 @@ impl Chat {
                     message.failed = true;
                     entries.push(Entry::new(note_id, message));
                 } else {
-                    let (cast_before, scene_before) = (cast.clone(), scene.clone());
+                    let (cast_before, scene_before, known) = (cast.clone(), scene.clone(), memories.len());
                     // New characters first, so they can speak in the reply that made them.
                     for creating in [true, false] {
                         for result in calls.iter_mut().filter(|r| (r.call.name == tools::CREATE_CHARACTER) == creating) {
-                            result.output = tools::run(&result.call, cast, scene, player.as_deref());
+                            result.output = tools::run(&result.call, cast, scene, memories, player.as_deref());
                         }
                     }
                     // Kept so deleting or regenerating the reply can undo it.
-                    entries[index].message.change = StoryChange::between(&cast_before, &scene_before, cast, scene);
+                    entries[index].message.change = StoryChange::between(&cast_before, &scene_before, cast, scene, &memories[known..]);
                 }
                 let complete = active.incomplete.is_none() && *auto_rounds < AUTO_ROUNDS;
                 // Everyone who acted this turn (since the user's message) must
@@ -520,7 +568,7 @@ impl Chat {
         let cost = std::mem::take(&mut conversation.carried_cost);
         let entry = &mut conversation.entries[index];
         entry.keep_streamed_speech();
-        if entry.message.content.is_empty() {
+        if entry.message.content.is_empty() && entry.message.tool_calls.is_empty() {
             entry.message.content = text;
             entry.message.failed = true;
             entry.message.cost += cost;
@@ -625,19 +673,37 @@ mod tests {
 
     #[test]
     fn story_prompts() {
-        assert_eq!(story_prompt(None, None, &[], &[], ""), PLAIN_CHAT);
+        assert_eq!(story_prompt(None, None, &[], &[], &[], "", ""), PLAIN_CHAT);
         // Nobody in the scene: the model is told to cast someone first.
-        let alone = story_prompt(Some(("Panem", "Twelve districts.")), None, &[], &[], "");
+        let alone = story_prompt(Some(("Panem", "Twelve districts.")), None, &[], &[], &[], "", "");
         assert!(alone.starts_with(ROLEPLAY) && alone.ends_with(&format!("# World: Panem\n\nTwelve districts.\n\n# The scene\n\n{NOBODY_HERE}")));
-        let away = story_prompt(Some(("Panem", "")), Some(("Gale", "A hunter.")), &[], &[("Peeta", "A baker.")], "");
+        let away = story_prompt(Some(("Panem", "")), Some(("Gale", "A hunter.")), &[], &[("Peeta", "A baker.")], &[], "", "");
         assert!(!away.contains("# Characters in the scene") && away.contains("# The user's character: Gale\n\nA hunter."));
         assert!(away.contains("## Peeta\n\nA baker.") && away.ends_with(NOBODY_HERE), "someone elsewhere is no one here");
-        let here = story_prompt(Some(("Panem", "")), None, &[("Katniss", "A hunter.")], &[], "");
+        let here = story_prompt(Some(("Panem", "")), None, &[("Katniss", "A hunter.")], &[], &[], "", "");
         assert!(here.ends_with("## Katniss\n\nA hunter.") && !here.contains(NOBODY_HERE));
-        let joined = story_prompt(Some(("Panem", "")), None, &[("Rue", " ")], &[], "");
+        let joined = story_prompt(Some(("Panem", "")), None, &[("Rue", " ")], &[], &[], "", "");
         assert!(joined.ends_with(&format!("## Rue\n\n{UNDESCRIBED}")), "someone who joined by speaking");
-        let kitchen = story_prompt(Some(("Panem", "")), None, &[("Katniss", "A hunter.")], &[], " The bakery, before dawn. ");
+        let kitchen = story_prompt(Some(("Panem", "")), None, &[("Katniss", "A hunter.")], &[], &[], " The bakery, before dawn. ", "");
         assert!(kitchen.ends_with("## Katniss\n\nA hunter.\n\n# The scene\n\nThe bakery, before dawn."));
+
+        // Memories before the scene; the author's note last, where it weighs most.
+        let memories = ["Peeta saved Katniss.".to_owned(), "Rue is hurt.".to_owned()];
+        let full = story_prompt(Some(("Panem", "")), None, &[("Katniss", "A hunter.")], &[], &memories, "The woods.", " Keep it short. ");
+        let expected = format!("# Memories\n\n{MEMORIES}\n\n- Peeta saved Katniss.\n- Rue is hurt.\n\n# The scene\n\nThe woods.\n\n# Author's note\n\n{NOTE}\n\nKeep it short.");
+        assert!(full.ends_with(&expected), "{full}");
+    }
+
+    #[test]
+    fn out_of_character_instructions_are_marked() {
+        assert_eq!(user_text("I knock."), "I knock.");
+        assert_eq!(user_text("I knock.\n/ooc make it tense"), format!("I knock.\n\n{OOC}\n\nmake it tense"));
+        assert_eq!(user_text("  /ooc  skip ahead a day "), format!("{OOC}\n\nskip ahead a day"));
+        assert_eq!(user_text("/oocx"), "/oocx", "only the command itself");
+        let items = input_items(&[StoredMessage::new(Role::User, "Hi.\n/ooc be brief".into())]);
+        assert!(matches!(&items[0], InputItem::Message { text, .. } if text.ends_with("be brief") && text.contains(OOC)));
+        assert_eq!(tools::user_display("I *wave*.\n/ooc a *dark* turn"), "I *wave*.\n\n*OOC: a dark turn*");
+        assert_eq!(tools::split_ooc("/ooc"), ("", None));
     }
 
     #[test]

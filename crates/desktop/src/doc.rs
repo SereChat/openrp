@@ -164,6 +164,8 @@ struct Builder<'a> {
     texts: Vec<TextPiece>,
     decos: Vec<DecoPiece>,
     codes: usize,
+    /// Ink of emphasised (italic) text.
+    emphasis_ink: u8,
 }
 
 impl Doc {
@@ -184,10 +186,22 @@ impl Doc {
     /// same width and scale, donates every leading block that is unchanged.
     /// `base_ink` colours plain text (e.g. [`INK_MUTED`] for reasoning).
     #[must_use]
-    pub fn markdown(fonts: &Fonts, src: &str, width: f32, scale: f32, base_ink: u8, mut previous: Option<Self>) -> Self {
+    pub fn markdown(fonts: &Fonts, src: &str, width: f32, scale: f32, base_ink: u8, previous: Option<Self>) -> Self {
+        Self::build(fonts, src, (width, scale), (base_ink, base_ink), previous)
+    }
+
+    /// Lays out a character's speech (Markdown) at `width`: their words in
+    /// the text colour, their actions (italics) muted.
+    #[must_use]
+    pub fn speech(fonts: &Fonts, src: &str, width: f32, scale: f32, previous: Option<Self>) -> Self {
+        Self::build(fonts, src, (width, scale), (INK_TEXT, INK_MUTED), previous)
+    }
+
+    /// [`Doc::markdown`] with `inks` for plain and emphasised text.
+    fn build(fonts: &Fonts, src: &str, (width, scale): (f32, f32), (base_ink, emphasis_ink): (u8, u8), mut previous: Option<Self>) -> Self {
         let blocks = markdown::parse(src);
         let key = (width.to_bits(), scale.to_bits());
-        let mut b = Builder { fonts, scale, texts: Vec::new(), decos: Vec::new(), codes: 0 };
+        let mut b = Builder { fonts, scale, texts: Vec::new(), decos: Vec::new(), codes: 0, emphasis_ink };
         let mut block_ends = Vec::with_capacity(blocks.len());
         let mut y = 0.0;
         let mut reused = 0;
@@ -446,6 +460,8 @@ impl Builder<'_> {
                 INK_LINK
             } else if mark.code {
                 INK_CODE
+            } else if mark.emphasis {
+                self.emphasis_ink
             } else {
                 base_ink
             };

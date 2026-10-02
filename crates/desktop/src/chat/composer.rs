@@ -18,15 +18,30 @@ const MAX_LINES: usize = 8;
 pub(super) enum Command {
     /// Deletes the open chat and starts over.
     Clear,
+    /// Starts an out-of-character instruction for the next reply.
+    Ooc,
+    /// Opens the story's author's note.
+    Note,
+    /// Opens the story's memories.
+    Memory,
+    /// Copies the story exactly.
+    Duplicate,
+    /// Copies the story's setup without what happened.
+    Frame,
 }
 
 impl Command {
-    const ALL: [Self; 1] = [Self::Clear];
+    const ALL: [Self; 6] = [Self::Ooc, Self::Note, Self::Memory, Self::Duplicate, Self::Frame, Self::Clear];
 
     /// What follows the slash.
     pub(super) fn name(self) -> &'static str {
         match self {
             Self::Clear => "clear",
+            Self::Ooc => "ooc",
+            Self::Note => "note",
+            Self::Memory => "memory",
+            Self::Duplicate => "duplicate",
+            Self::Frame => "frame",
         }
     }
 
@@ -34,6 +49,11 @@ impl Command {
     pub(super) fn detail(self) -> &'static str {
         match self {
             Self::Clear => "Clear this chat's messages",
+            Self::Ooc => "Tell the AI something out of character",
+            Self::Note => "Author's note for the whole story",
+            Self::Memory => "What the story remembers",
+            Self::Duplicate => "Copy this story exactly",
+            Self::Frame => "New story with this cast and setup",
         }
     }
 
@@ -208,7 +228,8 @@ mod tests {
 
     #[test]
     fn commands_complete_a_bare_slash_word() {
-        assert_eq!(Command::matching("/"), [Command::Clear]);
+        assert_eq!(Command::matching("/").len(), Command::ALL.len());
+        assert_eq!(Command::matching("/d"), [Command::Duplicate]);
         assert_eq!(Command::matching("/cl"), [Command::Clear]);
         assert_eq!(Command::matching("/clear"), [Command::Clear]);
         assert!(Command::matching("/clearer").is_empty());

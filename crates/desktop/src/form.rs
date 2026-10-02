@@ -55,6 +55,41 @@ impl Fields {
         Self { editors, multiline: vec![true; n], focus: 0, selecting: None, layouts: vec![None; n], caret: None }
     }
 
+    /// How many fields there are.
+    #[must_use]
+    pub fn count(&self) -> usize {
+        self.editors.len()
+    }
+
+    /// Adds a multi-line field holding `text` at the end, focused.
+    pub fn push(&mut self, text: &str) {
+        let mut editor = Editor::default();
+        editor.insert(text);
+        self.editors.push(editor);
+        self.multiline.push(true);
+        self.layouts.push(None);
+        self.focus = self.editors.len() - 1;
+        self.selecting = None;
+    }
+
+    /// Removes field `index`; one empty field is left when it was the last.
+    pub fn remove(&mut self, index: usize) {
+        if index >= self.editors.len() {
+            return;
+        }
+        if self.editors.len() == 1 {
+            self.editors[0] = Editor::default();
+            return;
+        }
+        self.editors.remove(index);
+        self.multiline.remove(index);
+        self.layouts.remove(index);
+        if self.focus > index || self.focus == self.editors.len() {
+            self.focus = self.focus.saturating_sub(1);
+        }
+        self.selecting = None;
+    }
+
     /// The text of field `index`.
     #[must_use]
     pub fn text(&self, index: usize) -> &str {
@@ -187,5 +222,22 @@ mod tests {
         fields.insert("A hunter.");
         assert_eq!((fields.text(0), fields.text(1)), ("Gale", "A hunter."));
         assert!(fields.caret().is_none(), "no caret before the first draw");
+    }
+
+    #[test]
+    fn fields_are_added_and_removed() {
+        let mut fields = Fields::multiline(&["a".to_owned(), "b".to_owned()]);
+        fields.push("c");
+        fields.insert("!");
+        assert_eq!((fields.count(), fields.text(2)), (3, "c!"), "the new field is focused");
+        fields.remove(2);
+        fields.insert("?");
+        assert_eq!((fields.count(), fields.text(1)), (2, "b?"), "focus moves to the field before");
+        fields.remove(0);
+        fields.remove(0);
+        assert_eq!((fields.count(), fields.text(0)), (1, ""), "one empty field is always left");
+        fields.remove(7);
+        fields.insert("x");
+        assert_eq!(fields.text(0), "x");
     }
 }

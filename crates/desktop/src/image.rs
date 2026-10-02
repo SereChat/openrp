@@ -153,7 +153,7 @@ pub fn thumbnail(key: &ImageKey) -> Result<Vec<u8>, String> {
 }
 
 /// Decodes a PNG to straight-alpha RGBA.
-fn decode_png(bytes: &[u8]) -> Result<(Vec<u8>, u32, u32), String> {
+pub fn decode_png(bytes: &[u8]) -> Result<(Vec<u8>, u32, u32), String> {
     let mut decoder = png::Decoder::new_with_limits(std::io::Cursor::new(bytes), png::Limits { bytes: MAX_PIXELS * 4 });
     decoder.set_transformations(png::Transformations::normalize_to_color8());
     let mut reader = decoder.read_info().map_err(|e| e.to_string())?;

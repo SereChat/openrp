@@ -1,7 +1,8 @@
 //! Drop-down menus: model and reasoning (above the composer toolbar),
 //! slash commands (above the composer), ways to add to the cast (below the
-//! cast strip's add button) and what to do with a cast member (below its
-//! chip's dots).
+//! cast strip's add button), what to do with a cast member (below its
+//! chip's dots) and with a session (duplicate or delete, below its sidebar
+//! row's dots).
 
 use winit::window::CursorIcon;
 
@@ -55,7 +56,12 @@ impl Chat {
             Menu::CastLibrary => (anchors[3], 280.0, true, ("From characters", ""), self.library_menu()),
             Menu::Member(index) => {
                 title = self.current().cast.get(index).map(|m| m.name.clone()).unwrap_or_default();
-                (anchors[3], 200.0, true, (title.as_str(), ""), Self::member_menu())
+                (anchors[3], 260.0, true, (title.as_str(), ""), self.member_menu(index))
+            }
+            Menu::Session(_) => {
+                let row = |label: &str, detail: &str| MenuItem { label: label.to_owned(), detail: detail.to_owned(), selected: false };
+                let items = vec![row("Duplicate", "Exact copy"), row("Duplicate frame", "Cast and setup only"), row("Delete", "")];
+                (self.session_menu, 280.0, true, ("Session", ""), items)
             }
         };
         if let Some(index) = self.draw_menu(p, ui, anchor, width, below, header, &items) {
@@ -82,6 +88,8 @@ impl Chat {
                 Menu::Cast => self.cast_menu_picked(index),
                 Menu::CastLibrary => self.library_menu_picked(index, actions),
                 Menu::Member(member) => self.member_menu_picked(member, index, actions),
+                Menu::Session(id) if index == 2 => self.delete_conversation(id, actions),
+                Menu::Session(id) => self.duplicate(id, index == 1, actions),
             }
             return;
         }

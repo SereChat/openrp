@@ -2,9 +2,10 @@
 //! message and everything up to the next one (replies, rounds that went on
 //! by themselves, notes about failures, summaries).
 //!
-//! * Edit makes the turn's replies editable at once. An edited reply keeps
-//!   its text only: its tool calls are dropped, and the model sees the
-//!   edited text instead.
+//! * Edit makes the turn's replies editable at once, a field per character
+//!   bubble. Edited speech is rewritten in the reply's speak call, so it
+//!   stays bubbles and the model sees the call as edited. A reply without
+//!   characters (a plain chat's) keeps its edited text only.
 //! * Regen (last turn only) sends its prompt again, as if just sent.
 //! * Delete removes the prompt and everything that answered it.
 //!
@@ -19,6 +20,7 @@ use std::ops::Range;
 
 use serechat::Role;
 
+use super::tools::{self, Part};
 use super::{Chat, Conversation, Entry, Load};
 use crate::app::Action;
 use crate::form::Fields;
@@ -27,10 +29,21 @@ use crate::form::Fields;
 pub(super) struct TurnEdit {
     /// The conversation they belong to.
     pub conversation: u64,
-    /// Ids of the entries being edited, in order.
-    pub entries: Vec<u64>,
-    /// One field per entry.
+    /// What each field edits, in order.
+    pub slots: Vec<Slot>,
+    /// One field per slot.
     pub fields: Fields,
+}
+
+/// What one field of a turn edit holds.
+pub(super) struct Slot {
+    /// Id of the reply.
+    pub entry: u64,
+    /// The character whose bubble it is, or `None` for a whole reply
+    /// without characters.
+    pub character: Option<String>,
+    /// The text before editing.
+    pub text: String,
 }
 
 /// The turn holding entry `index`: from the user message that started it
@@ -70,10 +83,10 @@ impl Conversation {
 
     /// Undoes, in reverse, what the replies in `range` changed in the story.
     fn rewind(&mut self, range: Range<usize>) {
-        let Self { entries, cast, scene, .. } = self;
+        let Self { entries, cast, scene, memories, .. } = self;
         for entry in entries[range].iter().rev() {
             if let Some(change) = &entry.message.change {
-                change.undo(cast, scene);
+                change.undo(cast, scene, memories);
             }
         }
     }
@@ -87,15 +100,28 @@ impl Chat {
         if !conversation.settled() || index >= conversation.entries.len() {
             return;
         }
+        let story = conversation.world.is_some();
         let turn = turn(&conversation.entries, index);
-        for entry in &mut conversation.entries[turn.clone()] {
-            entry.refresh_display(false);
+        let mut slots = Vec::new();
+        for entry in conversation.entries[turn].iter_mut().filter(|e| editable(e)) {
+            entry.refresh_display(false, story);
+            if entry.parts.is_empty() {
+                if !entry.display.is_empty() {
+                    slots.push(Slot { entry: entry.id, character: None, text: entry.display.clone() });
+                }
+                continue;
+            }
+            // A field per character; notes stay as they are.
+            for part in &entry.parts {
+                if let Part::Said { character, text } = part {
+                    slots.push(Slot { entry: entry.id, character: Some(character.clone()), text: text.clone() });
+                }
+            }
         }
-        let (ids, texts): (Vec<u64>, Vec<String>) =
-            conversation.entries[turn].iter().filter(|e| editable(e) && !e.display.is_empty()).map(|e| (e.id, e.display.clone())).unzip();
-        if !ids.is_empty() {
+        if !slots.is_empty() {
             self.selection = None;
-            self.turn_edit = Some(TurnEdit { conversation: current, entries: ids, fields: Fields::multiline(&texts) });
+            let texts: Vec<String> = slots.iter().map(|s| s.text.clone()).collect();
+            self.turn_edit = Some(TurnEdit { conversation: current, slots, fields: Fields::multiline(&texts) });
         }
     }
 
@@ -105,8 +131,11 @@ impl Chat {
         self.turn_edit.as_mut().filter(|e| e.conversation == current)
     }
 
-    /// Applies the edit: changed replies keep their new text only (an
-    /// emptied one is removed). Saves the story.
+    /// Applies the edit to each changed reply: a character's speech is
+    /// rewritten in its speak call (so it stays a bubble, and the model
+    /// sees the call as edited), an emptied character leaves the reply, and
+    /// a reply emptied entirely is removed. A reply without characters
+    /// keeps its new text only. Saves the story.
     pub(super) fn save_turn_edit(&mut self, actions: &mut Vec<Action>) {
         let Some(edit) = self.turn_edit.take() else { return };
         let Some(conversation) = self.find(edit.conversation) else { return };
@@ -114,24 +143,36 @@ impl Chat {
             return;
         }
         let mut changed = false;
-        for (field, id) in edit.entries.iter().enumerate() {
-            let text = edit.fields.text(field).trim();
-            let Some(index) = conversation.entries.iter().position(|e| e.id == *id) else { continue };
-            let entry = &mut conversation.entries[index];
-            if text == entry.display {
+        let mut done = 0;
+        while done < edit.slots.len() {
+            // The slots of one reply are next to each other.
+            let id = edit.slots[done].entry;
+            let end = edit.slots[done..].iter().position(|s| s.entry != id).map_or(edit.slots.len(), |n| done + n);
+            let fields: Vec<(&Slot, &str)> = (done..end).map(|k| (&edit.slots[k], edit.fields.text(k).trim())).collect();
+            done = end;
+            let Some(index) = conversation.entries.iter().position(|e| e.id == id) else { continue };
+            if fields.iter().all(|(slot, text)| slot.text == *text) {
                 continue;
             }
             changed = true;
-            if text.is_empty() {
+            if fields.iter().all(|(_, text)| text.is_empty()) {
                 // Its cost stays in the story, on the reply before it.
-                let cost = entry.message.cost;
+                let cost = conversation.entries[index].message.cost;
                 conversation.entries.remove(index);
                 carry_cost(conversation, index, cost);
                 continue;
             }
-            text.clone_into(&mut entry.message.content);
-            // The model sees the edited text, not the calls it replaced.
-            entry.message.tool_calls.clear();
+            let message = &mut conversation.entries[index].message;
+            if fields[0].0.character.is_some() {
+                let said: Vec<(&str, &str)> = fields.iter().filter_map(|(slot, text)| Some((slot.character.as_deref()?, *text))).collect();
+                tools::respeak(&mut message.tool_calls, &said);
+                message.content.clear();
+            } else {
+                fields[0].1.clone_into(&mut message.content);
+                // The model sees the edited text, not the calls it replaced.
+                message.tool_calls.clear();
+            }
+            let entry = &mut conversation.entries[index];
             entry.streaming_calls.clear();
             entry.display_key = (usize::MAX, 0, false);
         }
@@ -293,28 +334,53 @@ mod tests {
     }
 
     #[test]
-    fn edits_replace_the_calls_with_text() {
+    fn edits_rewrite_each_characters_bubble() {
         let mut chat = story();
-        answer(&mut chat, "Hello.", RUE);
+        let two = r#"{"scene":"The woods.","introduce":[{"name":"Rue","description":"A girl from 11."},{"name":"Thresh","description":"Her ally."}],"messages":[{"character":"Rue","text":"Hi."},{"character":"Thresh","action":"nods","text":""}]}"#;
+        answer(&mut chat, "Hello.", two);
         chat.edit_turn(0);
         let edit = chat.turn_edit().expect("editing");
-        assert_eq!(edit.entries.len(), 1);
-        assert!(edit.fields.text(0).contains("> Hi."));
+        let texts: Vec<(Option<&str>, &str)> = edit.slots.iter().map(|s| (s.character.as_deref(), s.text.as_str())).collect();
+        assert_eq!(texts, [(Some("Rue"), "Hi."), (Some("Thresh"), "*nods*")], "a field per character");
         edit.fields.insert(" Changed.");
         let mut actions = Vec::new();
         chat.save_turn_edit(&mut actions);
         let prompt = chat.current().entries[0].message.clone();
-        let reply = &chat.current().entries[1].message;
-        assert!(reply.tool_calls.is_empty() && reply.content.ends_with("Changed."));
-        assert!(reply.change.is_some(), "deleting it still undoes what it did");
+        let entry = &mut chat.current().entries[1];
+        entry.refresh_display(false, true);
+        assert_eq!(entry.display, "*The woods.*\n\n*Rue joins the story*\n\n*Thresh joins the story*\n\n**Rue**: Hi. Changed.\n\n**Thresh**: *nods*", "still bubbles");
+        let reply = &entry.message;
+        assert!(reply.content.is_empty() && reply.tool_calls.len() == 1 && reply.change.is_some(), "deleting it still undoes what it did");
         assert!(matches!(&actions[..], [Action::SaveSession(_)]));
         let items = crate::chat::input_items(&[prompt, reply.clone()]);
-        assert!(matches!(&items[1], serechat::InputItem::Message { role: Role::Assistant, text } if text.ends_with("Changed.")));
+        assert!(matches!(&items[1], serechat::InputItem::ToolCall(call) if call.arguments.contains("Hi. Changed.")), "the model sees the edit");
 
-        // Emptied, a reply is removed.
+        // An emptied character leaves the reply; emptied entirely, it is removed.
+        chat.edit_turn(1);
+        chat.turn_edit().unwrap().fields = Fields::multiline(&["Bye.".to_owned(), String::new()]);
+        chat.save_turn_edit(&mut actions);
+        let entry = &mut chat.current().entries[1];
+        entry.refresh_display(false, true);
+        assert!(entry.display.ends_with("**Rue**: Bye.") && !entry.display.contains("**Thresh**"), "{}", entry.display);
         chat.edit_turn(1);
         chat.turn_edit().unwrap().fields = Fields::multiline(&[String::new()]);
         chat.save_turn_edit(&mut actions);
         assert_eq!(chat.current().entries.len(), 1);
+    }
+
+    #[test]
+    fn replies_edited_into_text_read_back_as_bubbles() {
+        let mut chat = story();
+        answer(&mut chat, "Hello.", RUE);
+        let entry = &mut chat.current().entries[1];
+        entry.message.tool_calls.clear();
+        "**Rue** · *waves*\n> Hi.".clone_into(&mut entry.message.content);
+        chat.edit_turn(0);
+        let edit = chat.turn_edit().expect("editing");
+        assert_eq!(edit.slots[0].character.as_deref(), Some("Rue"));
+        edit.fields.insert(" Again.");
+        chat.save_turn_edit(&mut Vec::new());
+        let reply = &chat.current().entries[1].message;
+        assert!(reply.content.is_empty() && reply.tool_calls[0].call.arguments.contains("*waves* Hi. Again."), "now a call");
     }
 }

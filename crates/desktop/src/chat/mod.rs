@@ -29,7 +29,7 @@ use winit::keyboard::{Key, ModifiersState, NamedKey};
 use crate::app::Action;
 use crate::doc::Doc;
 use crate::editor::Editor;
-use crate::library::{Event as LibraryEvent, Kind, LibraryView};
+use crate::library::{Event as LibraryEvent, Kind, LibraryView, Story};
 use crate::paint::{Painter, Rect};
 use crate::settings::{SettingsView, Totals};
 use crate::spotlight::{Outcome, Pick, Spotlight};
@@ -194,6 +194,8 @@ enum Menu {
     CastLibrary,
     /// What to do with the cast member at this index.
     Member(usize),
+    /// What to do with this conversation (from its sidebar row).
+    Session(u64),
 }
 
 /// One message in a conversation, with its cached layouts.
@@ -203,8 +205,13 @@ struct Entry {
     /// The user opened (`true`) or closed the reasoning block; `None`
     /// follows the [`ReasoningView`] setting.
     reasoning_open: Option<bool>,
-    /// What the message shows, as Markdown: its text, then what its tool
-    /// calls show (speech, arrivals).
+    /// What a story reply's tool calls show: one bubble per character and
+    /// notes. Empty for everything else, which shows `display`.
+    parts: Vec<tools::Part>,
+    /// Each of `parts` laid out, with the part it was built from.
+    part_docs: Vec<(tools::Part, Doc)>,
+    /// What the message shows as Markdown (and copies and edits): its
+    /// text, or its `parts` when it has any.
     display: String,
     /// The (text bytes, call argument bytes, live) `display` was built for.
     display_key: (usize, usize, bool),
@@ -232,6 +239,8 @@ impl Entry {
             id,
             message,
             reasoning_open: None,
+            parts: Vec::new(),
+            part_docs: Vec::new(),
             display: String::new(),
             display_key: (usize::MAX, 0, false),
             doc: None,
@@ -243,8 +252,10 @@ impl Entry {
     }
 
     /// Rebuilds [`Entry::display`] if the message or its calls changed;
-    /// `live` while the reply streams (its calls are still previews).
-    fn refresh_display(&mut self, live: bool) {
+    /// `live` while the reply streams (its calls are still previews). In a
+    /// `story`, a reply edited into plain text by earlier versions is read
+    /// back into bubbles.
+    fn refresh_display(&mut self, live: bool, story: bool) {
         let calls: usize = if live {
             self.streaming_calls.iter().map(|c| c.arguments.len() + 1).sum()
         } else {
@@ -255,15 +266,37 @@ impl Entry {
             return;
         }
         self.display_key = key;
-        let display = if live {
-            tools::display(&self.message.content, self.streaming_calls.iter().map(|c| (c.name.as_str(), c.arguments.as_str())), true)
+        self.parts = if live {
+            tools::parts(self.streaming_calls.iter().map(|c| (c.name.as_str(), c.arguments.as_str())), true)
+        } else if !self.message.tool_calls.is_empty() {
+            tools::parts(self.message.tool_calls.iter().map(|r| (r.call.name.as_str(), r.call.arguments.as_str())), false)
+        } else if story && self.message.role == Role::Assistant && !self.message.failed && !self.message.compaction {
+            tools::parse(&self.message.content)
         } else {
-            tools::display(&self.message.content, self.message.tool_calls.iter().map(|r| (r.call.name.as_str(), r.call.arguments.as_str())), false)
+            Vec::new()
+        };
+        // No narration: a reply with calls shows only what they show.
+        let display = if story && self.message.role == Role::User {
+            tools::user_display(&self.message.content)
+        } else if self.parts.is_empty() && self.message.tool_calls.is_empty() {
+            self.message.content.trim_end().to_owned()
+        } else {
+            tools::display(&self.parts)
         };
         if display != self.display {
             // Not always longer: lay the document out again.
             self.display = display;
             self.doc_key = (usize::MAX, false);
+        }
+    }
+
+    /// Document `id` of the entry: `0` its reasoning, `1` its message and
+    /// from `2` its parts, in that (selection) order.
+    fn doc_by_id(&self, id: u8) -> Option<&Doc> {
+        match id {
+            0 => self.reasoning_doc.as_ref(),
+            1 => self.doc.as_ref(),
+            k => self.part_docs.get(usize::from(k - 2)).map(|(_, doc)| doc),
         }
     }
 
@@ -307,6 +340,11 @@ struct Conversation {
     player: Option<Player>,
     /// Where the story is now and what it is like, as the model set it.
     scene: String,
+    /// Facts the story must not forget, kept by the model's remember tool
+    /// and editable by the user.
+    memories: Vec<String>,
+    /// The user's author's note: guidance for the whole story.
+    note: String,
     /// Replies in a row that continued on their own after only calling
     /// tools; reset by every prompt.
     auto_rounds: u32,
@@ -338,6 +376,8 @@ impl Conversation {
             cast: Vec::new(),
             player: None,
             scene: String::new(),
+            memories: Vec::new(),
+            note: String::new(),
             auto_rounds: 0,
             repairing: false,
             load: Load::Loaded,
@@ -383,6 +423,8 @@ impl Conversation {
             cast: self.cast.clone(),
             player: self.player.clone(),
             scene: self.scene.clone(),
+            memories: self.memories.clone(),
+            note: self.note.clone(),
             messages: self
                 .entries
                 .iter()
@@ -476,8 +518,6 @@ pub struct Chat {
     /// Anchor entry of the turn whose Delete was clicked once, awaiting
     /// confirmation.
     confirm_turn: Option<u64>,
-    /// Conversation whose delete button was clicked once, awaiting confirmation.
-    confirm_delete: Option<u64>,
     /// What was just copied (entry, code block or whole message) and when.
     copied: Option<(u64, Option<usize>, f32)>,
     spotlight: Option<Spotlight>,
@@ -486,6 +526,10 @@ pub struct Chat {
     character_form: Option<dialog::CharacterForm>,
     /// Replies being edited, in one conversation.
     turn_edit: Option<turns::TurnEdit>,
+    /// A session to copy once it is read: (conversation, as a frame).
+    pending_duplicate: Option<(u64, bool)>,
+    /// Where the sidebar row whose session menu is open was drawn.
+    session_menu: Rect,
     /// The worlds and characters pages.
     library: LibraryView,
 }
@@ -523,12 +567,13 @@ impl Chat {
             selection: None,
             dragging: false,
             sidebar_scroll: 0.0,
-            confirm_delete: None,
             confirm_turn: None,
             copied: None,
             library: LibraryView::default(),
             character_form: None,
             turn_edit: None,
+            pending_duplicate: None,
+            session_menu: Rect::default(),
             spotlight: None,
         };
         for summary in sessions {
@@ -609,6 +654,21 @@ impl Chat {
         }
     }
 
+    /// The saved stories of the world open on the worlds page, newest first.
+    fn world_stories(&self) -> Vec<Story> {
+        let Some(world) = self.library.open_world() else {
+            return Vec::new();
+        };
+        let mut stories: Vec<Story> = self
+            .conversations
+            .iter()
+            .filter(|c| c.world.as_deref() == Some(world) && !c.is_fresh())
+            .map(|c| Story { id: c.id, title: c.title.clone(), updated: c.updated })
+            .collect();
+        stories.sort_by_key(|s| std::cmp::Reverse(s.updated));
+        stories
+    }
+
     /// Deletes every story played in `world` (which was just deleted).
     fn delete_world_stories(&mut self, world: &str, actions: &mut Vec<Action>) {
         let doomed: Vec<u64> = self.conversations.iter().filter(|c| c.world.as_deref() == Some(world)).map(|c| c.id).collect();
@@ -654,32 +714,89 @@ impl Chat {
         self.composer.take();
         self.command_dismissed = None;
         self.menu = None;
+        let current = self.current;
         match command {
             Command::Clear => self.clear(actions),
+            // The instruction is typed after it, then sent with the message.
+            Command::Ooc => self.composer.insert("/ooc "),
+            Command::Note => self.edit_note(),
+            Command::Memory => self.edit_memories(),
+            Command::Duplicate => self.duplicate(current, false, actions),
+            Command::Frame => self.duplicate(current, true, actions),
         }
     }
 
+    /// Copies conversation `id` into a new story and opens it: exactly,
+    /// every message, memory and the scene included (its replies are not
+    /// billed again), or as a `frame`: the world, player, cast and author's
+    /// note, but nothing that happened. A session not read yet is read
+    /// first, and copied once it is.
+    pub(super) fn duplicate(&mut self, id: u64, frame: bool, actions: &mut Vec<Action>) {
+        let Some(source) = self.conversations.iter_mut().find(|c| c.id == id) else { return };
+        match source.load {
+            Load::Summary | Load::Loading => {
+                if source.load == Load::Summary {
+                    source.load = Load::Loading;
+                    actions.push(Action::LoadSession { conversation: id, session: source.session_id.clone() });
+                }
+                self.pending_duplicate = Some((id, frame));
+                return;
+            }
+            Load::Failed(_) => return,
+            Load::Loaded if source.is_fresh() => return,
+            Load::Loaded => {}
+        }
+        let mut session = source.to_session();
+        let now = unix_now();
+        (session.id, session.created, session.updated) = (new_id(), now, now);
+        if frame {
+            // Named by its first prompt, like any new story.
+            session.title.clear();
+            session.messages.clear();
+            session.memories.clear();
+            session.scene.clear();
+        } else {
+            if !session.title.is_empty() {
+                session.title.push_str(" (copy)");
+            }
+            for message in &mut session.messages {
+                message.cost = 0.0;
+            }
+        }
+        let copy = self.next_id();
+        let mut conversation = Conversation::from_summary(copy, session.summary());
+        conversation.load = Load::Loading;
+        self.conversations.insert(0, conversation);
+        self.session_loaded(copy, Ok(session.clone()), actions);
+        self.select(copy);
+        actions.push(Action::SaveSession(session));
+    }
+
     /// Deletes the open story (stopping its reply) and starts it over in
-    /// the same world, with the same cast and player.
+    /// the same world, with the same cast, player and author's note.
     fn clear(&mut self, actions: &mut Vec<Action>) {
         let conversation = self.current();
         if conversation.entries.is_empty() || conversation.load != Load::Loaded {
             return;
         }
         let (id, world, cast, player) = (conversation.id, conversation.world.clone(), conversation.cast.clone(), conversation.player.clone());
+        let note = conversation.note.clone();
         self.delete_conversation(id, actions);
         let fresh = self.current();
         fresh.world = world;
         fresh.cast = cast;
         fresh.player = player;
+        fresh.note = note;
         // The story begins again at once, so it is saved and listed again.
         if !fresh.is_fresh() {
             actions.push(Action::SaveSession(fresh.to_session()));
         }
     }
 
-    /// Stores the messages of a session read on a worker thread.
-    pub fn session_loaded(&mut self, conversation: u64, result: Result<Session, Error>) {
+    /// Stores the messages of a session read on a worker thread, and makes
+    /// the copy that was waiting for them, if one was.
+    pub fn session_loaded(&mut self, conversation: u64, result: Result<Session, Error>, actions: &mut Vec<Action>) {
+        let conversation_id = conversation;
         let Some(index) = self.conversations.iter().position(|c| c.id == conversation && c.load == Load::Loading) else {
             return;
         };
@@ -710,7 +827,12 @@ impl Chat {
         conversation.cast = cast;
         conversation.player = session.player;
         conversation.scene = session.scene;
+        conversation.memories = session.memories;
+        conversation.note = session.note;
         conversation.load = Load::Loaded;
+        if let Some((id, frame)) = self.pending_duplicate.take_if(|(id, _)| *id == conversation_id) {
+            self.duplicate(id, frame, actions);
+        }
     }
 
     /// Sets how replies show reasoning. Blocks the user opened or closed
@@ -766,7 +888,12 @@ impl Chat {
         conversation.auto_rounds = 0;
         conversation.repairing = false;
         if conversation.title.is_empty() {
-            conversation.title = text.lines().next().unwrap_or_default().chars().take(80).collect();
+            // Named by what is said, not by an out-of-character instruction.
+            let said = match tools::split_ooc(&text) {
+                ("", Some(ooc)) => ooc,
+                (said, _) => said,
+            };
+            conversation.title = said.lines().next().unwrap_or_default().chars().take(80).collect();
         }
         conversation.entries.push(Entry::new(user_id, StoredMessage::new(Role::User, text)));
         let id = conversation.id;
@@ -799,9 +926,13 @@ impl Chat {
         self.library.loaded(worlds, characters, portraits);
     }
 
-    /// The portrait picker closed (see [`LibraryView::portrait_picked`]).
+    /// The portrait picker closed: for the cast member dialog if it asked,
+    /// else for the library's form (see [`LibraryView::portrait_picked`]).
     pub fn portrait_picked(&mut self, result: Result<Option<String>, String>) {
-        self.library.portrait_picked(result);
+        match self.character_form.as_mut().filter(|f| f.picking) {
+            Some(form) => form.portrait_picked(result),
+            None => self.library.portrait_picked(result),
+        }
     }
 
     /// Text of the message selection, if any.
@@ -814,9 +945,10 @@ impl Chat {
         let conversation = self.conversations.iter().find(|c| c.id == self.current)?;
         let mut out = String::new();
         for (index, entry) in conversation.entries.iter().enumerate().take(to.0 + 1).skip(from.0) {
-            let reasoning = entry.reasoning_doc.as_ref().filter(|_| entry.reasoning_shown(self.reasoning_view));
-            for (doc_id, doc) in [(0u8, reasoning), (1, entry.doc.as_ref())] {
-                let Some(doc) = doc else { continue };
+            let first = u8::from(!entry.reasoning_shown(self.reasoning_view));
+            let last = u8::try_from(entry.part_docs.len() + 1).unwrap_or(u8::MAX);
+            for doc_id in first..=last {
+                let Some(doc) = entry.doc_by_id(doc_id) else { continue };
                 if (index, doc_id) < (from.0, from.1) || (index, doc_id) > (to.0, to.1) {
                     continue;
                 }
@@ -1004,9 +1136,11 @@ impl Chat {
                 [Rect::default(); 4]
             }
             Page::Library(kind) => {
-                match self.library.draw(p, ui, main, kind, actions) {
+                let stories = self.world_stories();
+                match self.library.draw(p, ui, main, kind, &stories, actions) {
                     Some(LibraryEvent::Play(world)) => self.play(world),
                     Some(LibraryEvent::WorldDeleted(world)) => self.delete_world_stories(&world, actions),
+                    Some(LibraryEvent::Open(id)) => self.open(id, actions),
                     None => {}
                 }
                 [Rect::default(); 4]
@@ -1258,10 +1392,8 @@ mod tests {
             if let Some(stream) = &mut chat.current().stream {
                 stream.started -= std::time::Duration::from_secs(3);
             }
-            chat.stream_event(job.conversation, job.stream, StreamEvent::Text("answer".into()));
-            let completion = Completion { reasoning: reasoning.into(), ..Completion::default() };
-            chat.stream_event(job.conversation, job.stream, StreamEvent::Completed(completion));
-            chat.stream_end(job.conversation, job.stream, Ok(true), &mut Vec::new());
+            chat.stream_event(job.conversation, job.stream, StreamEvent::ToolCallStarted { index: 0, name: tools::SPEAK.into() });
+            finish_saying(&mut chat, &job, "answer", Completion { reasoning: reasoning.into(), ..Completion::default() });
             let ms = chat.current().entries.last().map(|e| e.message.reasoning_ms);
             assert_eq!(ms.is_some_and(|ms| ms >= 3000), !reasoning.is_empty(), "reasoning {reasoning:?}");
         }
@@ -1281,6 +1413,8 @@ mod tests {
             cast: Vec::new(),
             player: None,
             scene: String::new(),
+            memories: vec!["A fact.".into()],
+            note: "Keep it light.".into(),
             messages: vec![StoredMessage::new(Role::User, "hi".into()), reply],
         };
         let mut chat = Chat::new(None, Reasoning::Auto, vec![session.summary()]);
@@ -1301,7 +1435,7 @@ mod tests {
         chat.send(&mut actions);
         assert!(actions.is_empty());
 
-        chat.session_loaded(id, Ok(session.clone()));
+        chat.session_loaded(id, Ok(session.clone()), &mut Vec::new());
         assert_eq!(chat.current().to_session(), session);
         chat.send(&mut actions);
         assert!(matches!(&actions[..], [Action::SaveSession(saved), Action::Send(_)] if saved.messages.len() == 3));
@@ -1328,6 +1462,18 @@ mod tests {
         let mut actions = Vec::new();
         chat.stream_end(job.conversation, job.stream, Ok(true), &mut actions);
         actions
+    }
+
+    /// A story reply saying `text`: a speak call by the user's character,
+    /// so no one needs casting (the result only warns).
+    fn said(text: &str) -> ToolCall {
+        let arguments = serde_json::json!({ "messages": [{ "character": "Gale", "text": text }] }).to_string();
+        ToolCall { call_id: format!("said-{text}"), name: tools::SPEAK.into(), arguments }
+    }
+
+    /// Completes `job` with `text` said and `completion`'s other fields.
+    fn finish_saying(chat: &mut Chat, job: &SendJob, text: &str, completion: Completion) -> Vec<Action> {
+        finish(chat, job, Completion { tool_calls: vec![said(text)], ..completion })
     }
 
     fn next_send(actions: Vec<Action>) -> Option<SendJob> {
@@ -1386,18 +1532,22 @@ mod tests {
     fn stopping_keeps_partial_output() {
         let mut chat = new_chat();
         let job = start(&mut chat, "go");
-        chat.stream_event(job.conversation, job.stream, StreamEvent::Text("half".into()));
+        chat.stream_event(job.conversation, job.stream, StreamEvent::Text("A narrator says.".into()));
+        chat.stream_event(job.conversation, job.stream, StreamEvent::ToolCallStarted { index: 0, name: tools::SPEAK.into() });
+        let half = r#"{"messages":[{"character":"Gale","text":"half"#;
+        chat.stream_event(job.conversation, job.stream, StreamEvent::ToolCallDelta { index: 0, delta: half.into() });
         chat.stop(&mut Vec::new());
         assert!(job.cancel.load(Ordering::Relaxed) && !chat.is_busy());
-        assert_eq!(chat.current().entries.last().map(|e| e.message.content.as_str()), Some("half"));
+        let entry = chat.current().entries.last().unwrap();
+        assert!(entry.message.content.is_empty(), "a story has no narration");
+        assert!(entry.message.tool_calls[0].call.arguments.ends_with(r#""half"}]}"#));
     }
 
     #[test]
     fn replies_cut_off_say_so() {
         let mut chat = new_chat();
         let job = start(&mut chat, "write it");
-        chat.stream_event(job.conversation, job.stream, StreamEvent::Text("Long".into()));
-        let actions = finish(&mut chat, &job, Completion { incomplete: Some("max_output_tokens".into()), ..Completion::default() });
+        let actions = finish_saying(&mut chat, &job, "Long", Completion { incomplete: Some("max_output_tokens".into()), ..Completion::default() });
         assert!(next_send(actions).is_none());
         assert!(chat.current().entries.last().is_some_and(|e| e.message.failed && e.message.content.contains("cut off")));
     }
@@ -1406,9 +1556,8 @@ mod tests {
     fn long_conversations_are_summarised() {
         let mut chat = new_chat();
         let job = start(&mut chat, "first");
-        chat.stream_event(job.conversation, job.stream, StreamEvent::Text("ok".into()));
         // The reply used most of the (default) window.
-        finish(&mut chat, &job, Completion { usage: Usage::new(120_000, 1_000), ..Completion::default() });
+        finish_saying(&mut chat, &job, "ok", Completion { usage: Usage::new(120_000, 1_000), ..Completion::default() });
 
         let summary = start(&mut chat, "second");
         assert!(summary.history.last().is_some_and(|m| m.role == Role::User && m.content.contains("summary")));
@@ -1427,8 +1576,7 @@ mod tests {
     fn overflowing_requests_compact_and_keep_the_new_prompt() {
         let mut chat = new_chat();
         let job = start(&mut chat, "first");
-        chat.stream_event(job.conversation, job.stream, StreamEvent::Text("ok".into()));
-        finish(&mut chat, &job, Completion { usage: Usage::new(1_000, 10), ..Completion::default() });
+        finish_saying(&mut chat, &job, "ok", Completion { usage: Usage::new(1_000, 10), ..Completion::default() });
 
         let job = start(&mut chat, "second");
         let mut actions = Vec::new();
@@ -1454,14 +1602,68 @@ mod tests {
         assert_eq!(chat.conversations.iter().filter(|c| c.busy()).count(), 2, "both run at once");
 
         // Events for the chat in the background land in it, not the open one.
-        chat.stream_event(first.conversation, first.stream, StreamEvent::Text("a".into()));
-        chat.stream_event(second.conversation, second.stream, StreamEvent::Text("b".into()));
-        finish(&mut chat, &first, Completion::default());
-        finish(&mut chat, &second, Completion::default());
-        let reply = |id| chat.conversations.iter().find(|c| c.id == id).and_then(|c| c.entries.last()).map(|e| e.message.content.clone());
-        assert_eq!(reply(first.conversation).as_deref(), Some("a"));
-        assert_eq!(reply(second.conversation).as_deref(), Some("b"));
+        finish_saying(&mut chat, &first, "a", Completion::default());
+        finish_saying(&mut chat, &second, "b", Completion::default());
+        let reply = |id| {
+            let entry = chat.conversations.iter().find(|c| c.id == id).and_then(|c| c.entries.last());
+            entry.and_then(|e| e.message.tool_calls.first()).map(|r| r.call.call_id.clone())
+        };
+        assert_eq!(reply(first.conversation).as_deref(), Some("said-a"));
+        assert_eq!(reply(second.conversation).as_deref(), Some("said-b"));
         assert!(!chat.is_busy());
+    }
+
+    #[test]
+    fn memories_are_kept_and_undone_with_their_reply() {
+        let mut chat = new_chat();
+        let job = start(&mut chat, "I promise.");
+        let remember = ToolCall { call_id: "r".into(), name: tools::REMEMBER.into(), arguments: r#"{"memories":["Gale promised to return."]}"#.into() };
+        let completion = Completion { tool_calls: vec![said("I will."), remember], ..Completion::default() };
+        assert!(next_send(finish(&mut chat, &job, completion)).is_none(), "speech ends the turn");
+        assert_eq!(chat.current().memories, ["Gale promised to return."]);
+        let id = chat.current().id;
+        assert!(chat.instructions(id).contains("- Gale promised to return."), "the next reply reads it");
+        // Regenerating the turn forgets what it remembered.
+        let mut actions = Vec::new();
+        chat.regenerate(&mut actions);
+        assert!(chat.current().memories.is_empty());
+    }
+
+    #[test]
+    fn stories_duplicate_exactly_or_as_a_frame() {
+        let mut chat = new_chat();
+        chat.current().cast.push(CastMember { id: "k".into(), name: "Katniss".into(), description: "A hunter.".into(), present: true, ..CastMember::default() });
+        let job = start(&mut chat, "Hello.");
+        finish_saying(&mut chat, &job, "Hi.", Completion { usage: Usage::new(10, 5), ..Completion::default() });
+        let original = chat.current();
+        original.entries.last_mut().unwrap().message.cost = 0.25;
+        (original.scene, original.memories, original.note) = ("The woods.".into(), vec!["A fact.".into()], "Be brief.".into());
+        let (source, source_session) = (original.id, original.session_id.clone());
+
+        let mut actions = Vec::new();
+        chat.duplicate(source, false, &mut actions);
+        let [Action::SaveSession(copy)] = &actions[..] else { panic!("not saved") };
+        assert!(copy.id != source_session && copy.title == "Hello. (copy)" && copy.messages.len() == 2);
+        assert!(copy.scene == "The woods." && copy.memories == ["A fact."] && copy.note == "Be brief." && copy.cast.len() == 1);
+        assert!(copy.messages.iter().all(|m| m.cost == 0.0), "the replies were paid for once");
+        assert!(chat.current().id != source && chat.current().entries.len() == 2, "the copy is open");
+
+        let mut actions = Vec::new();
+        chat.duplicate(source, true, &mut actions);
+        let [Action::SaveSession(frame)] = &actions[..] else { panic!("not saved") };
+        assert!(frame.messages.is_empty() && frame.memories.is_empty() && frame.scene.is_empty() && frame.title.is_empty());
+        assert!(frame.cast.len() == 1 && frame.note == "Be brief." && frame.player.is_some() && frame.world.as_deref() == Some("w"));
+        assert!(chat.current().playable(), "a frame is ready to play");
+
+        // A session not read yet is read first, then copied.
+        let mut chat = Chat::new(None, Reasoning::Auto, vec![copy.summary()]);
+        let unread = chat.conversations.iter().find(|c| c.session_id == copy.id).unwrap().id;
+        let mut actions = Vec::new();
+        chat.duplicate(unread, true, &mut actions);
+        assert!(matches!(&actions[..], [Action::LoadSession { conversation, .. }] if *conversation == unread));
+        let mut actions = Vec::new();
+        chat.session_loaded(unread, Ok(copy.clone()), &mut actions);
+        assert!(matches!(&actions[..], [Action::SaveSession(s)] if s.messages.is_empty() && s.cast.len() == 1));
     }
 
     #[test]
@@ -1507,8 +1709,8 @@ mod tests {
         let partial = r#"{"lines":[{"character":"Katniss","text":"Who's th"#;
         chat.stream_event(job.conversation, job.stream, StreamEvent::ToolCallDelta { index: 1, delta: partial.into() });
         let entry = chat.current().entries.last_mut().unwrap();
-        entry.refresh_display(true);
-        assert_eq!(entry.display, "Leaves rustle.\n\n**Katniss**\n> Who's th");
+        entry.refresh_display(true, true);
+        assert_eq!(entry.display, "**Katniss**: Who's th", "no narration");
         let asked = ToolCall {
             call_id: "c0".into(),
             name: tools::SPEAK.into(),
@@ -1516,7 +1718,7 @@ mod tests {
         };
         assert!(
             start_over(&mut chat, &job, Completion { tool_calls: vec![asked], ..Completion::default() }).is_none(),
-            "narration and speech end the turn"
+            "speech ends the turn"
         );
 
         // A reply that only created someone carries on by itself.
@@ -1538,8 +1740,8 @@ mod tests {
         };
         assert!(start_over(&mut chat, &next, Completion { tool_calls: vec![spoken], ..Completion::default() }).is_none());
         let entry = chat.current().entries.last_mut().unwrap();
-        entry.refresh_display(false);
-        assert_eq!(entry.display, "**Cato** · *grins*\n> Found you.\n\n**Katniss**\n> Run!");
+        entry.refresh_display(false, true);
+        assert_eq!(entry.display, "**Cato**: *grins* Found you.\n\n**Katniss**: Run!");
         assert_eq!(entry.message.tool_calls[0].output, "Spoken.");
         let follow = start(&mut chat, "I run.");
         assert!(matches!(input_items(&follow.history).last(), Some(InputItem::Message { text, .. }) if text == "I run."));
@@ -1552,7 +1754,11 @@ mod tests {
             StreamEvent::ToolCallDelta { index: 0, delta: r#"{"lines":[{"character":"Cato","text":"Wait"#.into() },
         );
         chat.stop(&mut Vec::new());
-        assert_eq!(chat.current().entries.last().map(|e| e.message.content.as_str()), Some("**Cato**\n> Wait"));
+        let entry = chat.current().entries.last_mut().unwrap();
+        entry.refresh_display(false, true);
+        assert_eq!(entry.display, "**Cato**: Wait", "speech being written when the user stops stays");
+        assert!(entry.message.tool_calls[0].output.starts_with("Not run") && entry.message.content.is_empty());
+        assert_eq!(entry.message.tool_calls[0].call.arguments, r#"{"lines":[{"character":"Cato","text":"Wait"}]}"#, "valid JSON");
     }
 
     /// Completes `job` and returns the request it led to, if any.
@@ -1620,8 +1826,8 @@ mod tests {
         assert!(start_over(&mut chat, &job, Completion { tool_calls: vec![speak], ..Completion::default() }).is_none());
         assert!(chat.current().cast.iter().any(|m| m.name == "Rex" && m.description == "A clone captain." && m.present));
         let entry = chat.current().entries.last_mut().unwrap();
-        entry.refresh_display(false);
-        assert_eq!(entry.display, "*Rex joins the story.*\n\n**Rex**\n> General.");
+        entry.refresh_display(false, true);
+        assert_eq!(entry.display, "*Rex joins the story*\n\n**Rex**: General.");
 
         // Someone acting without being introduced is not cast half-made: the
         // model is made to describe them next.

@@ -1,11 +1,13 @@
 //! Stories: Play starts one in a world, and its cast is the characters
 //! taking part. A cast member is present (in the current scene) or absent
 //! (part of the story, elsewhere); the strip under the header toggles that,
-//! opens each member's menu (edit, delete; see `dialog.rs`) and adds
-//! characters: from the library, created or generated. Members are
+//! opens each member's menu (store in Characters, edit, delete; see
+//! `dialog.rs`) and adds characters: from the library, created or
+//! generated. Members are
 //! copies: what the library does later never changes a story. The strip
 //! also shows who the user plays, and opens the player form, and above
-//! the cast, the scene (set by the model, or by clicking it).
+//! the cast, the scene (set by the model, or by clicking it), beside the
+//! buttons that open the story's memories and author's note.
 
 use serechat::CastMember;
 use winit::window::CursorIcon;
@@ -15,7 +17,7 @@ use crate::app::Action;
 use crate::library::{Kind, portrait};
 use crate::paint::{Painter, Rect, fade, mix};
 use crate::theme;
-use crate::ui::{Ui, id};
+use crate::ui::{ButtonStyle, Ui, button, id};
 
 /// Height of one row of cast chips.
 const ROW_H: f32 = 34.0;
@@ -46,7 +48,8 @@ impl Chat {
             conversation.cast.iter().filter(|m| m.present == present).map(|m| (m.name.as_str(), m.description.as_str())).collect::<Vec<_>>()
         };
         let player = conversation.player.as_ref().map(|p| (p.name.as_str(), p.description.as_str()));
-        super::stream::story_prompt(world, player, &member(true), &member(false), &conversation.scene)
+        let (memories, scene, note) = (&conversation.memories, &conversation.scene, &conversation.note);
+        super::stream::story_prompt(world, player, &member(true), &member(false), memories, scene, note)
     }
 
     /// Library characters that can still join the open story: (id, name).
@@ -102,20 +105,28 @@ impl Chat {
         }
     }
 
-    /// Rows of a cast member's menu.
-    pub(super) fn member_menu() -> Vec<MenuItem> {
+    /// Rows of cast member `member`'s menu: storing them updates the library
+    /// character they were cast from, if there is one.
+    pub(super) fn member_menu(&mut self, member: usize) -> Vec<MenuItem> {
         let row = |label: &str, detail: &str| MenuItem { label: label.to_owned(), detail: detail.to_owned(), selected: false };
-        vec![row("Edit…", ""), row("Delete", "From this story")]
+        let id = self.current().cast.get(member).map(|m| m.id.clone()).unwrap_or_default();
+        let store = if self.library.get(Kind::Character, &id).is_some() { "Update in Characters" } else { "Store in Characters" };
+        vec![row(store, "For other stories"), row("Edit…", ""), row("Delete", "From this story")]
     }
 
     /// Applies row `index` of cast member `member`'s menu.
     pub(super) fn member_menu_picked(&mut self, member: usize, index: usize, actions: &mut Vec<Action>) {
-        if index == 0 {
-            self.edit_member(member);
-        } else if member < self.current().cast.len() {
-            self.change_cast(actions, |cast| {
+        match index {
+            0 => {
+                if let Some(m) = self.current().cast.get(member).cloned() {
+                    self.library.store_character(&m.id, &m.name, &m.description, &m.portrait, actions);
+                }
+            }
+            1 => self.edit_member(member),
+            _ if member < self.current().cast.len() => self.change_cast(actions, |cast| {
                 cast.remove(member);
-            });
+            }),
+            _ => {}
         }
     }
 
@@ -141,13 +152,23 @@ impl Chat {
         let cast = conversation.cast.clone();
         let player = conversation.player.as_ref().map(|p| p.name.clone());
         let scene = conversation.scene.clone();
+        let (memories, has_note) = (conversation.memories.len(), !conversation.note.trim().is_empty());
 
         // Where the story is, above the cast; clicking it edits it.
         let (left, right) = (main.x + 16.0, main.right() - 16.0);
         let label = p.layout("Cast", theme::CAPTION, None);
         let scene_label = p.layout("Scene", theme::CAPTION, None);
         let row_start = left + label.width().max(scene_label.width()) + 12.0;
-        let scene_row = Rect::new(row_start - 6.0, top + 5.0, right - row_start + 6.0, SCENE_H);
+        // Right of the scene: what the story remembers, and the author's note.
+        let memory_label = if memories == 0 { "Memory".to_owned() } else { format!("Memory · {memories}") };
+        let note_label = if has_note { "Note ✓" } else { "Note" };
+        let widths = [&memory_label as &str, note_label].map(|l| p.layout(l, theme::LABEL, None).width() + 20.0);
+        let note_button = Rect::new(right - widths[1], top + 5.0, widths[1], SCENE_H);
+        let memory_button = Rect::new(note_button.x - 4.0 - widths[0], top + 5.0, widths[0], SCENE_H);
+        let open_memories = button(p, ui, memory_button, &memory_label, ButtonStyle::Ghost, true);
+        let open_note = button(p, ui, note_button, note_label, ButtonStyle::Ghost, true);
+        let right_of_scene = memory_button.x - 8.0;
+        let scene_row = Rect::new(row_start - 6.0, top + 5.0, right_of_scene - row_start + 6.0, SCENE_H);
         let scene_hovered = ui.hovered(scene_row);
         let scene_hover = ui.anim(id("cast-scene"), f32::from(u8::from(scene_hovered)));
         p.rect(scene_row, fade(t.hover, scene_hover), theme::RADIUS_SM);
@@ -270,6 +291,10 @@ impl Chat {
 
         if edit_scene {
             self.edit_scene();
+        } else if open_memories {
+            self.edit_memories();
+        } else if open_note {
+            self.edit_note();
         } else if edit_you {
             self.edit_player();
         } else if let Some(index) = toggle {
@@ -337,7 +362,27 @@ mod tests {
         assert!(session.player.is_some());
         let Some(Action::Send(job)) = actions.last() else { panic!("not sent") };
         assert_eq!(job.instructions, prompt);
-        assert!(job.tools, "stories offer the narrator's tools");
+        assert!(job.tools, "stories offer the story's tools");
+    }
+
+    #[test]
+    fn members_are_stored_in_characters() {
+        let mut chat = Chat::new(None, Reasoning::Auto, Vec::new());
+        chat.play("w".into());
+        let rue = CastMember { id: "r".into(), name: "Rue".into(), description: "Small.".into(), portrait: "rue.png".into(), present: true };
+        chat.current().cast.push(rue);
+        assert_eq!(chat.member_menu(0)[0].label, "Store in Characters");
+        let mut actions = Vec::new();
+        chat.member_menu_picked(0, 0, &mut actions);
+        assert!(matches!(&actions[..], [Action::SaveCharacter(c)] if c.id == "r" && c.description == "Small." && c.portrait == "rue.png"));
+        assert_eq!(chat.member_menu(0)[0].label, "Update in Characters", "now cast from the library");
+
+        // Storing again updates that character; the story itself is untouched.
+        chat.current().cast[0].description = "Quick.".into();
+        chat.member_menu_picked(0, 0, &mut actions);
+        let records = chat.library.list(Kind::Character);
+        assert!(records.len() == 1 && records[0].description == "Quick.");
+        assert!(actions.iter().all(|a| matches!(a, Action::SaveCharacter(_))));
     }
 
     #[test]
@@ -349,6 +394,14 @@ mod tests {
             chat.composer.insert("Hello.");
             chat.send(&mut Vec::new());
         }
+        // A world's page lists its stories.
+        let world = |id: &str| serechat::World { id: id.into(), name: id.into(), ..serechat::World::default() };
+        chat.library_loaded(vec![world("a"), world("b")], Vec::new(), Portraits::at("portraits".into()));
+        assert!(chat.world_stories().is_empty(), "no world open");
+        chat.library.open_form(Kind::World, "a");
+        let stories = chat.world_stories();
+        assert!(stories.len() == 1 && chat.conversations.iter().any(|c| c.id == stories[0].id && c.world.as_deref() == Some("a")));
+
         let mut actions = Vec::new();
         chat.delete_world_stories("a", &mut actions);
         assert_eq!(actions.iter().filter(|a| matches!(a, Action::DeleteSession(_))).count(), 1);

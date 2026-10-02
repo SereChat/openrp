@@ -4,13 +4,14 @@
 use winit::window::CursorIcon;
 
 use super::stream::MAX_RETRIES;
-use serechat::Role;
+use serechat::{CastMember, Role};
 
+use super::tools::{self, Part};
 use super::{Chat, Entry, Load, PRIMARY_KEY, Page, ReasoningView, SelPos, model_name, turns, usage_caption};
 use crate::app::Action;
 use crate::doc::{Doc, INK_MUTED, INK_TEXT};
 use crate::form::FIELD_PAD;
-use crate::library::{Kind, portrait};
+use crate::library::{Kind, LibraryView, portrait};
 use crate::paint::{Painter, Rect, fade, mix};
 use crate::text::{Align, TextLayout};
 use crate::theme;
@@ -30,6 +31,16 @@ const FOOTER_H: f32 = 44.0;
 const EDIT_BAR: f32 = 46.0;
 /// Smallest height of a reply being edited.
 const EDIT_MIN_H: f32 = 60.0;
+/// Smallest height of a character's bubble being edited.
+const BUBBLE_EDIT_MIN_H: f32 = 44.0;
+/// Size of a character's portrait beside their bubble.
+const AVATAR: f32 = 34.0;
+/// Space between a portrait and its bubble.
+const AVATAR_GAP: f32 = 12.0;
+/// Height of the name row above a bubble.
+const NAME_H: f32 = 22.0;
+/// Vertical space between the parts of a story reply.
+const PART_GAP: f32 = 14.0;
 
 /// Where a laid-out document was drawn, for hit-testing after the frame.
 struct Target {
@@ -51,9 +62,40 @@ impl Entry {
         view != ReasoningView::Hidden && (self.thinking(live) || !self.message.reasoning.is_empty())
     }
 
+    /// Whether the entry shows as character bubbles and notes.
+    fn bubbles(&self) -> bool {
+        !self.parts.is_empty() && !self.boxed() && !self.message.compaction
+    }
+
+    /// Lays out stale parts at `width`; returns their height.
+    fn measure_parts(&mut self, p: &Painter, width: f32) -> f32 {
+        let (bubble_wrap, note_wrap) = (width - AVATAR - AVATAR_GAP - 2.0 * BOX_PAD.0, width - AVATAR - AVATAR_GAP);
+        self.part_docs.truncate(self.parts.len());
+        let mut height = 0.0;
+        for (k, part) in self.parts.iter().enumerate() {
+            let wrap = if matches!(part, Part::Note(_)) { note_wrap } else { bubble_wrap };
+            if !self.part_docs.get(k).is_some_and(|(built, doc)| built == part && doc.fits(wrap, p.scale)) {
+                let previous = self.part_docs.get_mut(k).map(|(_, doc)| std::mem::take(doc));
+                let doc = match part {
+                    // While a reply streams, only its last bubble grows.
+                    Part::Said { text, .. } => Doc::speech(p.fonts, text, wrap, p.scale, previous),
+                    Part::Note(note) => Doc::plain(p.fonts, note, theme::SMALL, wrap, p.scale),
+                };
+                if k < self.part_docs.len() {
+                    self.part_docs[k] = (part.clone(), doc);
+                } else {
+                    self.part_docs.push((part.clone(), doc));
+                }
+            }
+            let gap = if k > 0 { PART_GAP } else { 0.0 };
+            height += gap + part_height(part, &self.part_docs[k].1);
+        }
+        height
+    }
+
     /// Rebuilds stale documents and returns the entry's height at `width`.
-    fn measure(&mut self, p: &Painter, width: f32, live: bool, view: ReasoningView) -> f32 {
-        self.refresh_display(live);
+    fn measure(&mut self, p: &Painter, width: f32, live: bool, story: bool, view: ReasoningView) -> f32 {
+        self.refresh_display(live, story);
         let boxed = self.boxed();
         let summary = self.message.compaction && !boxed;
         let wrap = if boxed {
@@ -64,16 +106,25 @@ impl Entry {
             width
         };
         let key = (self.display.len(), boxed);
-        if self.doc.as_ref().is_none_or(|d| !d.fits(wrap, p.scale)) || self.doc_key != key {
-            let previous = self.doc.take();
-            self.doc = Some(if boxed {
-                Doc::plain(p.fonts, &self.display, theme::BODY, wrap, p.scale)
-            } else {
-                Doc::markdown(p.fonts, &self.display, wrap, p.scale, INK_TEXT, previous)
-            });
-            self.doc_key = key;
-        }
-        let doc_h = self.doc.as_ref().map_or(0.0, |d| d.height);
+        let doc_h = if self.bubbles() {
+            self.doc = None;
+            self.measure_parts(p, width)
+        } else {
+            self.part_docs.clear();
+            if self.doc.as_ref().is_none_or(|d| !d.fits(wrap, p.scale)) || self.doc_key != key {
+                let previous = self.doc.take();
+                self.doc = Some(if story && self.message.role == Role::User && !self.message.failed {
+                    // The user's *actions* are muted, as the characters' are.
+                    Doc::speech(p.fonts, &self.display, wrap, p.scale, previous)
+                } else if boxed {
+                    Doc::plain(p.fonts, &self.display, theme::BODY, wrap, p.scale)
+                } else {
+                    Doc::markdown(p.fonts, &self.display, wrap, p.scale, INK_TEXT, previous)
+                });
+                self.doc_key = key;
+            }
+            self.doc.as_ref().map_or(0.0, |d| d.height)
+        };
         if boxed {
             return doc_h + 2.0 * BOX_PAD.1;
         }
@@ -122,6 +173,7 @@ impl Chat {
         let current = self.current;
         let reasoning_view = self.reasoning_view;
         let models = &self.models;
+        let library = &self.library;
         let Some(conversation) = self.conversations.iter_mut().find(|c| c.id == current) else {
             return;
         };
@@ -146,6 +198,7 @@ impl Chat {
             Load::Loaded => {}
         }
         let live_entry = conversation.stream.as_ref().map(|s| s.entry);
+        let story = conversation.world.is_some();
         let started = conversation.stream.as_ref().map(|s| s.started);
         // Under the messages: a retry in progress, or the Continue button.
         let retry = conversation.retry.as_ref().map(|r| format!("Retrying ({} of {MAX_RETRIES}): {}", r.attempt, r.error));
@@ -161,19 +214,32 @@ impl Chat {
             anchors[turns::anchor(&conversation.entries, &turn)] = Some(turn.clone());
             next = turn.end.max(next + 1);
         }
-        // Replies being edited show a field each; the last one has the buttons.
+        // Replies being edited show a field per character bubble (or one for
+        // a reply without characters); the last reply has the buttons.
         let mut edit = self.turn_edit.as_mut().filter(|e| e.conversation == current);
-        let edit_ids = edit.as_ref().map(|e| e.entries.clone()).unwrap_or_default();
-        let mut edit_layouts: Vec<Option<TextLayout>> =
-            edit.as_ref().map(|e| (0..e.entries.len()).map(|k| Some(e.fields.layout(p, k, width))).collect()).unwrap_or_default();
-        let edit_heights: Vec<f32> = edit_layouts
+        let slots: Vec<(u64, Option<String>)> =
+            edit.as_ref().map(|e| e.slots.iter().map(|s| (s.entry, s.character.clone())).collect()).unwrap_or_default();
+        let field_w = |character: &Option<String>| if character.is_some() { width - AVATAR - AVATAR_GAP } else { width };
+        let mut edit_layouts: Vec<Option<TextLayout>> = edit
+            .as_ref()
+            .map(|e| slots.iter().enumerate().map(|(k, (_, character))| Some(e.fields.layout(p, k, field_w(character)))).collect())
+            .unwrap_or_default();
+        let field_heights: Vec<f32> = edit_layouts
             .iter()
-            .enumerate()
-            .map(|(k, l)| {
-                let field = l.as_ref().map_or(0.0, |l| l.height() + 2.0 * FIELD_PAD.1).max(EDIT_MIN_H);
-                field + if k + 1 == edit_ids.len() { EDIT_BAR } else { 0.0 }
+            .zip(&slots)
+            .map(|(layout, (_, character))| {
+                let min = if character.is_some() { BUBBLE_EDIT_MIN_H } else { EDIT_MIN_H };
+                layout.as_ref().map_or(0.0, |l| l.height() + 2.0 * FIELD_PAD.1).max(min)
             })
             .collect();
+        let last_edited = slots.last().map(|s| s.0);
+        // An edited reply's height: its fields (under names), then the buttons.
+        let edit_height = |id: u64| -> Option<f32> {
+            let rows = slots.iter().zip(&field_heights).filter(|((entry, _), _)| *entry == id);
+            let rows: Vec<f32> = rows.map(|((_, character), field)| field + if character.is_some() { NAME_H } else { 0.0 }).collect();
+            let gaps = PART_GAP * rows.len().saturating_sub(1) as f32;
+            (!rows.is_empty()).then(|| rows.iter().sum::<f32>() + gaps + if last_edited == Some(id) { EDIT_BAR } else { 0.0 })
+        };
         let confirming = self.confirm_turn;
         let editable: Vec<bool> = anchors.iter().map(|t| t.as_ref().is_some_and(|t| turns::has_editable(&conversation.entries, t))).collect();
         // Regen sends the last prompt again: there must be one.
@@ -182,10 +248,8 @@ impl Chat {
         // Measure everything (layouts are cached) to know the scroll range.
         let mut content_h = 24.0 + footer_h;
         for (index, entry) in conversation.entries.iter_mut().enumerate() {
-            let editing = edit_ids.iter().position(|id| *id == entry.id);
             let live = live_entry == Some(entry.id);
-            content_h +=
-                entry_height(entry, editing.map(|k| edit_heights[k]), anchors[index].is_some(), p, width, live, reasoning_view) + MESSAGE_GAP;
+            content_h += entry_height(entry, edit_height(entry.id), anchors[index].is_some(), p, width, live, story, reasoning_view) + MESSAGE_GAP;
         }
         let max_scroll = (content_h - view.h).max(0.0);
 
@@ -250,9 +314,9 @@ impl Chat {
         let mut turn_top = y;
         for (index, entry) in conversation.entries.iter_mut().enumerate() {
             let live = live_entry == Some(entry.id);
-            let editing = edit_ids.iter().position(|id| *id == entry.id);
+            let editing = edit_height(entry.id);
             let anchor = anchors[index].clone();
-            let height = entry_height(entry, editing.map(|k| edit_heights[k]), anchor.is_some(), p, width, live, reasoning_view);
+            let height = entry_height(entry, editing, anchor.is_some(), p, width, live, story, reasoning_view);
             let area = Rect::new(x, y, width, height);
             y += height + MESSAGE_GAP;
             if entry.message.role == Role::User || index == 0 {
@@ -264,21 +328,31 @@ impl Chat {
             // A turn's actions, while it is hovered and nothing is on its
             // way or being edited.
             let turn_hovered = in_view && ui.hovered(Rect::new(x, turn_top, width, area.bottom() - turn_top));
-            let actions_for = anchor.filter(|_| !busy && edit_ids.is_empty() && turn_hovered).map(|turn| TurnButtons {
+            let actions_for = anchor.filter(|_| !busy && slots.is_empty() && turn_hovered).map(|turn| TurnButtons {
                 edit: editable[index],
                 regen: turn.end == entry_count && regen_ok,
                 confirming: confirming == Some(entry.id),
             });
             effects.confirm_shown |= actions_for.as_ref().is_some_and(|b| b.confirming);
             let sel = |doc: u8, d: &Doc| selected_range(selection, index, doc, d);
-            if let Some(k) = editing {
-                let last = k + 1 == edit_ids.len();
-                let field = Rect::new(x, area.y, width, area.h - if last { EDIT_BAR } else { 0.0 });
-                if let (Some(edit), Some(layout)) = (edit.as_deref_mut(), edit_layouts[k].take()) {
-                    edit.fields.draw(k, p, ui, field, layout, "Empty: this reply is removed", in_view);
+            if editing.is_some() {
+                let mut top = area.y;
+                for (k, (_, character)) in slots.iter().enumerate().filter(|(_, (id, _))| *id == entry.id) {
+                    let field = if let Some(name) = character {
+                        // Where the bubble was: under the name, beside the portrait.
+                        let column = speaker(p, (&conversation.cast, library), name, (x, top), width);
+                        Rect::new(column, top + NAME_H, width - AVATAR - AVATAR_GAP, field_heights[k])
+                    } else {
+                        Rect::new(x, top, width, field_heights[k])
+                    };
+                    if let (Some(edit), Some(layout)) = (edit.as_deref_mut(), edit_layouts[k].take()) {
+                        let hint = if character.is_some() { "Empty: they say nothing in this reply" } else { "Empty: this reply is removed" };
+                        edit.fields.draw(k, p, ui, field, layout, hint, in_view);
+                    }
+                    top = field.bottom() + PART_GAP;
                 }
-                if last {
-                    let bar_y = field.bottom() + 10.0;
+                if last_edited == Some(entry.id) {
+                    let bar_y = area.bottom() - EDIT_BAR + 10.0;
                     let save = Rect::new(area.right() - 90.0, bar_y, 90.0, 30.0);
                     effects.save_edit |= button(p, ui, save, "Save", ButtonStyle::Primary, in_view);
                     effects.cancel_edit |= button(p, ui, Rect::new(save.x - 96.0, bar_y, 90.0, 30.0), "Cancel", ButtonStyle::Ghost, in_view);
@@ -378,7 +452,46 @@ impl Chat {
                 ui.animating = true;
                 continue;
             }
-            if let Some(doc) = &mut entry.doc {
+            if entry.bubbles() {
+                let column = x + AVATAR + AVATAR_GAP;
+                for (k, (part, doc)) in entry.part_docs.iter_mut().enumerate() {
+                    let Ok(doc_id) = u8::try_from(k + 2) else { break };
+                    if k > 0 {
+                        top += PART_GAP;
+                    }
+                    let height = part_height(part, doc);
+                    if top > view.bottom() || top + height < view.y {
+                        top += height;
+                        continue;
+                    }
+                    let (origin, color, rect) = match part {
+                        Part::Note(_) => {
+                            // A change to the story: a dot in the portraits' column.
+                            let mid = doc.texts.first().map_or(8.0, |t| t.layout.height() * 0.5);
+                            p.rect(Rect::new(x + AVATAR * 0.5 - 2.5, top + mid - 2.5, 5.0, 5.0), t.border_strong, 2.5);
+                            ((column, top), t.text_faint, Rect::new(column, top, width - AVATAR - AVATAR_GAP, doc.height))
+                        }
+                        Part::Said { character, .. } => {
+                            speaker(p, (&conversation.cast, library), character, (x, top), width);
+                            // Every bubble spans the column, whatever its text.
+                            let bubble = Rect::new(column, top + NAME_H, width - AVATAR - AVATAR_GAP, doc.height + 2.0 * BOX_PAD.1);
+                            p.bordered(bubble, t.surface, theme::RADIUS, 1.0, t.border);
+                            let origin = (bubble.x + BOX_PAD.0, bubble.y + BOX_PAD.1);
+                            (origin, t.text, Rect::new(origin.0, origin.1, bubble.w - 2.0 * BOX_PAD.0, doc.height))
+                        }
+                    };
+                    if let Some((a, b)) = sel(doc_id, doc) {
+                        doc.draw_selection(p, origin, a, b);
+                    }
+                    if in_view && ui.hovered(rect) {
+                        ui.cursor = CursorIcon::Text;
+                    }
+                    let event = doc.draw(p, ui, origin, color, in_view, None);
+                    effects.link = effects.link.take().or(event.open_link);
+                    targets.push(Target { entry: index, doc: doc_id, origin, rect });
+                    top += height;
+                }
+            } else if let Some(doc) = &mut entry.doc {
                 let origin = (x, top);
                 if let Some((a, b)) = sel(1, doc) {
                     doc.draw_selection(p, origin, a, b);
@@ -447,7 +560,7 @@ impl Chat {
                 gap(a.rect).total_cmp(&gap(b.rect))
             })?;
             let entry = &conversation.entries[target.entry];
-            let doc = if target.doc == 0 { entry.reasoning_doc.as_ref()? } else { entry.doc.as_ref()? };
+            let doc = entry.doc_by_id(target.doc)?;
             let (piece, byte) = doc.hit(mouse.0 - target.origin.0, mouse.1 - target.origin.1)?;
             Some((target.entry, target.doc, piece, byte))
         };
@@ -456,7 +569,7 @@ impl Chat {
             match hit(ui.mouse) {
                 Some(pos) if on_text || ui.mods.shift_key() => {
                     let entry = &conversation.entries[pos.0];
-                    let doc = if pos.1 == 0 { entry.reasoning_doc.as_ref() } else { entry.doc.as_ref() };
+                    let doc = entry.doc_by_id(pos.1);
                     self.selection = match (ui.clicks, doc) {
                         (2, Some(doc)) => {
                             let word = doc.word((pos.2, pos.3));
@@ -602,14 +715,37 @@ fn turn_buttons(p: &mut Painter, ui: &mut Ui, right: f32, y: f32, buttons: &Turn
     clicked
 }
 
+/// Draws `name`'s portrait (from the story's cast, with the library that
+/// holds the images) at `(x, top)` and their name beside it, in a column
+/// `width` wide. Returns where their bubble starts.
+fn speaker(p: &mut Painter, (cast, library): (&[CastMember], &LibraryView), name: &str, (x, top): (f32, f32), width: f32) -> f32 {
+    let member = cast.iter().find(|m| tools::same(&m.name, name));
+    let path = member.and_then(|m| library.portrait_path(&m.portrait));
+    portrait(p, path.as_deref(), name, Rect::new(x, top, AVATAR, AVATAR), AVATAR * 0.5);
+    let column = x + AVATAR + AVATAR_GAP;
+    let mut label = p.layout(name, theme::LABEL, None);
+    label.truncate(p.fonts, width - AVATAR - AVATAR_GAP);
+    p.text(&label, column, top + (NAME_H - 4.0 - label.height()) * 0.5, p.theme.text);
+    column
+}
+
+/// Height of a story reply's `part`, laid out as `doc`: a note's text, or
+/// a character's name and bubble beside their portrait.
+fn part_height(part: &Part, doc: &Doc) -> f32 {
+    match part {
+        Part::Note(_) => doc.height,
+        Part::Said { .. } => (NAME_H + doc.height + 2.0 * BOX_PAD.1).max(AVATAR),
+    }
+}
+
 /// Height of `entry`: `edit_h` while it is being edited, otherwise its
 /// laid-out height, plus the actions row when it is a boxed turn anchor.
 #[allow(clippy::too_many_arguments, reason = "layout inputs; a struct would only rename them")]
-fn entry_height(entry: &mut Entry, edit_h: Option<f32>, anchor: bool, p: &Painter, width: f32, live: bool, view: ReasoningView) -> f32 {
+fn entry_height(entry: &mut Entry, edit_h: Option<f32>, anchor: bool, p: &Painter, width: f32, live: bool, story: bool, view: ReasoningView) -> f32 {
     if let Some(height) = edit_h {
         return height;
     }
-    let height = entry.measure(p, width, live, view);
+    let height = entry.measure(p, width, live, story, view);
     if anchor && entry.boxed() { height + META_H } else { height }
 }
 

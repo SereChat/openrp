@@ -260,7 +260,12 @@ impl App {
             use winit::platform::macos::WindowAttributesExtMacOS;
             attributes.with_titlebar_transparent(true).with_fullsize_content_view(true).with_title_hidden(true)
         };
+        // Wayland's app id and X11's WM_CLASS: desktops match it to the
+        // installed `openrp.desktop` for the name and icon.
+        #[cfg(target_os = "linux")]
+        let attributes = winit::platform::wayland::WindowAttributesExtWayland::with_name(attributes, "openrp", "openrp");
         let window = Arc::new(event_loop.create_window(attributes).map_err(StartupError::Window)?);
+        set_icon(&window);
         // Chinese, Japanese and Korean input methods deliver text through IME events.
         window.set_ime_allowed(true);
         let renderer = block_on(Renderer::new(Arc::clone(&window), event_loop.owned_display_handle())).map_err(StartupError::Gpu)?;
@@ -481,7 +486,7 @@ impl App {
             }
             (WorkerEvent::Models(Ok(models)), Screen::Chat(chat)) => chat.set_models(models),
             (WorkerEvent::Models(Err(e)), _) => eprintln!("openrp: could not load models: {e}"),
-            (WorkerEvent::SessionLoaded { conversation, result }, Screen::Chat(chat)) => chat.session_loaded(conversation, result),
+            (WorkerEvent::SessionLoaded { conversation, result }, Screen::Chat(chat)) => chat.session_loaded(conversation, result, &mut actions),
             (WorkerEvent::Stream { conversation, stream, event }, Screen::Chat(chat)) => {
                 chat.stream_event(conversation, stream, event);
             }
@@ -524,7 +529,7 @@ impl App {
             Action::Send(job) => self.spawn(move |client, proxy| {
                 let (conversation, stream) = (job.conversation, job.stream);
                 let input = chat::input_items(&job.history);
-                // Stories offer the narrator's tools; plain chats none.
+                // Stories offer the story's tools; plain chats none.
                 let definitions = if job.tools { chat::tool_definitions() } else { Vec::new() };
                 let specs: Vec<ToolSpec<'_>> =
                     definitions.iter().map(|(name, description, parameters)| ToolSpec { name, description, parameters }).collect();
@@ -911,6 +916,33 @@ fn report<T>(listing: Result<(Vec<T>, Vec<Error>), Error>, what: &str) -> Vec<T>
 /// The OS window decoration style matching `scheme`.
 fn window_theme(scheme: Scheme) -> Theme {
     if scheme.is_light() { Theme::Light } else { Theme::Dark }
+}
+
+/// Gives the window the app icon for its title bar and taskbar entry.
+///
+/// Windows loads the sizes `build.rs` embedded, picked for the display's
+/// scale; X11 gets the 256px PNG. macOS ignores window icons and Wayland
+/// takes them from a `.desktop` file, so both keep the default.
+fn set_icon(window: &Window) {
+    #[cfg(windows)]
+    {
+        use winit::platform::windows::{IconExtWindows, WindowExtWindows};
+        let scale = window.scale_factor();
+        let load = |side: f64| {
+            let side = (side * scale).round() as u32;
+            winit::window::Icon::from_resource(1, Some(winit::dpi::PhysicalSize::new(side, side))).ok()
+        };
+        window.set_window_icon(load(16.0));
+        window.set_taskbar_icon(load(32.0));
+    }
+    #[cfg(all(unix, not(target_os = "macos")))]
+    if let Ok((rgba, w, h)) = image::decode_png(include_bytes!("../assets/icon/256.png"))
+        && let Ok(icon) = winit::window::Icon::from_rgba(rgba, w, h)
+    {
+        window.set_window_icon(Some(icon));
+    }
+    #[cfg(target_os = "macos")]
+    let _ = window;
 }
 
 /// Minimal executor for wgpu's initialisation futures.

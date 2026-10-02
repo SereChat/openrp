@@ -3,7 +3,7 @@
 use serechat::unix_now;
 use winit::window::CursorIcon;
 
-use super::{Chat, PRIMARY_KEY, Page, ago};
+use super::{Chat, Menu, PRIMARY_KEY, Page, ago};
 use crate::app::Action;
 use crate::library::Kind;
 use crate::paint::{Painter, Rect, fade, mix};
@@ -51,7 +51,12 @@ impl Chat {
 
         let clip = p.push_clip(list);
         let now = unix_now();
-        let (mut open, mut confirm, mut delete, mut confirm_hovered) = (None, None, None, false);
+        let mut open = None;
+        let menu_open = match self.menu {
+            Some(Menu::Session(id)) => Some(id),
+            _ => None,
+        };
+        let mut toggle_menu = None;
         let mut y = list.y - self.sidebar_scroll;
         for conversation in self.conversations.iter().filter(shown) {
             let item = Rect::new(8.0, y, area.w - 16.0, item_h);
@@ -65,30 +70,18 @@ impl Chat {
             let selected = on_chat && conversation.id == self.current;
             p.rect(item, if selected { t.active } else { fade(t.hover, hover) }, theme::RADIUS_SM);
 
-            // Right side: age, or the delete control while hovered.
-            let confirming = self.confirm_delete == Some(conversation.id);
-            confirm_hovered |= confirming && hovered;
+            // Right side: age, or the session's menu (duplicate, delete) while hovered.
             let mut on_control = false;
-            let right_w = if confirming {
-                let del = Rect::new(item.right() - 60.0, item.y + 4.0, 56.0, item_h - 8.0);
-                let over = hovered && del.contains(ui.mouse);
-                p.rect(del, fade(t.danger, if over { 0.24 } else { 0.14 }), theme::RADIUS_SM);
-                p.label_centered("Delete", theme::CAPTION, del, t.danger);
-                on_control = over;
-                if over && ui.clicked(del) {
-                    delete = Some(conversation.id);
+            let right_w = if hovered || menu_open == Some(conversation.id) {
+                let dots = Rect::new(item.right() - 26.0, item.y + 5.0, 20.0, 20.0);
+                let over = hovered && dots.contains(ui.mouse);
+                if over || menu_open == Some(conversation.id) {
+                    p.rect(dots, t.active, theme::RADIUS_SM);
                 }
-                64.0
-            } else if hovered {
-                let x = Rect::new(item.right() - 26.0, item.y + 5.0, 20.0, 20.0);
-                let over = x.contains(ui.mouse);
-                if over {
-                    p.rect(x, t.active, theme::RADIUS_SM);
-                }
-                p.label_centered("×", Style::regular(15.0), x, if over { t.text } else { t.text_faint });
+                p.label_centered("⋯", Style::regular(15.0), dots, if over { t.text } else { t.text_faint });
                 on_control = over;
-                if over && ui.clicked(x) {
-                    confirm = Some(conversation.id);
+                if over && ui.clicked(dots) {
+                    toggle_menu = Some((conversation.id, dots));
                 }
                 30.0
             } else if conversation.busy() {
@@ -117,19 +110,13 @@ impl Chat {
         }
         p.set_clip(clip);
 
-        // Leaving the row cancels a pending delete.
-        if !confirm_hovered {
-            self.confirm_delete = None;
-        }
-        if confirm.is_some() {
-            self.confirm_delete = confirm;
-        }
-        if let Some(id) = delete {
-            self.confirm_delete = None;
-            self.delete_conversation(id, actions);
-        }
         if let Some(id) = open {
             self.open(id, actions);
+        }
+        if let Some((id, anchor)) = toggle_menu {
+            self.menu = if menu_open == Some(id) { None } else { Some(Menu::Session(id)) };
+            self.menu_scroll = 0.0;
+            self.session_menu = anchor;
         }
 
         p.rect(Rect::new(0.0, area.h - 47.0, area.w - 1.0, 1.0), t.border, 0.0);

@@ -33,10 +33,14 @@ cargo clippy --workspace --all-targets
   them in or out of the scene; its ⋯ menu edits or deletes them. Deleting a world deletes its
   stories.
 - **No narrator**: the story is told only through its characters. Every reply must call a tool
-  (the request sets `tool_choice: required`); `speak` holds every line of the turn in one call,
-  in order, each a character, what they do (action) and what they say (text, empty when they
-  only act), so several characters can answer and react to each other. Lines appear as they
-  are written, as **Name** · *action* above a quote. Newcomers come in only when your message
+  (the request sets `tool_choice: required`), and text written outside tool calls is dropped:
+  there is no narration. `speak` holds the whole turn in one call, as one message per
+  responding character: what they do (action) and what they say (text, with short actions in
+  *asterisks*), so several characters can answer and react to each other. Each character gets
+  one bubble per reply, with their portrait and name, their actions muted and their words in
+  full colour; if a model gives someone two messages, they are merged and the model is told.
+  Bubbles appear as they are written; a scene change, arrival or departure shows as a small
+  note between them. Newcomers come in only when your message
   refers to someone not cast yet, or when nobody is in the scene (then the one character the
   moment needs); they are introduced in the same `speak` call, each with a description. No
   one is cast without a description: if a model lets someone act without introducing them,
@@ -47,8 +51,11 @@ cargo clippy --workspace --all-targets
   your character, the characters present and those elsewhere, and the scene make up its system prompt,
   rebuilt for every reply.
 - **Edit, Regen, Delete**: hovering a turn (your message and everything that answered it)
-  shows them left of Copy. **Edit** makes all of its replies editable at once (the model then
-  sees your text instead of the tool calls); **Regen** sends the last prompt again;
+  shows them left of Copy. **Edit** makes all of its replies editable at once, a box per
+  character bubble under their portrait and name; saving rewrites their speech in the reply's
+  `speak` call, so it stays bubbles and the model sees your edit (an emptied box drops that
+  character from the reply). Replies edited by earlier versions, saved as text, are read back
+  into bubbles. **Regen** sends the last prompt again;
   **Delete** (click twice) removes the prompt and its replies. Each reply records what it
   changed in the story (who joined or moved, the scene), so regenerating or deleting the last
   turn rewinds that too, except what you changed yourself since. Deleting an earlier turn only
@@ -60,8 +67,24 @@ cargo clippy --workspace --all-targets
   chats you switch away from.
 - **Spotlight** (Ctrl/Cmd+K): one search over commands, sessions, models, themes and the full
   text of every saved message.
+- **Memories**: the AI keeps what the story must not forget (promises, secrets, injuries,
+  changed relationships) with a `remember` tool, shown as a small note in the reply. They are
+  sent with every request, so they survive summarising; **Memory** beside the scene lists
+  them in a dialog where each can be edited or removed (×), and new ones added (Enter or
+  **+ Add memory**). Regenerating or deleting the reply that remembered something forgets it
+  again.
+- **Author's note and OOC**: **Note** beside the scene holds your guidance for the whole story
+  (tone, pacing, limits), sent last in every request. For one reply only, end a message with a
+  line starting `/ooc` (or send just `/ooc …` to nudge the story): the model is told it is your
+  instruction, not your character speaking, and it shows muted under your message. Your own
+  `*actions*` are muted too, like the characters'.
+- **Duplicate and delete**: a session's ⋯ in the sidebar deletes it at once, or (like
+  `/duplicate` and `/frame`) copies it exactly, with every message, memory and the scene
+  (replies are not billed twice), or as a **frame**: the world, your character, the cast and
+  the author's note, ready for a new story.
 - **Slash commands** in the composer, completed as you type (Tab completes, Enter runs, Esc
-  dismisses): `/clear` deletes the open story and starts it over in the same world and cast.
+  dismisses): `/ooc`, `/note`, `/memory`, `/duplicate`, `/frame`, and `/clear`, which deletes
+  the open story and starts it over in the same world, cast and note.
 - **Emoji and CJK**: colour emoji (Twemoji), and Chinese, Japanese and Korean text through the
   operating system's fonts, with input-method (IME) support for typing them.
 - **Settings**, in tabs: Appearance (Dark, One Dark and Light schemes, reasoning display),
@@ -108,7 +131,9 @@ worker threads and post results back to the event loop. Every file write goes th
 writer thread, in order, which finishes its queue before the app exits.
 
 CI (`.github/workflows/ci.yml`) runs clippy and the tests on Windows, macOS and Linux. Pushing
-a `v*` tag attaches release binaries to a GitHub release.
+a `v*` tag attaches release builds to a GitHub release: `openrp.exe` (icon embedded), `OpenRP.app`
+for macOS, and for Linux the binary with `openrp.desktop`, its icon and `install.sh` (installs
+all three for the current user). The packaging files are in `packaging/`.
 
 ## Sign-in and storage
 
@@ -118,7 +143,7 @@ approval page, and the user types the 6-digit code into the app. Everything live
 
 - `config.toml`: token, model, reasoning effort and display, and colour scheme.
 - `sessions/<id>.json`: one file per story, with its world, your character, its cast (copies),
-  each reply's tool calls, and each reply's tokens and cost at the
+  its scene, memories and author's note, each reply's tool calls, and each reply's tokens and cost at the
   prices of the time. `.index.json` next to them holds titles and totals, so startup reads
   only the index; a session's messages load when it is opened.
 - `worlds/<id>.json` and `characters/<id>.json`: one file per world or character.
@@ -134,7 +159,7 @@ from the API) removes the token but keeps sessions.
 - The world and character forms show input-method text only once it is committed.
 - The portrait picker runs the platform's helper (PowerShell, `osascript`, `zenity`/`kdialog`), so
   it takes a moment to appear.
-- Release binaries are unsigned and not packaged as installers or a macOS `.app` yet.
+- Release builds are unsigned (the macOS `.app` is ad-hoc signed only) and there are no installers.
 
 ## Fonts
 

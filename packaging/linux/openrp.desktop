@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=OpenRP
+Comment=AI roleplay in your own worlds
+Exec=openrp
+Icon=openrp
+Terminal=false
+Categories=Game;RolePlaying;
+StartupWMClass=openrp

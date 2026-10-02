@@ -1,7 +1,7 @@
 //! The worlds and characters pages: an index of everything saved, and a
-//! form to create or edit one, with its portrait. Worlds are played from
-//! here: Play starts a story set in that world, and deleting a world
-//! deletes its stories.
+//! form to create, edit or duplicate one, with its portrait. Worlds are
+//! played from here: Play starts a story set in that world, and deleting a
+//! world deletes its stories; a world's form lists them, to open one.
 //!
 //! The app reads the records from `~/.openrp/worlds/` and
 //! `~/.openrp/characters/` when the chat screen opens and saves them through
@@ -34,6 +34,8 @@ const CARD_H: f32 = 80.0;
 const CARD_PORTRAIT: f32 = 56.0;
 /// Side of the form's portrait.
 const FORM_PORTRAIT: f32 = 132.0;
+/// Height of a story's row on its world's page.
+const STORY_H: f32 = 40.0;
 /// Longest name, in chars.
 pub const NAME_LIMIT: usize = 80;
 /// Smallest height of a description field.
@@ -92,6 +94,19 @@ pub enum Event {
     Play(String),
     /// This world was deleted: its stories go too.
     WorldDeleted(String),
+    /// Open the story (conversation) with this id.
+    Open(u64),
+}
+
+/// A story played in the world being edited, for its page to list.
+#[derive(Clone, Debug)]
+pub struct Story {
+    /// The conversation's id.
+    pub id: u64,
+    /// Its title; empty for none yet.
+    pub title: String,
+    /// Last change, seconds since the Unix epoch.
+    pub updated: u64,
 }
 
 /// A world or character as the app shows it.
@@ -320,10 +335,54 @@ impl LibraryView {
             return;
         };
         let Some(record) = form.record() else { return };
-        let records = self.list_mut(form.kind);
+        self.put(form.kind, record, actions);
+    }
+
+    /// Saves `record`, replacing any with its id, as the most recent.
+    fn put(&mut self, kind: Kind, record: Record, actions: &mut Vec<Action>) {
+        let records = self.list_mut(kind);
         records.retain(|r| r.id != record.id);
         records.insert(0, record.clone());
-        actions.push(record.save_action(form.kind));
+        actions.push(record.save_action(kind));
+    }
+
+    /// Stores a story's cast member as library character `id`: updates the
+    /// one it was cast from, or adds a new one.
+    pub fn store_character(&mut self, id: &str, name: &str, description: &str, portrait: &str, actions: &mut Vec<Action>) {
+        let created = self.get(Kind::Character, id).map_or_else(unix_now, |r| r.created);
+        let record = Record {
+            id: id.to_owned(),
+            name: name.to_owned(),
+            description: description.to_owned(),
+            portrait: portrait.to_owned(),
+            created,
+            updated: unix_now(),
+        };
+        self.put(Kind::Character, record, actions);
+    }
+
+    /// Opens the form of record `id`, as clicking its card does.
+    #[cfg(test)]
+    pub fn open_form(&mut self, kind: Kind, id: &str) {
+        self.form = self.get(kind, id).cloned().map(|r| Form::new(kind, Some(r)));
+    }
+
+    /// The saved world whose form is open, whose stories it lists.
+    #[must_use]
+    pub fn open_world(&self) -> Option<&str> {
+        self.form.as_ref().filter(|f| f.kind == Kind::World && !f.new).map(|f| f.id.as_str())
+    }
+
+    /// Saves the open form, like Play, then opens a new, unsaved copy of it.
+    fn duplicate(&mut self, actions: &mut Vec<Action>) {
+        let Some(form) = &self.form else { return };
+        let (kind, Some(record)) = (form.kind, form.record()) else { return };
+        self.put(kind, record.clone(), actions);
+        let copy = Record { id: new_id(), name: format!("{} (copy)", record.name), created: unix_now(), ..record };
+        let mut form = Form::new(kind, Some(copy));
+        form.new = true;
+        self.form = Some(form);
+        self.scroll = 0.0;
     }
 
     /// Deletes the open form's record and returns to the index. Returns the
@@ -339,8 +398,9 @@ impl LibraryView {
     }
 
     /// Draws the page for `kind` into `area` (the whole main area).
-    pub fn draw(&mut self, p: &mut Painter, ui: &mut Ui, area: Rect, kind: Kind, actions: &mut Vec<Action>) -> Option<Event> {
-        if self.form.is_some() { self.draw_form(p, ui, area, actions) } else { self.draw_index(p, ui, area, kind).map(Event::Play) }
+    /// `stories` are those of the world being edited (see [`Self::open_world`]).
+    pub fn draw(&mut self, p: &mut Painter, ui: &mut Ui, area: Rect, kind: Kind, stories: &[Story], actions: &mut Vec<Action>) -> Option<Event> {
+        if self.form.is_some() { self.draw_form(p, ui, area, stories, actions) } else { self.draw_index(p, ui, area, kind).map(Event::Play) }
     }
 
     /// Scrolls the body below the header and returns it with the content
@@ -441,9 +501,9 @@ impl LibraryView {
         play
     }
 
-    /// The open form: portrait, name and description, with save, delete
-    /// and (for a saved world) play.
-    fn draw_form(&mut self, p: &mut Painter, ui: &mut Ui, area: Rect, actions: &mut Vec<Action>) -> Option<Event> {
+    /// The open form: portrait, name and description, with save, duplicate,
+    /// delete and, for a saved world, play and the stories played in it.
+    fn draw_form(&mut self, p: &mut Painter, ui: &mut Ui, area: Rect, stories: &[Story], actions: &mut Vec<Action>) -> Option<Event> {
         let t = p.theme;
         let (body, x, width) = self.body(ui, area);
         let scroll = self.scroll;
@@ -469,6 +529,12 @@ impl LibraryView {
             let play_button = Rect::new(right - 72.0, back.y, 72.0, 30.0);
             play = button(p, ui, play_button, "Play", ButtonStyle::Secondary, true);
             right = play_button.x - 8.0;
+        }
+        let mut duplicated = false;
+        if !form.new {
+            let duplicate = Rect::new(right - 96.0, back.y, 96.0, 30.0);
+            duplicated = button(p, ui, duplicate, "Duplicate", ButtonStyle::Secondary, can_save);
+            right = duplicate.x - 8.0;
         }
         let mut deleted = false;
         if !form.new {
@@ -546,12 +612,53 @@ impl LibraryView {
         let description_h = (description.height() + 2.0 * FIELD_PAD.1).max(DESCRIPTION_MIN_H);
         form.fields.draw(DESCRIPTION, p, ui, Rect::new(x, y, width, description_h), description, kind.hint(), interactive);
         y += description_h;
+
+        // A saved world lists the stories played in it, newest first.
+        let mut opened = None;
+        if kind == Kind::World && !form.new {
+            y += 32.0;
+            p.label("Stories", theme::LABEL, x, y, t.text);
+            if !stories.is_empty() {
+                let count = p.layout(&stories.len().to_string(), theme::SMALL, None);
+                p.text(&count, x + width - count.width(), y + 1.0, t.text_faint);
+            }
+            y += 28.0;
+            if stories.is_empty() {
+                p.label("None yet: press Play to start one.", theme::SMALL, x, y, t.text_muted);
+                y += 20.0;
+            }
+            let now = unix_now();
+            for story in stories {
+                let row = Rect::new(x, y, width, STORY_H);
+                y += STORY_H + 4.0;
+                let hovered = interactive && ui.hovered(row);
+                let hover = ui.anim(id(("story", story.id)), f32::from(u8::from(hovered)));
+                p.bordered(row, mix(t.surface, t.hover, hover), theme::RADIUS_SM, 1.0, mix(t.border, t.border_strong, hover));
+                let age = p.layout(&crate::chat::ago(now, story.updated), theme::TINY, None);
+                p.text(&age, row.right() - 12.0 - age.width(), row.y + (STORY_H - age.height()) * 0.5, t.text_faint);
+                let mut title = p.layout(if story.title.is_empty() { "Untitled story" } else { &story.title }, theme::SMALL, None);
+                title.truncate(p.fonts, row.w - 36.0 - age.width());
+                p.text(&title, row.x + 12.0, row.y + (STORY_H - title.height()) * 0.5, t.text);
+                if hovered {
+                    ui.cursor = CursorIcon::Pointer;
+                    if ui.clicked(row) {
+                        opened = Some(story.id);
+                    }
+                }
+            }
+        }
         p.set_clip(clip);
         self.content_h = y - top + 64.0;
 
         let id = form.id.clone();
         if saved {
             self.save(actions);
+        } else if duplicated {
+            self.duplicate(actions);
+        } else if let Some(story) = opened {
+            // Unsaved edits are dropped, as when going back.
+            self.form = None;
+            return Some(Event::Open(story));
         } else if deleted {
             return self.delete(actions).map(Event::WorldDeleted);
         } else if go_back {
@@ -629,6 +736,19 @@ mod tests {
         assert_eq!(view.delete(&mut actions).as_deref(), Some("a"));
         assert!(matches!(&actions[..], [Action::DeleteRecord(Kind::World, id)] if id == "a"));
         assert_eq!(view.worlds.len(), 1);
+
+        // Duplicating saves what is shown, then opens an unsaved copy.
+        let mut actions = Vec::new();
+        view.form = Some(Form::new(Kind::World, Some(view.worlds[0].clone())));
+        assert_eq!(view.open_world(), Some("b"));
+        view.form.as_mut().unwrap().fields.insert("er");
+        view.duplicate(&mut actions);
+        assert!(matches!(&actions[..], [Action::SaveWorld(w)] if w.id == "b" && w.name == "Newer"));
+        let copy = view.form.as_ref().unwrap();
+        assert!(copy.new && copy.id != "b" && copy.fields.text(NAME) == "Newer (copy)");
+        assert_eq!(view.open_world(), None, "an unsaved world has no stories");
+        view.save(&mut actions);
+        assert_eq!(view.worlds.len(), 2);
 
         // A pick landing after the form closed changes nothing.
         view.portrait_picked(Ok(Some("late.png".into())));
