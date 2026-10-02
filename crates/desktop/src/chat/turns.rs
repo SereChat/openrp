@@ -6,7 +6,7 @@
 //!   bubble. Edited speech is rewritten in the reply's speak call, so it
 //!   stays bubbles and the model sees the call as edited. A reply without
 //!   characters (a plain chat's) keeps its edited text only.
-//! * Regen (last turn only) sends its prompt again, as if just sent.
+//! * Regenerate (last turn only) sends its prompt again, as if just sent.
 //! * Delete removes the prompt and everything that answered it.
 //!
 //! Regenerating, or deleting the last turn, rewinds the story too: each

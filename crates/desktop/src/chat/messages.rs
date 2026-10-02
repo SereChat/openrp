@@ -240,9 +240,8 @@ impl Chat {
             let gaps = PART_GAP * rows.len().saturating_sub(1) as f32;
             (!rows.is_empty()).then(|| rows.iter().sum::<f32>() + gaps + if last_edited == Some(id) { EDIT_BAR } else { 0.0 })
         };
-        let confirming = self.confirm_turn;
         let editable: Vec<bool> = anchors.iter().map(|t| t.as_ref().is_some_and(|t| turns::has_editable(&conversation.entries, t))).collect();
-        // Regen sends the last prompt again: there must be one.
+        // Regenerate sends the last prompt again: there must be one.
         let regen_ok = conversation.entries.iter().any(|e| e.message.role == Role::User);
 
         // Measure everything (layouts are cached) to know the scroll range.
@@ -331,9 +330,7 @@ impl Chat {
             let actions_for = anchor.filter(|_| !busy && slots.is_empty() && turn_hovered).map(|turn| TurnButtons {
                 edit: editable[index],
                 regen: turn.end == entry_count && regen_ok,
-                confirming: confirming == Some(entry.id),
             });
-            effects.confirm_shown |= actions_for.as_ref().is_some_and(|b| b.confirming);
             let sel = |doc: u8, d: &Doc| selected_range(selection, index, doc, d);
             if editing.is_some() {
                 let mut top = area.y;
@@ -376,7 +373,7 @@ impl Chat {
                 }
                 if let Some(buttons) = &actions_for {
                     effects.turn =
-                        effects.turn.take().or(turn_buttons(p, ui, area.right(), boxed.bottom() + 6.0, buttons).map(|c| (c, index, entry.id)));
+                        effects.turn.take().or(turn_buttons(p, ui, area.right(), boxed.bottom() + 6.0, buttons).map(|c| (c, index)));
                 }
                 continue;
             }
@@ -530,7 +527,7 @@ impl Chat {
             // The turn's actions, left of Copy (which keeps its place).
             if let Some(buttons) = &actions_for {
                 let right = area.right() - if has_copy { 76.0 } else { 0.0 };
-                effects.turn = effects.turn.take().or(turn_buttons(p, ui, right, meta_y, buttons).map(|c| (c, index, entry.id)));
+                effects.turn = effects.turn.take().or(turn_buttons(p, ui, right, meta_y, buttons).map(|c| (c, index)));
             }
         }
         if let Some(status) = &retry {
@@ -610,18 +607,10 @@ impl Chat {
         if effects.resume {
             self.resume(current, actions);
         }
-        // A Delete awaiting confirmation is dropped once its turn is left.
-        if confirming.is_some() && !effects.confirm_shown {
-            self.confirm_turn = None;
-        }
         match effects.turn {
-            Some((TurnClick::Edit, index, _)) => self.edit_turn(index),
-            Some((TurnClick::Regen, ..)) => self.regenerate(actions),
-            Some((TurnClick::Delete, index, id)) if confirming == Some(id) => {
-                self.confirm_turn = None;
-                self.delete_turn(index, actions);
-            }
-            Some((TurnClick::Delete, _, id)) => self.confirm_turn = Some(id),
+            Some((TurnClick::Edit, index)) => self.edit_turn(index),
+            Some((TurnClick::Regen, _)) => self.regenerate(actions),
+            Some((TurnClick::Delete, index)) => self.delete_turn(index, actions),
             None => {}
         }
         if effects.save_edit {
@@ -664,10 +653,8 @@ struct Effects {
     link: Option<String>,
     /// The Continue button was clicked.
     resume: bool,
-    /// A turn's button: what, an entry of the turn and the anchor's id.
-    turn: Option<(TurnClick, usize, u64)>,
-    /// The Delete awaiting confirmation is still shown.
-    confirm_shown: bool,
+    /// A turn's button: what and an entry of the turn.
+    turn: Option<(TurnClick, usize)>,
     /// The edited replies' Save or Cancel was clicked.
     save_edit: bool,
     cancel_edit: bool,
@@ -679,8 +666,6 @@ struct TurnButtons {
     edit: bool,
     /// It is the last turn: its prompt can be sent again.
     regen: bool,
-    /// Delete was clicked once and awaits confirmation.
-    confirming: bool,
 }
 
 /// A turn button that was clicked.
@@ -691,15 +676,14 @@ enum TurnClick {
     Delete,
 }
 
-/// Draws a turn's Edit, Regen and Delete buttons, ending at `right`, on
+/// Draws a turn's Edit, Regenerate and Delete buttons, ending at `right`, on
 /// the row at `y`. Returns the one clicked.
 fn turn_buttons(p: &mut Painter, ui: &mut Ui, right: f32, y: f32, buttons: &TurnButtons) -> Option<TurnClick> {
     let mut right = right;
     let mut clicked = None;
-    let delete = if buttons.confirming { ("Delete?", ButtonStyle::Danger, 72.0) } else { ("Delete", ButtonStyle::Ghost, 64.0) };
     let row = [
-        (true, TurnClick::Delete, delete),
-        (buttons.regen, TurnClick::Regen, ("Regen", ButtonStyle::Ghost, 60.0)),
+        (true, TurnClick::Delete, ("Delete", ButtonStyle::Ghost, 64.0)),
+        (buttons.regen, TurnClick::Regen, ("Regenerate", ButtonStyle::Ghost, 92.0)),
         (buttons.edit, TurnClick::Edit, ("Edit", ButtonStyle::Ghost, 52.0)),
     ];
     for (shown, click, (label, style, width)) in row {

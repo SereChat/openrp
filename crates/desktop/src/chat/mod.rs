@@ -522,9 +522,6 @@ pub struct Chat {
     /// Dragging a message selection.
     dragging: bool,
     sidebar_scroll: f32,
-    /// Anchor entry of the turn whose Delete was clicked once, awaiting
-    /// confirmation.
-    confirm_turn: Option<u64>,
     /// What was just copied (entry, code block or whole message) and when.
     copied: Option<(u64, Option<usize>, f32)>,
     spotlight: Option<Spotlight>,
@@ -574,7 +571,6 @@ impl Chat {
             selection: None,
             dragging: false,
             sidebar_scroll: 0.0,
-            confirm_turn: None,
             copied: None,
             library: LibraryView::default(),
             character_form: None,

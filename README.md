@@ -50,13 +50,13 @@ cargo clippy --workspace --all-targets
   and members who stay behind or walk off go in its `leave`. The world,
   your character, the characters present and those elsewhere, and the scene make up its system prompt,
   rebuilt for every reply.
-- **Edit, Regen, Delete**: hovering a turn (your message and everything that answered it)
+- **Edit, Regenerate, Delete**: hovering a turn (your message and everything that answered it)
   shows them left of Copy. **Edit** makes all of its replies editable at once, a box per
   character bubble under their portrait and name; saving rewrites their speech in the reply's
   `speak` call, so it stays bubbles and the model sees your edit (an emptied box drops that
   character from the reply). Replies edited by earlier versions, saved as text, are read back
-  into bubbles. **Regen** sends the last prompt again;
-  **Delete** (click twice) removes the prompt and its replies. Each reply records what it
+  into bubbles. **Regenerate** sends the last prompt again;
+  **Delete** removes the prompt and its replies. Each reply records what it
   changed in the story (who joined or moved, the scene), so regenerating or deleting the last
   turn rewinds that too, except what you changed yourself since. Deleting an earlier turn only
   removes its messages. What removed replies cost stays counted.
