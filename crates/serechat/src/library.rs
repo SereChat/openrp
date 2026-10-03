@@ -292,7 +292,7 @@ mod tests {
 
         library.delete("w1").unwrap();
         library.delete("w1").unwrap();
-        assert!(library.list::<World>().unwrap().0.is_empty());
+        assert_eq!(library.list::<World>().unwrap().0.len(), 0);
         assert!(library.save("../evil", &Character::default()).is_err());
         assert!(library.delete("..").is_err());
         fs::remove_dir_all(&dir).unwrap();

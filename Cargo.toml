@@ -40,6 +40,8 @@ too_many_lines = "allow"
 # Hex colour literals read best unseparated; UI state structs are flag-heavy.
 unreadable_literal = "allow"
 struct_excessive_bools = "allow"
+# `assert!(x.is_empty())` reads better in tests than `assert_eq!(x, [])`.
+assert_is_empty = "allow"
 
 [profile.release]
 lto = "fat"
