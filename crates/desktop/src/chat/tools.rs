@@ -24,8 +24,10 @@
 //! Both run instantly on the UI thread: they only read or change the story.
 //! A reply shows as [`Part`]s: one bubble per character (whatever the model
 //! sent, a character's messages merge into one) and short notes for scene
-//! changes, arrivals and departures. They update while the model writes
-//! them, from arguments that are still incomplete JSON. There is no
+//! changes. They update while the model writes them, from arguments that
+//! are still incomplete JSON. Once the calls ran, notes for what they
+//! really changed (arrivals, departures, new memories) come from the
+//! reply's change record, so a call that changed nothing shows nothing. There is no
 //! narration: text a story reply writes outside its calls is never shown.
 
 use std::fmt::Write as _;
@@ -253,7 +255,7 @@ pub fn transcript(messages: &[StoredMessage], player: &str, limit: usize) -> Str
             }
             continue;
         }
-        let mut shown = parts(message.tool_calls.iter().map(|r| (r.call.name.as_str(), r.call.arguments.as_str())), false);
+        let mut shown = reply_parts(message);
         if shown.is_empty() {
             shown = parse(&message.content);
         }
@@ -468,69 +470,60 @@ pub enum Part {
     Note(String),
 }
 
-/// What a story reply's calls (name, arguments) show, in order: a new
-/// scene and arrivals, one [`Part::Said`] per character (their messages
-/// merged, whatever the model sent), then departures. `streaming` calls
-/// may be incomplete; arrivals and departures show once they are not.
+/// What a story reply's calls (name, arguments) say, in order: a new scene
+/// and one [`Part::Said`] per character (their messages merged, whatever
+/// the model sent). Calls may still be streaming, as incomplete JSON. What
+/// the calls changed (arrivals, departures, memories) is shown by
+/// [`reply_parts`] once they ran.
 #[must_use]
-pub fn parts<'a>(calls: impl Iterator<Item = (&'a str, &'a str)>, streaming: bool) -> Vec<Part> {
-    let (mut parts, mut departures, mut remembered) = (Vec::new(), Vec::new(), Vec::new());
+pub fn parts<'a>(calls: impl Iterator<Item = (&'a str, &'a str)>) -> Vec<Part> {
+    let mut parts = Vec::new();
     let text = |value: &Value, key: &str| value.get(key).and_then(Value::as_str).map(str::trim).unwrap_or_default().to_owned();
-    for (name, arguments) in calls {
+    for (_, arguments) in calls.filter(|(name, _)| *name == SPEAK) {
         let Some(args) = parse_partial(arguments) else {
             continue;
         };
-        match name {
-            SPEAK => {
-                // A new scene first, as it is written: it sets the stage.
-                let scene = plain(&text(&args, "scene"));
-                if !scene.is_empty() {
-                    parts.push(Part::Note(scene));
-                }
-                // Newcomers arrive before they act; announced once complete.
-                if !streaming {
-                    for new in args.get("introduce").and_then(Value::as_array).into_iter().flatten() {
-                        let who = plain(&text(new, "name"));
-                        if !who.is_empty() && !text(new, "description").is_empty() {
-                            parts.push(Part::Note(format!("{who} joins the story")));
-                        }
-                    }
-                }
-                for message in messages(&args) {
-                    let (speaker, action, said) = (plain(&text(message, "character")), plain(&text(message, "action")), text(message, "text"));
-                    if speaker.is_empty() || (action.is_empty() && said.is_empty()) {
-                        continue;
-                    }
-                    let mut block = if action.is_empty() { String::new() } else { format!("*{action}*") };
-                    if !said.is_empty() {
-                        if !block.is_empty() {
-                            block.push(' ');
-                        }
-                        block.push_str(&said);
-                    }
-                    add_said(&mut parts, &speaker, &block);
-                }
-                if !streaming {
-                    let leaving = args.get("leave").and_then(Value::as_array).into_iter().flatten().filter_map(Value::as_str).map(plain);
-                    departures.extend(leaving.filter(|who| !who.is_empty()).map(|who| Part::Note(format!("{who} leaves the scene"))));
-                }
+        // A new scene first, as it is written: it sets the stage.
+        let scene = Part::Note(plain(&text(&args, "scene")));
+        if !matches!(&scene, Part::Note(s) if s.is_empty()) && !parts.contains(&scene) {
+            parts.push(scene);
+        }
+        for message in messages(&args) {
+            let (speaker, action, said) = (plain(&text(message, "character")), plain(&text(message, "action")), text(message, "text"));
+            if speaker.is_empty() || (action.is_empty() && said.is_empty()) {
+                continue;
             }
-            CREATE_CHARACTER if !streaming => {
-                let who = plain(&text(&args, "name"));
-                if !who.is_empty() {
-                    parts.push(Part::Note(format!("{who} joins the story")));
+            let mut block = if action.is_empty() { String::new() } else { format!("*{action}*") };
+            if !said.is_empty() {
+                if !block.is_empty() {
+                    block.push(' ');
                 }
+                block.push_str(&said);
             }
-            REMEMBER if !streaming => {
-                let memories = args.get("memories").and_then(Value::as_array).into_iter().flatten().filter_map(Value::as_str);
-                let memories = memories.map(|m| plain(m).split_whitespace().collect::<Vec<_>>().join(" "));
-                remembered.extend(memories.filter(|m| !m.is_empty()).map(|m| Part::Note(format!("Remembered: {m}"))));
-            }
-            _ => {}
+            add_said(&mut parts, &speaker, &block);
         }
     }
-    parts.extend(departures);
-    parts.extend(remembered);
+    parts
+}
+
+/// What a finished story reply shows: its [`parts`], with notes for what
+/// its calls really changed, as its `change` record holds it. Newcomers
+/// join before anyone speaks; departures and new memories follow. A call
+/// that changed nothing (casting someone already cast, sending away
+/// someone already gone, remembering a known fact) shows nothing.
+#[must_use]
+pub fn reply_parts(message: &StoredMessage) -> Vec<Part> {
+    let mut parts = parts(message.tool_calls.iter().map(|r| (r.call.name.as_str(), r.call.arguments.as_str())));
+    let Some(change) = &message.change else {
+        return parts;
+    };
+    let note = |who: &str, what: &str| Part::Note(format!("{} {what}", plain(who)));
+    let joined = change.cast.iter().filter(|(before, _)| before.is_none()).map(|(_, after)| note(&after.name, "joins the story"));
+    let at = parts.iter().position(|p| matches!(p, Part::Said { .. })).unwrap_or(parts.len());
+    parts.splice(at..at, joined.collect::<Vec<_>>());
+    let left = change.cast.iter().filter(|(before, after)| before.as_ref().is_some_and(|b| b.present) && !after.present);
+    parts.extend(left.map(|(_, after)| note(&after.name, "leaves the scene")));
+    parts.extend(change.memories.iter().map(|m| Part::Note(format!("Remembered: {}", plain(m)))));
     parts
 }
 
@@ -781,7 +774,7 @@ mod tests {
             { "character": "", "text": "nobody" },
             { "character": "Effie", "text": " " },
         ]});
-        let shown = parts([(SPEAK, args.to_string().as_str())].into_iter(), false);
+        let shown = parts([(SPEAK, args.to_string().as_str())].into_iter());
         assert_eq!(
             shown,
             [said("Katniss", "*draws her bow* Stay back.\n\nI mean it."), said("Peeta", "Easy."), said("Haymitch", "*takes a long drink*")]
@@ -789,10 +782,9 @@ mod tests {
         assert_eq!(display(&shown[1..]), "**Peeta**: Easy.\n\n**Haymitch**: *takes a long drink*");
         // Stories saved before `messages` still show.
         let old = json!({ "lines": [{ "character": "Peeta", "text": "Easy." }] }).to_string();
-        assert_eq!(parts([(SPEAK, old.as_str())].into_iter(), false), [said("Peeta", "Easy.")]);
+        assert_eq!(parts([(SPEAK, old.as_str())].into_iter()), [said("Peeta", "Easy.")]);
         let created = json!({ "name": "Cato", "description": "A career." }).to_string();
-        assert_eq!(parts([(CREATE_CHARACTER, created.as_str())].into_iter(), false), [Part::Note("Cato joins the story".into())]);
-        assert!(parts([(CREATE_CHARACTER, created.as_str())].into_iter(), true).is_empty(), "only finished arrivals show");
+        assert!(parts([(CREATE_CHARACTER, created.as_str())].into_iter()).is_empty(), "what calls change shows once they ran");
     }
 
     #[test]
@@ -828,15 +820,53 @@ mod tests {
         let long = call(REMEMBER, &json!({ "memories": ["é".repeat(1000)] }));
         run(&long, &mut cast, &mut scene, &mut memories, None);
         assert_eq!(memories[2].chars().count(), MEMORY_LIMIT);
-        let shown = parts([(REMEMBER, facts.arguments.as_str())].into_iter(), false);
-        assert_eq!(shown[0], Part::Note("Remembered: Katniss promised Prim.".into()));
-        assert!(parts([(REMEMBER, facts.arguments.as_str())].into_iter(), true).is_empty(), "shown once complete");
+    }
+
+    #[test]
+    fn notes_show_only_what_really_changed() {
+        // Katniss is here; the user sent Haymitch away by hand.
+        let mut cast = vec![member("Katniss", true), member("Haymitch", false)];
+        let (mut scene, mut memories) = (String::new(), vec!["Rue is hurt.".to_owned()]);
+        let (cast_before, scene_before, known) = (cast.clone(), scene.clone(), memories.len());
+        let speak = json!({
+            "scene": "",
+            "introduce": [{ "name": "Katniss", "description": "Again." }, { "name": "Rue", "description": "A girl." }],
+            "messages": [{ "character": "Katniss", "text": "Go." }, { "character": "Rue", "text": "Hi." }],
+            "leave": ["Haymitch", "Katniss", "katniss"],
+        });
+        let facts = json!({ "memories": ["Katniss left.", "rue is hurt."] });
+        let calls = [
+            call(SPEAK, &speak),
+            call(CREATE_CHARACTER, &json!({ "name": "Rue", "description": "Twice." })),
+            call(REMEMBER, &facts),
+            call(REMEMBER, &facts),
+        ];
+        let mut reply = StoredMessage::new(Role::Assistant, String::new());
+        for call in calls {
+            let output = run(&call, &mut cast, &mut scene, &mut memories, None);
+            reply.tool_calls.push(ToolResult { call, output });
+        }
+        reply.change = serechat::StoryChange::between(&cast_before, &scene_before, &cast, &scene, &memories[known..]);
+        assert_eq!(
+            reply_parts(&reply),
+            [
+                Part::Note("Rue joins the story".into()),
+                said("Katniss", "Go."),
+                said("Rue", "Hi."),
+                Part::Note("Katniss leaves the scene".into()),
+                Part::Note("Remembered: Katniss left.".into()),
+            ],
+            "no join for Katniss (already here), no leave for Haymitch (already gone), each fact once"
+        );
+        // Cut off before anything ran: speech only.
+        reply.change = None;
+        assert_eq!(reply_parts(&reply), [said("Katniss", "Go."), said("Rue", "Hi.")]);
     }
 
     #[test]
     fn edits_rewrite_the_speak_call() {
         let speak = |id: &str, args: Value| ToolResult { call: ToolCall { call_id: id.into(), name: SPEAK.into(), arguments: args.to_string() }, output: "Spoken.".into() };
-        let created = ToolResult { call: call(CREATE_CHARACTER, &json!({ "name": "Rue", "description": "A girl." })), output: "Rue joined.".into() };
+        let created = ToolResult { call: call(CREATE_CHARACTER, &json!({ "name": "Rue", "description": "A girl." })), output: "Rue joined the cast and is in the scene.".into() };
         let mut calls = vec![
             created.clone(),
             speak("a", json!({ "scene": "The woods.", "messages": [{ "character": "Katniss", "text": "Hi." }, { "character": "Peeta", "text": "Yo." }] })),
@@ -846,17 +876,8 @@ mod tests {
         assert_eq!(calls.len(), 2);
         assert_eq!(calls[0], created, "other calls stay");
         assert_eq!((calls[1].call.call_id.as_str(), calls[1].output.as_str()), ("a", "Spoken. Spoken."));
-        let shown = parts(calls.iter().map(|r| (r.call.name.as_str(), r.call.arguments.as_str())), false);
-        assert_eq!(
-            shown,
-            [
-                Part::Note("Rue joins the story".into()),
-                Part::Note("The woods.".into()),
-                said("Katniss", "Hello there."),
-                said("Rue", "Hey."),
-                Part::Note("Peeta leaves the scene".into())
-            ]
-        );
+        let shown = parts(calls.iter().map(|r| (r.call.name.as_str(), r.call.arguments.as_str())));
+        assert_eq!(shown, [Part::Note("The woods.".into()), said("Katniss", "Hello there."), said("Rue", "Hey.")]);
         // A reply read back from text gets a call.
         let mut none = Vec::new();
         respeak(&mut none, &[("Katniss", "Hi.")]);
@@ -918,8 +939,8 @@ mod tests {
         let noted = run(&call(SPEAK, &moved), &mut cast, &mut scene, &mut memories, None);
         assert!(noted.contains("Left the scene: Haymitch.") && noted.ends_with("Scene set."), "{noted}");
         assert!(scene == "The train, at dusk." && cast.iter().any(|m| m.name == "Haymitch" && !m.present));
-        let shown = display(&parts([(SPEAK, moved.to_string().as_str())].into_iter(), false));
-        assert_eq!(shown, "*The train, at dusk.*\n\n**Haymitch**: Go.\n\n*haymitch leaves the scene*\n\n*Nobody leaves the scene*");
+        let shown = display(&parts([(SPEAK, moved.to_string().as_str())].into_iter()));
+        assert_eq!(shown, "*The train, at dusk.*\n\n**Haymitch**: Go.");
         let kept = json!({ "scene": "", "lines": [{ "character": "Katniss", "text": "Hi." }] });
         run(&call(SPEAK, &kept), &mut cast, &mut scene, &mut memories, None);
         assert_eq!(scene, "The train, at dusk.", "an empty scene keeps the last one");

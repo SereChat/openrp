@@ -50,7 +50,7 @@ cargo clippy --workspace --all-targets
   rounds). `create_character` also adds someone who matters but is not acting yet. When the
   place or ambiance changes (you walk into a house, night falls), `speak` sets the new scene,
   and members who stay behind or walk off go in its `leave`. The world,
-  your character, the characters present and those elsewhere, and the scene make up its system prompt,
+  your character, the characters present (described) and those elsewhere (names only), and the scene make up its system prompt,
   rebuilt for every reply.
 - **Edit, Regenerate, Delete**: hovering a turn (your message and everything that answered it)
   shows them left of Copy. **Edit** makes all of its replies editable at once, a box per

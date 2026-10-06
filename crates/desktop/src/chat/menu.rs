@@ -53,7 +53,7 @@ impl Chat {
                 (anchors[2], 320.0, false, ("Commands", "Tab to complete"), items)
             }
             Menu::Cast => (anchors[3], 240.0, true, ("Add to the cast", ""), Self::cast_menu()),
-            Menu::CastLibrary => (anchors[3], 280.0, true, ("From characters", ""), self.library_menu()),
+            Menu::CastLibrary => (anchors[3], 280.0, true, ("From characters", "Click each to add"), self.library_menu()),
             Menu::Member(index) => {
                 title = self.current().cast.get(index).map(|m| m.name.clone()).unwrap_or_default();
                 (anchors[3], 260.0, true, (title.as_str(), ""), self.member_menu(index))

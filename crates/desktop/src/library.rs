@@ -180,7 +180,7 @@ struct Form {
     picking: bool,
     /// Why the last portrait could not be used.
     error: Option<String>,
-    /// Delete was clicked once and waits for a second click.
+    /// Delete was clicked once on a character and waits for a second click.
     confirm_delete: bool,
     /// The generator request whose answer fills the form.
     generating: Option<u64>,
@@ -590,15 +590,11 @@ impl LibraryView {
         }
         let mut deleted = false;
         if !form.new {
-            // Deleting a world takes its stories along; the label says so.
-            let (label, w) = match (form.confirm_delete, kind) {
-                (false, _) => ("Delete", 90.0),
-                (true, Kind::World) => ("Delete world and its stories", 220.0),
-                (true, Kind::Character) => ("Confirm delete", 130.0),
-            };
+            // A world (and its stories) goes at once; a character asks first.
+            let (label, w) = if form.confirm_delete { ("Confirm delete", 130.0) } else { ("Delete", 90.0) };
             let delete = Rect::new(right - w, back.y, w, 30.0);
             if button(p, ui, delete, label, ButtonStyle::Danger, true) {
-                deleted = form.confirm_delete;
+                deleted = form.confirm_delete || kind == Kind::World;
                 form.confirm_delete = true;
             } else if ui.released && !delete.contains(ui.press_pos) {
                 form.confirm_delete = false;

@@ -44,12 +44,11 @@ impl Chat {
             .world
             .as_deref()
             .map(|w| self.library.get(Kind::World, w).map_or(("this world", ""), |w| (w.name.as_str(), w.description.as_str())));
-        let member = |present: bool| {
-            conversation.cast.iter().filter(|m| m.present == present).map(|m| (m.name.as_str(), m.description.as_str())).collect::<Vec<_>>()
-        };
+        let present: Vec<_> = conversation.cast.iter().filter(|m| m.present).map(|m| (m.name.as_str(), m.description.as_str())).collect();
+        let absent: Vec<_> = conversation.cast.iter().filter(|m| !m.present).map(|m| m.name.as_str()).collect();
         let player = conversation.player.as_ref().map(|p| (p.name.as_str(), p.description.as_str()));
         let (memories, scene, note) = (&conversation.memories, &conversation.scene, &conversation.note);
-        super::stream::story_prompt(world, player, &member(true), &member(false), memories, scene, note)
+        super::stream::story_prompt(world, player, &present, &absent, memories, scene, note)
     }
 
     /// Library characters that can still join the open story: (id, name).
@@ -86,7 +85,8 @@ impl Chat {
         items
     }
 
-    /// Applies row `index` of the library menu.
+    /// Applies row `index` of the library menu, which stays open while
+    /// there is anyone left to add.
     pub(super) fn library_menu_picked(&mut self, index: usize, actions: &mut Vec<Action>) {
         let picked = self.cast_choices().into_iter().nth(index).and_then(|(id, _)| self.library.get(Kind::Character, &id));
         match picked {
@@ -100,6 +100,10 @@ impl Chat {
                     present: true,
                 };
                 self.change_cast(actions, |cast| cast.push(member));
+                // Stays open to add more; whoever joined leaves the list.
+                if !self.cast_choices().is_empty() {
+                    self.menu = Some(Menu::CastLibrary);
+                }
             }
             None => self.show(Page::Library(Kind::Character)),
         }
@@ -337,7 +341,10 @@ mod tests {
         assert!(chat.current().playable());
         let mut actions = Vec::new();
         chat.library_menu_picked(0, &mut actions);
+        assert!(chat.menu == Some(Menu::CastLibrary), "stays open to add more");
+        chat.menu = None;
         chat.library_menu_picked(0, &mut actions);
+        assert!(chat.menu.is_none(), "closes once everyone is added");
         assert_eq!(actions.len(), 2, "a begun story is saved with every change");
         assert_eq!(chat.cast_choices().len(), 0, "everyone is cast");
         chat.library_menu_picked(0, &mut actions);
@@ -352,7 +359,7 @@ mod tests {
         let prompt = chat.instructions(id);
         assert!(prompt.contains("# World: Panem\n\nTwelve districts.") && prompt.contains("# The user's character: Gale\n\nA hunter too."));
         let (here, away) = prompt.split_once("# Characters elsewhere").unwrap();
-        assert!(here.contains("## Katniss\n\nA hunter.") && away.contains("## Peeta"));
+        assert!(here.contains("## Katniss\n\nA hunter.") && away.contains("- Peeta") && !away.contains("A baker"), "names only for the absent");
 
         // Sending saves the story with its world, cast and player.
         actions.clear();

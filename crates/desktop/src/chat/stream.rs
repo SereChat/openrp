@@ -92,6 +92,10 @@ const MEMORIES: &str = "Facts this story must not forget, kept with remember. Th
 const NOTE: &str = "The user's guidance for the whole story. Follow it in every reply.";
 /// Introduces an out-of-character instruction sent with a user message.
 const OOC: &str = "(OOC: the user's instruction for this reply, not something their character says or does.)";
+/// Opens the list of cast members away from the scene.
+const ELSEWHERE: &str = "These characters belong to the story but are not in the current scene. They may be mentioned, but do not \
+    have them act here unless the user brings them in; once they are in the scene, their description follows. Until then, keep \
+    them consistent with what the story has shown of them.";
 /// Stands in for the description of a character who has none.
 const UNDESCRIBED: &str = "(Not described yet: keep them consistent with what they have said and done so far.)";
 /// Added when nobody is in the scene: the first thing to do is cast someone.
@@ -100,8 +104,8 @@ const NOBODY_HERE: &str = "No one is in the scene yet. Introduce who the user me
     the one character the moment most needs.";
 
 /// The system prompt of a story in `world`, played by `player`, with the
-/// characters `present` in the scene and those `absent` from it (each a
-/// name and description), its `memories`, in `scene` (empty until the
+/// characters `present` in the scene (name and description) and the names
+/// of those `absent` from it, its `memories`, in `scene` (empty until the
 /// model sets it), with the user's author's `note` last. `None` for a
 /// plain chat. It changes only when the story's setup, memories or scene
 /// do, so the provider can cache it.
@@ -109,7 +113,7 @@ pub(super) fn story_prompt(
     world: Option<(&str, &str)>,
     player: Option<(&str, &str)>,
     present: &[(&str, &str)],
-    absent: &[(&str, &str)],
+    absent: &[&str],
     memories: &[String],
     scene: &str,
     note: &str,
@@ -121,22 +125,21 @@ pub(super) fn story_prompt(
     if let Some((name, description)) = player {
         let _ = write!(prompt, "\n\n# The user's character: {name}\n\n{description}");
     }
-    let mut section = |title: &str, note: &str, characters: &[(&str, &str)]| {
-        if !characters.is_empty() {
-            let _ = write!(prompt, "\n\n# {title}\n\n{note}");
-            for (name, description) in characters {
-                // Someone who joined by speaking has no description yet.
-                let description = if description.trim().is_empty() { UNDESCRIBED } else { description };
-                let _ = write!(prompt, "\n\n## {name}\n\n{description}");
-            }
+    if !present.is_empty() {
+        prompt.push_str("\n\n# Characters in the scene\n\nThese characters are here now; you play them.");
+        for (name, description) in present {
+            // Someone who joined by speaking has no description yet.
+            let description = if description.trim().is_empty() { UNDESCRIBED } else { description };
+            let _ = write!(prompt, "\n\n## {name}\n\n{description}");
         }
-    };
-    section("Characters in the scene", "These characters are here now; you play them.", present);
-    section(
-        "Characters elsewhere",
-        "These characters belong to the story but are not in the current scene. They may be mentioned, but do not have them act here unless the story brings them in.",
-        absent,
-    );
+    }
+    // Names only: descriptions cost tokens and pull absent people into the scene.
+    if !absent.is_empty() {
+        let _ = write!(prompt, "\n\n# Characters elsewhere\n\n{ELSEWHERE}\n");
+        for name in absent {
+            let _ = write!(prompt, "\n- {name}");
+        }
+    }
     if !memories.is_empty() {
         let _ = write!(prompt, "\n\n# Memories\n\n{MEMORIES}\n");
         for memory in memories {
@@ -763,9 +766,9 @@ mod tests {
         // Nobody in the scene: the model is told to cast someone first.
         let alone = story_prompt(Some(("Panem", "Twelve districts.")), None, &[], &[], &[], "", "");
         assert!(alone.starts_with(ROLEPLAY) && alone.ends_with(&format!("# World: Panem\n\nTwelve districts.\n\n# The scene\n\n{NOBODY_HERE}")));
-        let away = story_prompt(Some(("Panem", "")), Some(("Gale", "A hunter.")), &[], &[("Peeta", "A baker.")], &[], "", "");
+        let away = story_prompt(Some(("Panem", "")), Some(("Gale", "A hunter.")), &[], &["Peeta"], &[], "", "");
         assert!(!away.contains("# Characters in the scene") && away.contains("# The user's character: Gale\n\nA hunter."));
-        assert!(away.contains("## Peeta\n\nA baker.") && away.ends_with(NOBODY_HERE), "someone elsewhere is no one here");
+        assert!(away.contains(&format!("{ELSEWHERE}\n\n- Peeta")) && away.ends_with(NOBODY_HERE), "someone elsewhere is no one here");
         let here = story_prompt(Some(("Panem", "")), None, &[("Katniss", "A hunter.")], &[], &[], "", "");
         assert!(here.ends_with("## Katniss\n\nA hunter.") && !here.contains(NOBODY_HERE));
         let joined = story_prompt(Some(("Panem", "")), None, &[("Rue", " ")], &[], &[], "", "");

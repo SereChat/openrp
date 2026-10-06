@@ -267,9 +267,9 @@ impl Entry {
         }
         self.display_key = key;
         self.parts = if live {
-            tools::parts(self.streaming_calls.iter().map(|c| (c.name.as_str(), c.arguments.as_str())), true)
+            tools::parts(self.streaming_calls.iter().map(|c| (c.name.as_str(), c.arguments.as_str())))
         } else if !self.message.tool_calls.is_empty() {
-            tools::parts(self.message.tool_calls.iter().map(|r| (r.call.name.as_str(), r.call.arguments.as_str())), false)
+            tools::reply_parts(&self.message)
         } else if story && self.message.role == Role::Assistant && !self.message.failed && !self.message.compaction {
             tools::parse(&self.message.content)
         } else {
