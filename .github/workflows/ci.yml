@@ -63,9 +63,12 @@ jobs:
         shell: bash
         run: |
           icons=crates/desktop/assets/icon
+          # Every archive carries OpenRP's licenses and the bundled fonts'.
+          mkdir licenses
+          cp LICENSE-MIT LICENSE-APACHE crates/desktop/assets/*-LICENSE.txt licenses/
           case "$RUNNER_OS" in
             Windows)
-              7z a "${{ matrix.archive }}" ./target/release/openrp.exe
+              7z a "${{ matrix.archive }}" ./target/release/openrp.exe ./licenses
               ;;
             macOS)
               app=OpenRP.app
@@ -79,13 +82,14 @@ jobs:
               iconutil -c icns AppIcon.iconset -o "$app/Contents/Resources/AppIcon.icns"
               # Ad-hoc sign the bundle as a whole; Apple silicon refuses unsigned code.
               codesign --force --deep --sign - "$app"
-              tar czf "${{ matrix.archive }}" "$app"
+              tar czf "${{ matrix.archive }}" "$app" licenses
               ;;
             Linux)
               dir=openrp-linux-x86_64
               mkdir "$dir"
               cp target/release/openrp packaging/linux/openrp.desktop packaging/linux/install.sh "$dir/"
               cp "$icons/256.png" "$dir/openrp.png"
+              cp -r licenses "$dir/"
               chmod +x "$dir/openrp" "$dir/install.sh"
               tar czf "${{ matrix.archive }}" "$dir"
               ;;

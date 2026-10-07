@@ -2,7 +2,9 @@
 //! slash commands (above the composer), ways to add to the cast (below the
 //! cast strip's add button), what to do with a cast member (below its
 //! chip's dots) and with a session (duplicate or delete, below its sidebar
-//! row's dots).
+//! row's dots), and the background model (from the settings page).
+//!
+//! Deleting from a menu takes a second click on the same row.
 
 use winit::window::CursorIcon;
 
@@ -20,9 +22,17 @@ impl Chat {
     pub(super) fn draw_open_menu(&mut self, p: &mut Painter, ui: &mut Ui, anchors: [Rect; 4], actions: &mut Vec<Action>) {
         let Some(menu) = self.menu else {
             self.menu_rect = None;
+            self.confirming = None;
             return;
         };
+        if self.confirming.is_some_and(|m| m != menu) {
+            self.confirming = None;
+        }
+        let confirming = self.confirming == Some(menu);
+        // The row that deletes, while it waits for its second click.
+        let delete_row = |label: &'static str| if confirming { ("Click again to delete", "Can't be undone") } else { (label, "") };
         let title;
+        let mut empty = "Loading…".to_owned();
         let (anchor, width, below, header, items) = match menu {
             Menu::Model => {
                 let items = self
@@ -34,6 +44,9 @@ impl Chat {
                         selected: m.id == self.model,
                     })
                     .collect::<Vec<_>>();
+                if let Some(error) = &self.models_error {
+                    empty = format!("{error} Trying again soon.");
+                }
                 (anchors[0], 360.0, false, ("Model", "Input / output per 1M tokens"), items)
             }
             Menu::Reasoning => {
@@ -56,17 +69,39 @@ impl Chat {
             Menu::CastLibrary => (anchors[3], 280.0, true, ("From characters", "Click each to add"), self.library_menu()),
             Menu::Member(index) => {
                 title = self.current().cast.get(index).map(|m| m.name.clone()).unwrap_or_default();
-                (anchors[3], 260.0, true, (title.as_str(), ""), self.member_menu(index))
+                let mut items = self.member_menu(index);
+                if let Some(row) = items.get_mut(2) {
+                    let (label, detail) = delete_row("Delete");
+                    (row.label, row.detail) = (label.to_owned(), if confirming { detail.to_owned() } else { "From this story".to_owned() });
+                }
+                (anchors[3], 260.0, true, (title.as_str(), ""), items)
             }
             Menu::Session(_) => {
                 let row = |label: &str, detail: &str| MenuItem { label: label.to_owned(), detail: detail.to_owned(), selected: false };
-                let items = vec![row("Duplicate", "Exact copy"), row("Duplicate frame", "Cast and setup only"), row("Delete", "")];
+                let (label, detail) = delete_row("Delete");
+                let items = vec![row("Duplicate", "Exact copy"), row("Duplicate frame", "Cast and setup only"), row(label, detail)];
                 (self.session_menu, 280.0, true, ("Session", ""), items)
             }
+            Menu::UtilityModel => {
+                let same = MenuItem { label: "Same as the story".to_owned(), detail: String::new(), selected: self.utility_model.is_none() };
+                let models = self.models.iter().map(|m| MenuItem {
+                    label: if m.name.is_empty() { m.id.clone() } else { m.name.clone() },
+                    detail: price(m),
+                    selected: self.utility_model.as_deref() == Some(m.id.as_str()),
+                });
+                (self.utility_anchor, 360.0, true, ("Background model", "Input / output per 1M tokens"), std::iter::once(same).chain(models).collect())
+            }
         };
-        if let Some(index) = self.draw_menu(p, ui, anchor, width, below, header, &items) {
-            self.menu = None;
+        if let Some(index) = self.draw_menu(p, ui, anchor, width, below, header, &items, &empty) {
             ui.released = false;
+            // Deleting asks for a second click on the row.
+            let deletes = index == 2 && matches!(menu, Menu::Session(_) | Menu::Member(_));
+            if deletes && !confirming {
+                self.confirming = Some(menu);
+                return;
+            }
+            self.menu = None;
+            self.confirming = None;
             match menu {
                 Menu::Model => {
                     if let Some(model) = self.models.get(index) {
@@ -90,6 +125,11 @@ impl Chat {
                 Menu::Member(member) => self.member_menu_picked(member, index, actions),
                 Menu::Session(id) if index == 2 => self.delete_conversation(id, actions),
                 Menu::Session(id) => self.duplicate(id, index == 1, actions),
+                Menu::UtilityModel => {
+                    let model = index.checked_sub(1).and_then(|i| self.models.get(i)).map(|m| m.id.clone());
+                    self.utility_model.clone_from(&model);
+                    actions.push(Action::SetUtilityModel(model));
+                }
             }
             return;
         }
@@ -100,7 +140,7 @@ impl Chat {
     }
 
     /// Draws a menu next to `anchor` (below it, or above when `below` is
-    /// false). Returns the clicked row.
+    /// false), showing `empty` while it has no rows. Returns the clicked row.
     #[allow(clippy::too_many_arguments, reason = "menu geometry and content; a struct would only rename them")]
     fn draw_menu(
         &mut self,
@@ -111,6 +151,7 @@ impl Chat {
         below: bool,
         header: (&str, &str),
         items: &[MenuItem],
+        empty: &str,
     ) -> Option<usize> {
         let t = p.theme;
         let (row_h, header_h, pad) = (30.0, 30.0, 4.0);
@@ -134,7 +175,9 @@ impl Chat {
 
         let list = Rect::new(area.x, area.y + header_h + pad, area.w, area.h - header_h - 2.0 * pad);
         if items.is_empty() {
-            p.label("Loading…", theme::SMALL, list.x + 12.0, list.y + 7.0, t.text_muted);
+            let mut text = p.layout(empty, theme::SMALL, None);
+            text.truncate(p.fonts, list.w - 24.0);
+            p.text(&text, list.x + 12.0, list.y + 7.0, t.text_muted);
             return None;
         }
         if ui.hovered(area) {

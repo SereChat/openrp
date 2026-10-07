@@ -24,9 +24,10 @@ use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoopProxy};
 use winit::window::{CursorIcon, Theme, UserAttentionType, Window};
 
 use crate::chat::{self, Chat, GenerateJob, Reasoning, ReasoningView, ReviewJob, SendJob};
-use crate::gpu::{GpuError, Instance, Renderer};
+use crate::gpu::{Frame, GpuError, Instance, Renderer};
 use crate::image::{self, ImageAtlas, ImageKey};
 use crate::library::Kind;
+use crate::log;
 use crate::login::Login;
 use crate::paint::{Painter, Rect};
 use crate::platform;
@@ -39,6 +40,11 @@ const THEME_FADE_SECS: f32 = 0.25;
 
 /// Name shown on the SereChat approval page.
 const APP_NAME: &str = "OpenRP";
+/// Waits before trying to load the model list again, one per failure.
+const MODEL_RETRIES: [Duration; 5] =
+    [Duration::from_secs(5), Duration::from_secs(15), Duration::from_secs(30), Duration::from_secs(60), Duration::from_secs(120)];
+/// Wait between attempts to bring the GPU back after it was lost.
+const GPU_RETRY: Duration = Duration::from_secs(2);
 
 /// Results delivered from worker threads.
 pub enum WorkerEvent {
@@ -112,6 +118,14 @@ pub enum WorkerEvent {
     },
     /// A thumbnail was decoded (or could not be).
     Thumbnail(ImageKey, Result<Vec<u8>, String>),
+    /// Something went wrong out of sight (a file could not be written):
+    /// what to tell the user, and whether the data folder can help.
+    Problem {
+        /// What happened, in a sentence.
+        text: String,
+        /// Offer to open the data folder.
+        folder: bool,
+    },
 }
 
 /// Something a screen wants done that needs app-level resources.
@@ -167,6 +181,10 @@ pub enum Action {
     DeleteRecord(Kind, String),
     /// Ask for an image and copy it in as a portrait.
     PickPortrait,
+    /// Load the model list again (it failed before).
+    LoadModels,
+    /// Persist the model for work beside the story; `None`: the story's.
+    SetUtilityModel(Option<String>),
     /// Show `~/.openrp/sessions` in the file manager.
     OpenDataDir,
     /// Open a link from a reply in the browser.
@@ -215,7 +233,15 @@ enum Screen {
 /// The running application.
 pub struct App {
     window: Arc<Window>,
+    /// For creating the renderer again after the GPU was lost.
+    display: winit::event_loop::OwnedDisplayHandle,
     renderer: Renderer,
+    /// When to try again to bring back a lost GPU.
+    gpu_retry: Option<Instant>,
+    /// When to load the model list again after it failed.
+    models_retry: Option<Instant>,
+    /// Loads of the model list that failed in a row.
+    models_failures: usize,
     fonts: Fonts,
     atlas: GlyphAtlas,
     images: ImageAtlas,
@@ -254,7 +280,7 @@ impl App {
     /// See [`StartupError`].
     pub fn new(event_loop: &ActiveEventLoop, proxy: EventLoopProxy<WorkerEvent>) -> Result<Self, StartupError> {
         let config = Config::load().unwrap_or_else(|e| {
-            eprintln!("openrp: ignoring unreadable config: {e}");
+            log::error(format!("ignoring unreadable config: {e}"));
             Config::default()
         });
         let scheme = Scheme::from_key(config.theme.as_deref());
@@ -279,19 +305,28 @@ impl App {
         set_icon(&window);
         // Chinese, Japanese and Korean input methods deliver text through IME events.
         window.set_ime_allowed(true);
-        let renderer = block_on(Renderer::new(Arc::clone(&window), event_loop.owned_display_handle())).map_err(StartupError::Gpu)?;
+        let display = event_loop.owned_display_handle();
+        let renderer = block_on(Renderer::new(Arc::clone(&window), display.clone())).map_err(StartupError::Gpu)?;
 
         let client = Client::new(config.token.clone());
         let sessions_dir =
-            SessionStore::open().inspect_err(|e| eprintln!("openrp: sessions will not be saved: {e}")).ok().map(|store| store.dir().to_owned());
+            SessionStore::open().inspect_err(|e| log::error(format!("sessions will not be saved: {e}"))).ok().map(|store| store.dir().to_owned());
         let library = Library::worlds()
             .and_then(|worlds| Ok(Store { worlds, characters: Library::characters()?, portraits: Portraits::open()? }))
-            .inspect_err(|e| eprintln!("openrp: worlds and characters will not be saved: {e}"))
+            .inspect_err(|e| log::error(format!("worlds and characters will not be saved: {e}")))
             .ok();
+        let reporter = proxy.clone();
+        let report = move |text: String| {
+            let _ = reporter.send_event(WorkerEvent::Problem { text, folder: true });
+        };
         let now = Instant::now();
         let mut app = Self {
             window,
+            display,
             renderer,
+            gpu_retry: None,
+            models_retry: None,
+            models_failures: 0,
             fonts: Fonts::load(),
             atlas: GlyphAtlas::default(),
             images: ImageAtlas::default(),
@@ -304,7 +339,7 @@ impl App {
             screen: Screen::Login(Login::new(None)),
             config,
             client,
-            writer: Writer::start(sessions_dir.clone()),
+            writer: Writer::start(sessions_dir.clone(), report),
             sessions_dir,
             library,
             scheme,
@@ -327,21 +362,40 @@ impl App {
 
     fn enter_chat(&mut self) {
         // Only the index is read here; messages load when a session opens.
-        let sessions = self.writer.list_sessions();
+        let (sessions, unreadable) = self.writer.list_sessions();
         let session_ids = sessions.iter().map(|s| s.id.clone()).collect();
         let reasoning = Reasoning::from_key(self.config.reasoning.as_deref());
         let mut chat = Chat::new(self.config.model.clone(), reasoning, sessions);
         chat.set_reasoning_view(ReasoningView::from_key(self.config.reasoning_view.as_deref()));
+        chat.set_utility_model(self.config.utility_model.clone());
+        if unreadable > 0 {
+            let stories = if unreadable == 1 { "1 saved story" } else { "Some saved stories" };
+            chat.notify(format!("{stories} could not be read and are not listed. Their files are left untouched."), true);
+        }
         self.screen = Screen::Chat(Box::new(chat));
-        self.spawn(|client, _| WorkerEvent::Models(client.models()));
+        self.load_models();
         if let Some(Store { worlds, characters, portraits }) = self.library.clone() {
-            self.spawn(move |_, _| WorkerEvent::Library {
-                worlds: report(worlds.list(), "worlds"),
-                characters: report(characters.list(), "characters"),
-                portraits,
+            let proxy = self.proxy.clone();
+            self.spawn(move |_, _| {
+                let (worlds, world_errors) = report(worlds.list(), "worlds");
+                let (characters, character_errors) = report(characters.list(), "characters");
+                if world_errors + character_errors > 0 {
+                    let text = "Some saved worlds or characters could not be read and are not shown. Their files are left untouched.";
+                    let _ = proxy.send_event(WorkerEvent::Problem { text: text.to_owned(), folder: true });
+                }
+                WorkerEvent::Library { worlds, characters, portraits }
             });
         }
-        self.sweep_portraits(session_ids);
+        // A story that could not be read might use any portrait.
+        if unreadable == 0 {
+            self.sweep_portraits(session_ids);
+        }
+    }
+
+    /// Fetches the model list on a worker thread.
+    fn load_models(&mut self) {
+        self.models_retry = None;
+        self.spawn(|client, _| WorkerEvent::Models(client.models()));
     }
 
     /// Deletes, on a background thread, portraits no world, character or
@@ -372,7 +426,7 @@ impl App {
             }
         });
         if let Err(e) = spawned {
-            eprintln!("openrp: cannot sweep portraits: {e}");
+            log::error(format!("cannot sweep portraits: {e}"));
         }
     }
 
@@ -415,7 +469,7 @@ impl App {
             let _ = proxy.send_event(event);
         });
         if let Err(e) = spawned {
-            eprintln!("openrp: cannot spawn worker thread: {e}");
+            log::error(format!("cannot spawn worker thread: {e}"));
         }
     }
 
@@ -495,8 +549,22 @@ impl App {
                     self.enter_chat();
                 }
             }
-            (WorkerEvent::Models(Ok(models)), Screen::Chat(chat)) => chat.set_models(models),
-            (WorkerEvent::Models(Err(e)), _) => eprintln!("openrp: could not load models: {e}"),
+            (WorkerEvent::Models(Ok(models)), Screen::Chat(chat)) => {
+                (self.models_retry, self.models_failures) = (None, 0);
+                chat.set_models(models);
+            }
+            (WorkerEvent::Models(Err(e)), Screen::Chat(_)) if e.is_unauthorized() => {
+                self.sign_out(Some("Your session has expired. Please sign in again.".into()));
+            }
+            (WorkerEvent::Models(Err(e)), Screen::Chat(chat)) => {
+                log::error(format!("could not load models: {e}"));
+                chat.models_failed(format!("Could not load the models: {e}"));
+                let wait = MODEL_RETRIES[self.models_failures.min(MODEL_RETRIES.len() - 1)];
+                self.models_failures += 1;
+                self.models_retry = Some(Instant::now() + wait);
+            }
+            (WorkerEvent::Problem { text, folder }, Screen::Chat(chat)) => chat.notify(text, folder),
+            (WorkerEvent::Problem { text, .. }, Screen::Login(_)) => log::error(text),
             (WorkerEvent::SessionLoaded { conversation, result }, Screen::Chat(chat)) => chat.session_loaded(conversation, result, &mut actions),
             (WorkerEvent::Stream { conversation, stream, event }, Screen::Chat(chat)) => {
                 chat.stream_event(conversation, stream, event);
@@ -542,7 +610,7 @@ impl App {
             }
             Action::Send(job) => self.spawn(move |client, proxy| {
                 let (conversation, stream) = (job.conversation, job.stream);
-                let input = chat::input_items(&job.history);
+                let input = job.input();
                 // Stories offer the story's tools; plain chats none.
                 let definitions = if job.tools { chat::tool_definitions() } else { Vec::new() };
                 let specs: Vec<ToolSpec<'_>> =
@@ -583,8 +651,8 @@ impl App {
                 });
                 WorkerEvent::CharacterGenerated { conversation: job.conversation, request: job.request, result: result.map(|_| made) }
             }),
-            // ponytail: like the generator, not streamed or cancellable; a
-            // failed review is dropped and the next one is a few prompts away.
+            // ponytail: like the generator, not streamed; the chat gives up
+            // on one that takes too long, and reads its turns again next time.
             Action::ReviewMemories(job) => self.spawn(move |client, _| {
                 let (name, description, parameters) = chat::remember_tool();
                 let request = ResponseRequest {
@@ -596,7 +664,7 @@ impl App {
                     tool_choice: Some(ToolChoice::Function(name)),
                 };
                 let (mut made, mut used) = (None, Usage::default());
-                let result = client.stream_response(&request, &AtomicBool::new(false), |event| {
+                let result = client.stream_response(&request, &job.cancel, |event| {
                     // A call cut off may be incomplete: not used.
                     if let StreamEvent::Completed(completion) = event {
                         used = completion.usage;
@@ -663,12 +731,20 @@ impl App {
                     }))
                 });
             }
+            Action::LoadModels => self.load_models(),
+            Action::SetUtilityModel(model) => {
+                if let Screen::Chat(chat) = &mut self.screen {
+                    chat.set_utility_model(model.clone());
+                }
+                self.config.utility_model = model;
+                self.save_config();
+            }
             Action::OpenDataDir => {
                 if let Some(dir) = &self.sessions_dir {
                     // The folder may not exist before the first save.
                     let _ = std::fs::create_dir_all(dir);
                     if let Err(e) = platform::open_folder(dir) {
-                        eprintln!("openrp: cannot open the data folder: {e}");
+                        log::error(format!("cannot open the data folder: {e}"));
                     }
                 }
             }
@@ -676,7 +752,7 @@ impl App {
                 // Only web and mail links: a reply must never launch local programs.
                 let safe = ["https://", "http://", "mailto:"].iter().any(|scheme| url.starts_with(scheme));
                 if safe && let Err(e) = platform::open_url(&url) {
-                    eprintln!("openrp: cannot open link: {e}");
+                    log::error(format!("cannot open link: {e}"));
                 }
             }
             Action::Copy(text) => copy(&mut self.clipboard, &text),
@@ -689,7 +765,7 @@ impl App {
     fn open_auth_page(&mut self, request_id: &str) {
         let url = self.client.authorize_url(request_id);
         if let Err(e) = platform::open_url(&url) {
-            eprintln!("openrp: cannot open browser: {e}");
+            log::error(format!("cannot open browser: {e}"));
             copy(&mut self.clipboard, &url);
             if let Screen::Login(login) = &mut self.screen {
                 login.browser_failed();
@@ -697,8 +773,34 @@ impl App {
         }
     }
 
+    /// Creates the renderer again after the GPU was lost (a driver reset or
+    /// update, a GPU switch), with fresh atlases: theirs lived on the old
+    /// device. Tries again every [`GPU_RETRY`] while it fails.
+    fn recover_gpu(&mut self) {
+        if self.gpu_retry.is_some_and(|at| at > Instant::now()) {
+            return;
+        }
+        match block_on(Renderer::new(Arc::clone(&self.window), self.display.clone())) {
+            Ok(renderer) => {
+                self.renderer = renderer;
+                self.atlas.clear();
+                self.images = ImageAtlas::default();
+                self.gpu_retry = None;
+                let size = self.window.inner_size();
+                self.renderer.resize(size.width, size.height);
+            }
+            Err(e) => {
+                log::error(format!("cannot restore the GPU: {e}"));
+                self.gpu_retry = Some(Instant::now() + GPU_RETRY);
+            }
+        }
+    }
+
     /// Builds and presents one frame.
     fn frame(&mut self) {
+        if self.renderer.is_lost() {
+            self.recover_gpu();
+        }
         self.tick();
         let now = Instant::now();
         let dt = (now - self.last_frame).as_secs_f32().min(0.05);
@@ -740,8 +842,12 @@ impl App {
             self.ui.end();
         }
 
-        self.renderer.render(&self.instances, &mut self.atlas.uploads, &mut self.images.uploads, scale, self.palette.bg);
+        let drawn = self.renderer.render(&self.instances, &mut self.atlas.uploads, &mut self.images.uploads, scale, self.palette.bg);
         self.ui.end();
+        if drawn == Frame::Retry {
+            // The surface was set up again: draw this frame onto it.
+            self.window.request_redraw();
+        }
         if !self.shown {
             self.shown = true;
             self.window.set_visible(true);
@@ -793,7 +899,7 @@ impl App {
             Screen::Chat(chat) => chat.next_deadline(),
             Screen::Login(_) => None,
         };
-        match blink.into_iter().chain(chat).min() {
+        match blink.into_iter().chain(chat).chain(self.models_retry).chain(self.gpu_retry).min() {
             Some(at) => ControlFlow::WaitUntil(at),
             None => ControlFlow::Wait,
         }
@@ -808,6 +914,9 @@ impl App {
 
     /// Sends due retries and drops silent streams.
     fn tick(&mut self) {
+        if self.models_retry.is_some_and(|at| at <= Instant::now()) {
+            self.load_models();
+        }
         let mut actions = Vec::new();
         if let Screen::Chat(chat) = &mut self.screen {
             chat.tick(Instant::now(), &mut actions);
@@ -833,42 +942,48 @@ enum Job {
     SaveCharacter(Library, Character),
     /// Delete a world's or character's file from its library.
     DeleteRecord(Library, String),
-    /// List the saved sessions and send them back.
-    ListSessions(mpsc::Sender<Vec<SessionSummary>>),
+    /// List the saved sessions and send them back, with how many files
+    /// could not be read.
+    ListSessions(mpsc::Sender<(Vec<SessionSummary>, usize)>),
 }
+
+/// Tells the user about a write that failed; called on the writer thread.
+type Report = Arc<dyn Fn(String) + Send + Sync>;
 
 impl Job {
     /// Performs the job against `store` (`None`: sessions are not saved).
-    fn run(self, store: Option<&mut SessionStore>) {
+    /// A failure is logged and handed to `report`, for the user.
+    fn run(self, store: Option<&mut SessionStore>, report: &dyn Fn(String)) {
         let result = match (self, store) {
-            (Self::SaveSession(session), Some(store)) => store.save(&session).map_err(|e| ("save the session", e)),
-            (Self::DeleteSession(id), Some(store)) => store.delete(&id).map_err(|e| ("delete the session", e)),
+            (Self::SaveSession(session), Some(store)) => store.save(&session).map_err(|e| ("save the story", e)),
+            (Self::DeleteSession(id), Some(store)) => store.delete(&id).map_err(|e| ("delete the story", e)),
             (Self::SaveSession(_) | Self::DeleteSession(_), None) => Ok(()),
-            (Self::SaveConfig(config), _) => config.save().map_err(|e| ("save the config", e)),
+            (Self::SaveConfig(config), _) => config.save().map_err(|e| ("save the settings", e)),
             (Self::SaveWorld(library, world), _) => library.save(&world.id, &world).map_err(|e| ("save the world", e)),
             (Self::SaveCharacter(library, character), _) => library.save(&character.id, &character).map_err(|e| ("save the character", e)),
             (Self::DeleteRecord(library, id), _) => library.delete(&id).map_err(|e| ("delete the file", e)),
             (Self::ListSessions(reply), store) => {
-                let sessions = match store.map(SessionStore::list) {
+                let listed = match store.map(SessionStore::list) {
                     Some(Ok((sessions, errors))) => {
-                        for e in errors {
-                            eprintln!("openrp: skipping unreadable session: {e}");
+                        for e in &errors {
+                            log::error(format!("skipping unreadable story: {e}"));
                         }
-                        sessions
+                        (sessions, errors.len())
                     }
                     Some(Err(e)) => {
-                        eprintln!("openrp: cannot list sessions: {e}");
-                        Vec::new()
+                        log::error(format!("cannot list stories: {e}"));
+                        (Vec::new(), 1)
                     }
-                    None => Vec::new(),
+                    None => (Vec::new(), 0),
                 };
                 // The receiver only disappears if the app is exiting.
-                let _ = reply.send(sessions);
+                let _ = reply.send(listed);
                 Ok(())
             }
         };
         if let Err((what, e)) = result {
-            eprintln!("openrp: could not {what}: {e}");
+            log::error(format!("could not {what}: {e}"));
+            report(format!("Could not {what}: {e}"));
         }
     }
 }
@@ -881,24 +996,28 @@ struct Writer {
     thread: Option<JoinHandle<()>>,
     /// Used on the calling thread if the writer thread could not start.
     inline: Option<SessionStore>,
+    /// Told about every write that fails.
+    report: Report,
 }
 
 impl Writer {
-    /// Starts the thread for sessions in `dir` (`None`: not saved).
-    fn start(dir: Option<PathBuf>) -> Self {
+    /// Starts the thread for sessions in `dir` (`None`: not saved), telling
+    /// `report` about every write that fails.
+    fn start(dir: Option<PathBuf>, report: impl Fn(String) + Send + Sync + 'static) -> Self {
         let (queue, jobs) = mpsc::channel::<Job>();
-        let fallback = dir.clone();
+        let report: Report = Arc::new(report);
+        let (fallback, theirs) = (dir.clone(), Arc::clone(&report));
         let spawned = std::thread::Builder::new().name("openrp-writer".into()).spawn(move || {
             let mut store = dir.map(SessionStore::at);
             for job in jobs {
-                job.run(store.as_mut());
+                job.run(store.as_mut(), &*theirs);
             }
         });
         match spawned {
-            Ok(thread) => Self { queue: Some(queue), thread: Some(thread), inline: None },
+            Ok(thread) => Self { queue: Some(queue), thread: Some(thread), inline: None, report },
             Err(e) => {
-                eprintln!("openrp: cannot start the writer thread, saving on the UI thread: {e}");
-                Self { queue: None, thread: None, inline: fallback.map(SessionStore::at) }
+                log::error(format!("cannot start the writer thread, saving on the UI thread: {e}"));
+                Self { queue: None, thread: None, inline: fallback.map(SessionStore::at), report }
             }
         }
     }
@@ -913,12 +1032,13 @@ impl Writer {
             },
             None => job,
         };
-        job.run(self.inline.as_mut());
+        job.run(self.inline.as_mut(), &*self.report);
     }
 
-    /// The saved sessions, newest first. Waits for the writes queued before
-    /// it, which only happens when the chat screen opens.
-    fn list_sessions(&mut self) -> Vec<SessionSummary> {
+    /// The saved sessions, newest first, and how many files could not be
+    /// read. Waits for the writes queued before it, which only happens when
+    /// the chat screen opens.
+    fn list_sessions(&mut self) -> (Vec<SessionSummary>, usize) {
         let (reply, sessions) = mpsc::channel();
         self.send(Job::ListSessions(reply));
         sessions.recv().unwrap_or_default()
@@ -935,18 +1055,19 @@ impl Drop for Writer {
     }
 }
 
-/// The records of a library listing; unreadable files are reported and skipped.
-fn report<T>(listing: Result<(Vec<T>, Vec<Error>), Error>, what: &str) -> Vec<T> {
+/// The records of a library listing and how many files could not be read;
+/// those are logged and skipped.
+fn report<T>(listing: Result<(Vec<T>, Vec<Error>), Error>, what: &str) -> (Vec<T>, usize) {
     match listing {
         Ok((records, errors)) => {
-            for e in errors {
-                eprintln!("openrp: skipping unreadable file in {what}: {e}");
+            for e in &errors {
+                log::error(format!("skipping unreadable file in {what}: {e}"));
             }
-            records
+            (records, errors.len())
         }
         Err(e) => {
-            eprintln!("openrp: cannot list {what}: {e}");
-            Vec::new()
+            log::error(format!("cannot list {what}: {e}"));
+            (Vec::new(), 1)
         }
     }
 }
@@ -1010,13 +1131,19 @@ mod tests {
     fn writer_keeps_order_and_flushes_on_drop() {
         let dir = std::env::temp_dir().join(format!("openrp-writer-{}", std::process::id())).join("sessions");
         let session = |id: &str, updated| Session { id: id.into(), title: id.into(), updated, ..Session::default() };
-        let mut writer = Writer::start(Some(dir.clone()));
+        let failures = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let seen = Arc::clone(&failures);
+        let mut writer = Writer::start(Some(dir.clone()), move |text| seen.lock().unwrap().push(text));
         writer.send(Job::SaveSession(session("a", 1)));
         writer.send(Job::SaveSession(session("b", 2)));
         writer.send(Job::DeleteSession("a".into()));
         // Listing waits for the writes queued before it.
-        let ids: Vec<String> = writer.list_sessions().into_iter().map(|s| s.id).collect();
+        let ids: Vec<String> = writer.list_sessions().0.into_iter().map(|s| s.id).collect();
         assert_eq!(ids, ["b"]);
+        // A write that fails is reported.
+        writer.send(Job::SaveSession(session("../bad", 4)));
+        assert_eq!(writer.list_sessions().1, 0);
+        assert!(failures.lock().unwrap()[0].starts_with("Could not save the story"));
         writer.send(Job::SaveSession(session("c", 3)));
         drop(writer);
         assert!(dir.join("c.json").exists(), "dropping the writer finishes its queue");

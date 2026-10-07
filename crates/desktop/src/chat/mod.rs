@@ -14,6 +14,8 @@ mod composer;
 mod dialog;
 mod menu;
 mod messages;
+mod names;
+mod notice;
 mod sidebar;
 mod stream;
 mod tools;
@@ -39,8 +41,9 @@ use crate::ui::{Ui, copy, edit_key, move_line};
 
 use composer::Command;
 pub use dialog::GenerateJob;
-use stream::{ActiveStream, Retry};
-pub use stream::{ReviewJob, SendJob, input_items};
+use notice::Notice;
+use stream::{ActiveStream, Retry, Review};
+pub use stream::{ReviewJob, SendJob};
 pub use tools::{generator_tool, remember_tool, tool_definitions};
 
 /// Model used until the user picks one.
@@ -196,6 +199,8 @@ enum Menu {
     Member(usize),
     /// What to do with this conversation (from its sidebar row).
     Session(u64),
+    /// The model for work beside the story (from the settings page).
+    UtilityModel,
 }
 
 /// One message in a conversation, with its cached layouts.
@@ -345,10 +350,10 @@ struct Conversation {
     memories: Vec<String>,
     /// The user's author's note: guidance for the whole story.
     note: String,
-    /// How many entries the last memory review had read.
+    /// How many prompts (and their replies) the memory reviews have read.
     reviewed: usize,
-    /// The memory review being waited for: its request id and model.
-    reviewing: Option<(u64, String)>,
+    /// The memory review being waited for.
+    reviewing: Option<Review>,
     /// Replies in a row that continued on their own after only calling
     /// tools; reset by every prompt.
     auto_rounds: u32,
@@ -421,6 +426,7 @@ impl Conversation {
     fn to_session(&self) -> Session {
         debug_assert_eq!(self.load, Load::Loaded, "saving would drop unloaded messages");
         Session {
+            version: Session::VERSION,
             id: self.session_id.clone(),
             title: self.title.clone(),
             created: self.created,
@@ -441,16 +447,14 @@ impl Conversation {
         }
     }
 
+    /// What the story cost, the replies swiped away included.
     fn cost(&self) -> f64 {
-        if self.load == Load::Loaded { self.entries.iter().map(|e| e.message.cost).sum() } else { self.indexed_cost }
+        if self.load == Load::Loaded { self.entries.iter().map(|e| e.message.total_cost()).sum() } else { self.indexed_cost }
     }
 
+    /// Tokens billed for the story, the replies swiped away included.
     fn tokens(&self) -> u64 {
-        if self.load == Load::Loaded {
-            self.entries.iter().map(|e| e.message.usage.input_tokens + e.message.usage.output_tokens).sum()
-        } else {
-            self.indexed_tokens
-        }
+        if self.load == Load::Loaded { self.entries.iter().map(|e| e.message.total_tokens()).sum() } else { self.indexed_tokens }
     }
 
     /// Streaming or waiting to retry.
@@ -500,13 +504,26 @@ pub struct Chat {
     /// Composer caret rectangle, for placing the input method's window.
     caret_rect: Option<Rect>,
     models: Vec<Model>,
+    /// Why the model list could not be loaded, while it could not.
+    models_error: Option<String>,
     model: String,
+    /// Model for work beside the story; `None` uses `model`.
+    utility_model: Option<String>,
     reasoning: Reasoning,
     reasoning_view: ReasoningView,
     menu: Option<Menu>,
     /// Where the open menu was drawn last frame; blocks hover beneath it.
     menu_rect: Option<Rect>,
     menu_scroll: f32,
+    /// A destructive row of the open menu was clicked once and asks for a
+    /// second click.
+    confirming: Option<Menu>,
+    /// Where the settings page's background model button was drawn.
+    utility_anchor: Rect,
+    /// Problems to tell the user about, newest last.
+    notices: Vec<Notice>,
+    /// Where the notices were drawn last frame; they block what is beneath.
+    notices_rect: Option<Rect>,
     /// The slash command Enter runs, among those matching.
     command_pick: usize,
     /// Composer text the command menu was closed for; it stays closed
@@ -530,6 +547,9 @@ pub struct Chat {
     character_form: Option<dialog::CharacterForm>,
     /// Replies being edited, in one conversation.
     turn_edit: Option<turns::TurnEdit>,
+    /// The entry whose turn's Delete was clicked once and waits for a
+    /// second click.
+    turn_confirm: Option<u64>,
     /// A session to copy once it is read: (conversation, as a frame).
     pending_duplicate: Option<(u64, bool)>,
     /// Where the sidebar row whose session menu is open was drawn.
@@ -556,12 +576,18 @@ impl Chat {
             preedit: None,
             caret_rect: None,
             models: Vec::new(),
+            models_error: None,
             model: model.unwrap_or_else(|| DEFAULT_MODEL.to_owned()),
+            utility_model: None,
             reasoning,
             reasoning_view: ReasoningView::default(),
             menu: None,
             menu_rect: None,
             menu_scroll: 0.0,
+            confirming: None,
+            utility_anchor: Rect::default(),
+            notices: Vec::new(),
+            notices_rect: None,
             command_pick: 0,
             command_dismissed: None,
             scroll: 0.0,
@@ -575,6 +601,7 @@ impl Chat {
             library: LibraryView::default(),
             character_form: None,
             turn_edit: None,
+            turn_confirm: None,
             pending_duplicate: None,
             session_menu: Rect::default(),
             spotlight: None,
@@ -595,6 +622,52 @@ impl Chat {
     /// The effort requests use: the chosen one if the model accepts it.
     fn reasoning_in_use(&self) -> Reasoning {
         if Reasoning::choices(self.selected_model()).contains(&self.reasoning) { self.reasoning } else { Reasoning::Auto }
+    }
+
+    /// The effort to send with a story request, `None` for the model's default.
+    fn reasoning_key(&self) -> Option<&'static str> {
+        Some(self.reasoning_in_use()).filter(|r| *r != Reasoning::Auto).map(Reasoning::key)
+    }
+
+    /// The model (and effort) for work beside the story: memory reviews and
+    /// character generation. The background model, when one is set and
+    /// still offered, at its default effort; the story's otherwise.
+    fn side_model(&self) -> (String, Option<&'static str>) {
+        let offered = |id: &str| self.models.is_empty() || self.models.iter().any(|m| m.id == id);
+        match self.utility_model.as_deref().filter(|id| offered(id)) {
+            Some(id) => (id.to_owned(), None),
+            None => (self.model.clone(), self.reasoning_key()),
+        }
+    }
+
+    /// The model (and effort) that summarises a story: the background one
+    /// only if its context window is as large as the story model's, since
+    /// it reads what no longer fits that.
+    fn summary_model(&self) -> (String, Option<&'static str>) {
+        let (model, reasoning) = self.side_model();
+        let window = |id: &str| self.models.iter().find(|m| m.id == id).map_or(0, |m| m.context_window);
+        if model != self.model && window(&model) < window(&self.model) { (self.model.clone(), self.reasoning_key()) } else { (model, reasoning) }
+    }
+
+    /// Sets the model for work beside the story; `None` uses the story's.
+    pub fn set_utility_model(&mut self, model: Option<String>) {
+        self.utility_model = model;
+    }
+
+    /// Tells the user about a problem, with a way to the data folder when
+    /// it can help.
+    pub fn notify(&mut self, text: String, folder: bool) {
+        self.notices.retain(|n| n.text != text);
+        self.notices.push(Notice::new(text, folder));
+        // A few at most: the oldest go first.
+        if self.notices.len() > 3 {
+            self.notices.remove(0);
+        }
+    }
+
+    /// The model list could not be loaded; the app tries again.
+    pub fn models_failed(&mut self, error: String) {
+        self.models_error = Some(error);
     }
 
     fn next_id(&mut self) -> u64 {
@@ -764,9 +837,7 @@ impl Chat {
             if !session.title.is_empty() {
                 session.title.push_str(" (copy)");
             }
-            for message in &mut session.messages {
-                message.cost = 0.0;
-            }
+            session.messages.iter_mut().for_each(unbilled);
         }
         let copy = self.next_id();
         let mut conversation = Conversation::from_summary(copy, session.summary());
@@ -853,6 +924,7 @@ impl Chat {
 
     /// Stores the model list, keeping the selection valid.
     pub fn set_models(&mut self, models: Vec<Model>) {
+        self.models_error = None;
         if !models.iter().any(|m| m.id == self.model)
             && let Some(fallback) = models.iter().find(|m| m.id == DEFAULT_MODEL).or(models.first())
         {
@@ -888,6 +960,10 @@ impl Chat {
         if conversation.load != Load::Loaded || conversation.busy() || !has_content || !conversation.playable() || editing {
             return;
         }
+        // The model list failed to load: try again now.
+        if self.models.is_empty() && self.models_error.is_some() {
+            actions.push(Action::LoadModels);
+        }
         let text = self.composer.take().trim().to_owned();
         let user_id = self.next_id();
         let conversation = self.current();
@@ -921,8 +997,8 @@ impl Chat {
     /// Switches the main area to `page`.
     fn show(&mut self, page: Page) {
         self.menu = None;
-        if let Page::Library(_) = page {
-            self.library.show_index();
+        if let Page::Library(kind) = page {
+            self.library.show(kind);
         }
         self.page = page;
     }
@@ -1141,13 +1217,18 @@ impl Chat {
         } else if self.menu.is_some() {
             self.menu_rect
         } else {
-            None
+            self.notices_rect
         };
         self.draw_sidebar(p, ui, sidebar, actions);
         let toolbar = match self.page {
             Page::Settings => {
                 let totals = self.totals();
-                self.settings.draw(p, ui, main, scheme, self.reasoning_view, totals, actions);
+                let utility = self.utility_model.as_deref().map_or("Same as the story", |id| model_name(&self.models, id)).to_owned();
+                if let Some(anchor) = self.settings.draw(p, ui, main, scheme, self.reasoning_view, &utility, totals, actions) {
+                    self.menu = if self.menu == Some(Menu::UtilityModel) { None } else { Some(Menu::UtilityModel) };
+                    self.menu_scroll = 0.0;
+                    self.utility_anchor = anchor;
+                }
                 [Rect::default(); 4]
             }
             Page::Library(kind) => {
@@ -1195,6 +1276,9 @@ impl Chat {
             ui.blocker = None;
         }
         self.draw_open_menu(p, ui, toolbar, actions);
+        if !modal {
+            self.draw_notices(p, ui, main, actions);
+        }
         if let Some(spotlight) = &mut self.spotlight {
             ui.blocker = None;
             let context = crate::spotlight::Context {
@@ -1255,6 +1339,13 @@ impl Chat {
         let width = theme::COLUMN_WIDTH.min(main.w - 64.0);
         (main.x + ((main.w - width) * 0.5).round(), width)
     }
+}
+
+/// Clears what `message` and the replies swiped away under it cost: a
+/// copy of a story was paid for once, with the original.
+fn unbilled(message: &mut StoredMessage) {
+    message.cost = 0.0;
+    message.swipes.iter_mut().flatten().for_each(unbilled);
 }
 
 /// Display name of a model id.
@@ -1324,6 +1415,7 @@ pub fn format_cost(usd: f64) -> String {
 mod tests {
     use serechat::{Completion, InputItem, StreamEvent, ToolCall};
 
+    use super::stream::input_items;
     use super::*;
 
     #[test]
@@ -1426,6 +1518,7 @@ mod tests {
         reply.cost = 0.5;
         reply.usage = Usage::new(3, 4);
         let session = Session {
+            version: Session::VERSION,
             id: "abc".into(),
             title: "Hi".into(),
             created: 1,
@@ -1466,7 +1559,7 @@ mod tests {
     fn new_chat() -> Chat {
         let mut chat = Chat::new(None, Reasoning::Auto, Vec::new());
         chat.play("w".into());
-        chat.current().player = Some(Player { name: "Gale".into(), description: String::new() });
+        chat.current().player = Some(Player { name: "Gale".into(), ..Player::default() });
         chat
     }
 
@@ -1535,6 +1628,51 @@ mod tests {
         let error = Error::Response { code: Some("invalid_request_error".into()), message: "bad".into() };
         chat.stream_end(job.conversation, job.stream, Err(error), &mut Vec::new());
         assert!(chat.current().retry.is_none() && !chat.current().busy());
+    }
+
+    #[test]
+    fn replies_in_plain_text_are_tried_once_more() {
+        let mut chat = new_chat();
+        let job = start(&mut chat, "hi");
+        // A model that ignores the tools and narrates instead.
+        chat.stream_event(job.conversation, job.stream, StreamEvent::Text("Once upon a time…".into()));
+        chat.stream_end(job.conversation, job.stream, Ok(true), &mut Vec::new());
+        assert_eq!(chat.current().retry.as_ref().map(|r| r.attempt), Some(1), "one more try");
+        let mut actions = Vec::new();
+        chat.tick(chat.next_deadline().unwrap(), &mut actions);
+        let job = next_send(actions).expect("tried again");
+        chat.stream_event(job.conversation, job.stream, StreamEvent::Text("More prose.".into()));
+        chat.stream_end(job.conversation, job.stream, Ok(true), &mut Vec::new());
+        let c = chat.current();
+        assert!(c.retry.is_none(), "not retried for minutes");
+        assert!(c.entries.last().is_some_and(|e| e.message.failed && e.message.content.contains("plain text")));
+    }
+
+    #[test]
+    fn slow_memory_reviews_are_given_up() {
+        let mut chat = new_chat();
+        let mut review = None;
+        for turn in 1..=8 {
+            let job = start(&mut chat, &format!("turn {turn}"));
+            let actions = finish_saying(&mut chat, &job, "Go on.", Completion::default());
+            review = review.or(actions.into_iter().find_map(|a| if let Action::ReviewMemories(job) = a { Some(job) } else { None }));
+        }
+        let review = review.expect("a review");
+        assert_eq!(chat.current().reviewed, 8);
+        chat.tick(std::time::Instant::now() + std::time::Duration::from_secs(3600), &mut Vec::new());
+        let c = chat.current();
+        assert!(review.cancel.load(Ordering::Relaxed) && c.reviewing.is_none());
+        assert_eq!(c.reviewed, 0, "its turns are read next time");
+        // Its late answer is dropped.
+        let remember = ToolCall { call_id: "m".into(), name: tools::REMEMBER.into(), arguments: r#"{"memories":["Late."]}"#.into() };
+        let id = c.id;
+        chat.memories_reviewed(id, review.request, Ok((Some(remember), Usage::default())), &mut Vec::new());
+        assert!(chat.current().memories.is_empty());
+
+        // Deleting a turn a review read counts it out.
+        chat.current().reviewed = 8;
+        chat.delete_turn(0, &mut Vec::new());
+        assert_eq!(chat.current().reviewed, 7);
     }
 
     #[test]
@@ -1618,7 +1756,7 @@ mod tests {
         let mut chat = new_chat();
         let first = start(&mut chat, "one");
         chat.play("w".into());
-        chat.current().player = Some(Player { name: "Gale".into(), description: String::new() });
+        chat.current().player = Some(Player { name: "Gale".into(), ..Player::default() });
         let second = start(&mut chat, "two");
         assert_ne!(first.conversation, second.conversation);
         assert_eq!(chat.conversations.iter().filter(|c| c.busy()).count(), 2, "both run at once");
@@ -1644,7 +1782,7 @@ mod tests {
         assert!(next_send(finish(&mut chat, &job, completion)).is_none(), "speech ends the turn");
         assert_eq!(chat.current().memories, ["Gale promised to return."]);
         let id = chat.current().id;
-        assert!(chat.instructions(id).contains("- Gale promised to return."), "the next reply reads it");
+        assert!(chat.state(id).unwrap().contains("- Gale promised to return."), "the next reply reads it");
         // Regenerating the turn forgets what it remembered.
         let mut actions = Vec::new();
         chat.regenerate(&mut actions);
@@ -1673,7 +1811,7 @@ mod tests {
 
         // The answer joins the memories once; a repeat of it is stale.
         chat.memories_reviewed(id, review.request, Ok((Some(remember(memory)), Usage::new(10, 5))), &mut actions);
-        assert!(matches!(&actions[..], [Action::SaveSession(s)] if s.memories == ["Gale trusts Peeta."] && s.reviewed == 16));
+        assert!(matches!(&actions[..], [Action::SaveSession(s)] if s.memories == ["Gale trusts Peeta."] && s.reviewed == 8));
         chat.memories_reviewed(id, review.request, Ok((Some(remember(r#"{"memories":["Stale."]}"#)), Usage::default())), &mut Vec::new());
         assert_eq!(chat.current().memories, ["Gale trusts Peeta."]);
 
@@ -1858,7 +1996,7 @@ mod tests {
     fn a_character_created_in_a_reply_speaks_in_it() {
         let mut chat = new_chat();
         let job = start(&mut chat, "I walk into the tavern and meet the barkeep, Mira.");
-        assert!(job.instructions.contains("No one is in the scene yet"));
+        assert!(job.state.as_deref().is_some_and(|s| s.contains("No one is in the scene yet")));
         // The model may list the speech before the character it needs.
         let speak = ToolCall {
             call_id: "s".into(),
@@ -1875,7 +2013,7 @@ mod tests {
         let calls = &chat.current().entries.last().unwrap().message.tool_calls;
         assert_eq!(calls[0].output, "Spoken.", "Mira was created before she spoke");
         let follow = start(&mut chat, "A beer, please.");
-        assert!(follow.instructions.contains("## Mira") && !follow.instructions.contains("No one is in the scene yet"));
+        assert!(follow.instructions.contains("## Mira") && !follow.state.as_deref().is_some_and(|s| s.contains("No one is in the scene yet")));
     }
 
     #[test]

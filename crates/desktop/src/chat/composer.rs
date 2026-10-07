@@ -51,7 +51,7 @@ impl Command {
     /// What it does, shown next to it.
     pub(super) fn detail(self) -> &'static str {
         match self {
-            Self::Clear => "Clear this chat's messages",
+            Self::Clear => "Delete this story and start it over",
             Self::Ooc => "Tell the AI something out of character",
             Self::Note => "Author's note for the whole story",
             Self::Memory => "What the story remembers",

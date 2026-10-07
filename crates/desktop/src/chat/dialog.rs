@@ -6,12 +6,12 @@
 //! Everything it changes belongs to the story only.
 
 use arboard::Clipboard;
-use serechat::{CastMember, Error, Player, ToolCall, new_id};
+use serechat::{CastMember, Error, Player, ToolCall, new_id, rename};
 use winit::event::KeyEvent;
 use winit::keyboard::{Key, ModifiersState, NamedKey};
 use winit::window::CursorIcon;
 
-use super::{Chat, Load, Reasoning, tools};
+use super::{Chat, Load, names, tools};
 use crate::app::Action;
 use crate::form::{FIELD_PAD, Fields};
 use crate::library::{Kind, name_editor, portrait, text_editor};
@@ -223,8 +223,8 @@ impl Chat {
     /// the tools tell characters apart by name.
     fn name_taken(&mut self, subject: &Subject, name: &str) -> bool {
         let conversation = self.current();
-        let player = *subject != Subject::Player && conversation.player.as_ref().is_some_and(|p| tools::same(&p.name, name));
-        player || conversation.cast.iter().any(|m| tools::same(&m.name, name) && !matches!(subject, Subject::Member(id) if *id == m.id))
+        let player = *subject != Subject::Player && conversation.player.as_ref().is_some_and(|p| names::same(&p.name, name));
+        player || conversation.cast.iter().any(|m| names::same(&m.name, name) && !matches!(subject, Subject::Member(id) if *id == m.id))
     }
 
     /// Applies the form, if it has a free name, and closes it; when
@@ -259,14 +259,24 @@ impl Chat {
         }
         self.character_form = None;
         let conversation = self.current();
+        // A new name keeps the old one as an alias: earlier turns use it.
         match subject {
-            Subject::Player => conversation.player = Some(Player { name, description }),
+            Subject::Player => match &mut conversation.player {
+                Some(player) => {
+                    rename(&mut player.name, &mut player.aliases, &name);
+                    player.description = description;
+                }
+                None => conversation.player = Some(Player { name, description, ..Player::default() }),
+            },
             Subject::Member(id) => {
                 if let Some(member) = conversation.cast.iter_mut().find(|m| m.id == id) {
-                    (member.name, member.description, member.portrait) = (name, description, portrait);
+                    rename(&mut member.name, &mut member.aliases, &name);
+                    (member.description, member.portrait) = (description, portrait);
                 }
             }
-            Subject::NewMember => conversation.cast.push(CastMember { id: new_id(), name, description, portrait, present: true }),
+            Subject::NewMember => {
+                conversation.cast.push(CastMember { id: new_id(), name, description, portrait, present: true, ..CastMember::default() });
+            }
             Subject::Scene => conversation.scene = name,
             Subject::Note => conversation.note = name,
             Subject::Memory | Subject::Generate { .. } => {}
@@ -301,8 +311,8 @@ impl Chat {
     /// and returns its id.
     fn generate_job(&mut self, conversation: Option<u64>, instructions: String, idea: String, actions: &mut Vec<Action>) -> u64 {
         let request = self.next_id();
-        let reasoning = Some(self.reasoning_in_use()).filter(|r| *r != Reasoning::Auto).map(Reasoning::key);
-        actions.push(Action::GenerateCharacter(GenerateJob { conversation, request, model: self.model.clone(), reasoning, instructions, idea }));
+        let (model, reasoning) = self.side_model();
+        actions.push(Action::GenerateCharacter(GenerateJob { conversation, request, model, reasoning, instructions, idea }));
         request
     }
 
@@ -637,6 +647,7 @@ fn draw_photo(p: &mut Painter, ui: &mut Ui, rect: Rect, path: Option<&str>, name
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::chat::Reasoning;
 
     #[test]
     fn a_story_asks_who_you_are_before_it_begins() {
@@ -674,7 +685,7 @@ mod tests {
     fn the_cast_is_created_edited_and_generated() {
         let mut chat = Chat::new(None, Reasoning::Auto, Vec::new());
         chat.play("w".into());
-        chat.current().player = Some(Player { name: "Gale".into(), description: String::new() });
+        chat.current().player = Some(Player { name: "Gale".into(), ..Player::default() });
         let mut actions = Vec::new();
 
         chat.create_member();
@@ -735,7 +746,7 @@ mod tests {
     fn memories_and_the_note_are_edited_by_hand() {
         let mut chat = Chat::new(None, Reasoning::Auto, Vec::new());
         chat.play("w".into());
-        chat.current().player = Some(Player { name: "Gale".into(), description: String::new() });
+        chat.current().player = Some(Player { name: "Gale".into(), ..Player::default() });
         chat.current().memories = vec!["One.".into(), "Two.".into()];
         let mut actions = Vec::new();
 
@@ -763,7 +774,7 @@ mod tests {
         chat.submit_form(&mut actions);
         assert_eq!(chat.current().note, "Slow burn.");
         let id = chat.current().id;
-        assert!(chat.instructions(id).ends_with("Slow burn."), "the note comes last");
+        assert!(chat.state(id).unwrap().ends_with("Slow burn."), "the note comes last");
         assert!(matches!(actions.last(), Some(Action::SaveSession(s)) if s.note == "Slow burn." && s.memories.is_empty()));
     }
 
@@ -771,7 +782,7 @@ mod tests {
     fn the_scene_is_set_by_hand() {
         let mut chat = Chat::new(None, Reasoning::Auto, Vec::new());
         chat.play("w".into());
-        chat.current().player = Some(Player { name: "Gale".into(), description: String::new() });
+        chat.current().player = Some(Player { name: "Gale".into(), ..Player::default() });
         chat.current().scene = "The Hob.".into();
         let mut actions = Vec::new();
 
@@ -783,7 +794,7 @@ mod tests {
         assert!(chat.character_form.is_none());
         assert!(matches!(&actions[..], [Action::SaveSession(s)] if s.scene == "The Hob. Smoky."));
         let id = chat.current().id;
-        assert!(chat.instructions(id).contains("# The scene\n\nThe Hob. Smoky."), "the next reply reads it");
+        assert!(chat.state(id).unwrap().contains("# The scene\n\nThe Hob. Smoky."), "the next reply reads it");
 
         // Emptied, the model sets it afresh.
         chat.edit_scene();

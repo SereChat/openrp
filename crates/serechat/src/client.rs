@@ -13,6 +13,10 @@ use crate::error::{Error, Result};
 
 /// Production API origin.
 pub const BASE_URL: &str = "https://serechat.com";
+/// Longest a response body may take to arrive, streams included.
+const BODY_TIMEOUT: Duration = Duration::from_secs(30 * 60);
+/// Longest wait a `Retry-After` header is trusted with.
+const MAX_RETRY_AFTER: Duration = Duration::from_secs(10 * 60);
 
 /// A cheaply clonable handle to the API. Clones share one connection pool.
 #[derive(Clone)]
@@ -30,12 +34,19 @@ impl std::fmt::Debug for Client {
 }
 
 /// Result of a successful device-code exchange.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Clone, Deserialize)]
 pub struct AccessToken {
     /// Bearer token for inference requests.
     pub access_token: String,
     /// Lifetime in seconds (currently one year).
     pub expires_in: u64,
+}
+
+impl std::fmt::Debug for AccessToken {
+    // Hand-written so the bearer token never ends up in logs.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AccessToken").field("expires_in", &self.expires_in).finish_non_exhaustive()
+    }
 }
 
 /// A chat model offered by the API.
@@ -94,8 +105,10 @@ impl Client {
             .http_status_as_error(false)
             .timeout_connect(Some(Duration::from_secs(15)))
             .timeout_recv_response(Some(Duration::from_secs(120)))
-            // Streams may legitimately idle while a model thinks; no body
-            // timeout, cancellation is handled by the caller instead.
+            // Streams may legitimately idle while a model thinks, and the
+            // caller gives up on silent ones by itself. This only bounds how
+            // long a dead connection can keep its worker thread blocked.
+            .timeout_recv_body(Some(BODY_TIMEOUT))
             .user_agent(concat!("openrp/", env!("CARGO_PKG_VERSION")))
             .build()
             .into();
@@ -152,20 +165,6 @@ impl Client {
         Ok(body.data)
     }
 
-    /// Downloads a web page or text resource (no credentials are sent),
-    /// reading at most `limit` bytes. Returns the content type and body.
-    ///
-    /// # Errors
-    /// Network failure or a non-success status. Invalid UTF-8 is replaced.
-    pub fn fetch_text(&self, url: &str, limit: u64) -> Result<(String, String)> {
-        let mut response = check_status(self.agent.get(url).call()?)?;
-        let content_type = response.headers().get("content-type").and_then(|v| v.to_str().ok()).unwrap_or_default().to_owned();
-        // Truncate rather than fail: a long page is still useful.
-        let mut body = Vec::new();
-        std::io::Read::read_to_end(&mut std::io::Read::take(response.body_mut().with_config().reader(), limit), &mut body)?;
-        Ok((content_type, String::from_utf8_lossy(&body).into_owned()))
-    }
-
     /// POSTs `body` as JSON and returns the raw response after checking the
     /// status. Used by streaming calls that consume the body incrementally.
     pub(crate) fn post(&self, path: &str, body: &Value, auth: bool) -> Result<Response<ureq::Body>> {
@@ -197,13 +196,21 @@ fn check_status(mut response: Response<ureq::Body>) -> Result<Response<ureq::Bod
     if status.is_success() {
         return Ok(response);
     }
+    let retry_after = response.headers().get("retry-after").and_then(|v| v.to_str().ok()).and_then(parse_retry_after);
     let text = response.body_mut().read_to_string().unwrap_or_default();
     let (code, message) = parse_error_body(&text);
     Err(Error::Api {
         status: status.as_u16(),
         code,
         message: message.unwrap_or_else(|| status.canonical_reason().unwrap_or("request failed").to_owned()),
+        retry_after,
     })
+}
+
+/// A `Retry-After` header in seconds, capped at [`MAX_RETRY_AFTER`]. HTTP
+/// dates are not worth a date parser here: they mean "use your default".
+fn parse_retry_after(value: &str) -> Option<Duration> {
+    value.trim().parse::<u64>().ok().map(|secs| Duration::from_secs(secs).min(MAX_RETRY_AFTER))
 }
 
 /// Extracts `(code, message)` from an error body. Accepts both
@@ -221,7 +228,7 @@ pub(crate) fn parse_error_body(text: &str) -> (Option<String>, Option<String>) {
 
 #[cfg(test)]
 mod tests {
-    use super::{Model, parse_error_body};
+    use super::{Model, parse_error_body, parse_retry_after};
     use crate::Usage;
 
     #[test]
@@ -250,5 +257,12 @@ mod tests {
         let flat = r#"{"error":"authorization_pending","message":"Not yet"}"#;
         assert_eq!(parse_error_body(flat), (Some("authorization_pending".into()), Some("Not yet".into())));
         assert_eq!(parse_error_body("<html>"), (None, None));
+    }
+
+    #[test]
+    fn retry_after_headers() {
+        assert_eq!(parse_retry_after(" 7 "), Some(std::time::Duration::from_secs(7)));
+        assert_eq!(parse_retry_after("999999"), Some(super::MAX_RETRY_AFTER), "capped");
+        assert_eq!(parse_retry_after("Wed, 21 Oct 2015 07:28:00 GMT"), None);
     }
 }

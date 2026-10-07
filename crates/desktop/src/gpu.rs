@@ -2,6 +2,7 @@
 
 use std::fmt;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
 use winit::window::Window;
 
@@ -82,6 +83,22 @@ impl std::error::Error for GpuError {
     }
 }
 
+/// What became of a frame.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Frame {
+    /// It was drawn and presented.
+    Drawn,
+    /// The surface had to be set up again: draw again right away.
+    Retry,
+    /// Nothing can be shown now (hidden window, timeout); wait for the
+    /// next reason to draw.
+    Skipped,
+}
+
+/// Uncaptured GPU errors logged; later ones are dropped, as a broken
+/// frame would repeat the same error every frame.
+const MAX_LOGGED_ERRORS: u32 = 8;
+
 /// Owns every GPU object needed to draw the UI into the window.
 pub struct Renderer {
     surface: wgpu::Surface<'static>,
@@ -96,6 +113,9 @@ pub struct Renderer {
     images: wgpu::Texture,
     instances: wgpu::Buffer,
     linear_output: bool,
+    /// Raised when the device is lost (driver reset or update, GPU
+    /// switched): the renderer must be created again.
+    lost: Arc<AtomicBool>,
 }
 
 impl Renderer {
@@ -125,6 +145,19 @@ impl Renderer {
             })
             .await
             .map_err(GpuError::Device)?;
+        // wgpu's default handler panics, which aborts the app: log instead.
+        let logged = AtomicU32::new(0);
+        device.on_uncaptured_error(Arc::new(move |error| {
+            if logged.fetch_add(1, Ordering::Relaxed) < MAX_LOGGED_ERRORS {
+                crate::log::error(format!("GPU error: {error}"));
+            }
+        }));
+        let lost = Arc::new(AtomicBool::new(false));
+        let flag = Arc::clone(&lost);
+        device.set_device_lost_callback(move |reason, message| {
+            crate::log::error(format!("GPU device lost ({reason:?}): {message}"));
+            flag.store(true, Ordering::Relaxed);
+        });
 
         // Blend in sRGB space (like browsers do) by picking a non-sRGB
         // format; fall back to converting in the shader if there is none.
@@ -266,7 +299,14 @@ impl Renderer {
         });
 
         let instances = Self::instance_buffer(&device, 1024);
-        Ok(Self { surface, device, queue, config, pipeline, bind_group, globals, atlas, images, instances, linear_output: format.is_srgb() })
+        Ok(Self { surface, device, queue, config, pipeline, bind_group, globals, atlas, images, instances, linear_output: format.is_srgb(), lost })
+    }
+
+    /// The device was lost: drawing does nothing until the renderer is
+    /// created again (with fresh atlases, which lived on the old device).
+    #[must_use]
+    pub fn is_lost(&self) -> bool {
+        self.lost.load(Ordering::Relaxed)
     }
 
     fn instance_buffer(device: &wgpu::Device, capacity: usize) -> wgpu::Buffer {
@@ -289,10 +329,10 @@ impl Renderer {
     }
 
     /// Uploads pending glyphs and thumbnails and draws `instances` over `clear`.
-    ///
-    /// Returns `false` when no frame could be acquired (window occluded,
-    /// timeout); the caller should simply try again on the next redraw.
-    pub fn render(&mut self, instances: &[Instance], glyphs: &mut Vec<Upload>, images: &mut Vec<Upload>, scale: f32, clear: [f32; 4]) -> bool {
+    pub fn render(&mut self, instances: &[Instance], glyphs: &mut Vec<Upload>, images: &mut Vec<Upload>, scale: f32, clear: [f32; 4]) -> Frame {
+        if self.is_lost() {
+            return Frame::Skipped;
+        }
         for (texture, bytes_per_texel, uploads) in [(&self.atlas, 1, glyphs), (&self.images, 4, images)] {
             for upload in uploads.drain(..) {
                 self.queue.write_texture(
@@ -318,9 +358,11 @@ impl Renderer {
             }
             wgpu::CurrentSurfaceTexture::Outdated | wgpu::CurrentSurfaceTexture::Lost => {
                 self.surface.configure(&self.device, &self.config);
-                return false;
+                return Frame::Retry;
             }
-            wgpu::CurrentSurfaceTexture::Timeout | wgpu::CurrentSurfaceTexture::Occluded | wgpu::CurrentSurfaceTexture::Validation => return false,
+            wgpu::CurrentSurfaceTexture::Timeout | wgpu::CurrentSurfaceTexture::Occluded | wgpu::CurrentSurfaceTexture::Validation => {
+                return Frame::Skipped;
+            }
         };
 
         let globals = Globals {
@@ -370,7 +412,7 @@ impl Renderer {
         }
         self.queue.submit([encoder.finish()]);
         self.queue.present(frame);
-        true
+        Frame::Drawn
     }
 }
 

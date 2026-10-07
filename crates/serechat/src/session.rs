@@ -9,12 +9,16 @@
 //!
 //! Files are written atomically with the same private permissions as the
 //! config. Fields added later must be `#[serde(default)]` so older files keep
-//! loading.
+//! loading. Each file records the [`Session::VERSION`] that wrote it: an
+//! older one is upgraded as it is read, and one from a newer version of the
+//! app is listed but never opened, since saving it here would drop what this
+//! version does not know.
 
 use std::collections::HashSet;
 use std::fs;
 use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
@@ -31,6 +35,9 @@ const INDEX_FILE: &str = ".index.json";
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Session {
+    /// The format version that wrote the file; `0` for files from before
+    /// versions were recorded.
+    pub version: u32,
     /// Identifier, also the file name without `.json`.
     pub id: String,
     /// Sidebar title, taken from the first prompt.
@@ -61,8 +68,8 @@ pub struct Session {
     /// sent with every request.
     #[serde(skip_serializing_if = "String::is_empty")]
     pub note: String,
-    /// How many of `messages` the last memory review had read, so the next
-    /// one covers only what came after.
+    /// How many of the story's prompts (and their replies) the memory
+    /// reviews have read, so the next one covers only what came after.
     #[serde(skip_serializing_if = "is_default")]
     pub reviewed: usize,
     /// Every turn, oldest first.
@@ -83,6 +90,10 @@ pub struct CastMember {
     pub id: String,
     /// Display name, also how the model refers to them.
     pub name: String,
+    /// Names they went by before (renamed by the user or the model), so
+    /// earlier turns that use them still mean this character.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub aliases: Vec<String>,
     /// Who they are, for the model.
     pub description: String,
     /// Portrait file name in [`Portraits`](crate::Portraits); empty for none.
@@ -99,8 +110,26 @@ pub struct CastMember {
 pub struct Player {
     /// Their name.
     pub name: String,
+    /// Names they went by before, as for [`CastMember::aliases`].
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub aliases: Vec<String>,
     /// Who they are, for the model.
     pub description: String,
+}
+
+/// Renames someone known by `name` (and `aliases`) to `new_name`, keeping
+/// the old name as an alias so earlier turns still mean them; a name they
+/// had before stops being an alias.
+pub fn rename(name: &mut String, aliases: &mut Vec<String>, new_name: &str) {
+    let new_name = new_name.trim();
+    if new_name.is_empty() || name.as_str() == new_name {
+        return;
+    }
+    let old = std::mem::replace(name, new_name.to_owned());
+    aliases.retain(|a| !a.trim().eq_ignore_ascii_case(new_name) && !a.trim().eq_ignore_ascii_case(&old));
+    if !old.trim().is_empty() && !old.trim().eq_ignore_ascii_case(new_name) {
+        aliases.push(old);
+    }
 }
 
 /// A tool call a reply made, with the result sent back to the model.
@@ -115,16 +144,30 @@ pub struct ToolResult {
 }
 
 impl Session {
-    /// Total spent on this session in USD.
+    /// The format this version of the app writes.
+    pub const VERSION: u32 = 1;
+
+    /// Total spent on this session in USD, the replies swiped away included.
     #[must_use]
     pub fn cost(&self) -> f64 {
-        self.messages.iter().map(|m| m.cost).sum()
+        self.messages.iter().map(StoredMessage::total_cost).sum()
     }
 
-    /// Total tokens billed for this session.
+    /// Total tokens billed for this session, the replies swiped away included.
     #[must_use]
     pub fn tokens(&self) -> u64 {
-        self.messages.iter().map(|m| m.usage.input_tokens + m.usage.output_tokens).sum()
+        self.messages.iter().map(StoredMessage::total_tokens).sum()
+    }
+
+    /// Brings a session written by an older format up to this one.
+    fn upgrade(&mut self) {
+        if self.version == 0 {
+            // `reviewed` counted messages; it counts prompts now, which
+            // deleting replies or summarising does not shift.
+            let read = &self.messages[..self.reviewed.min(self.messages.len())];
+            self.reviewed = read.iter().filter(|m| m.is_prompt()).count();
+        }
+        self.version = Self::VERSION;
     }
 
     /// The index entry for this session.
@@ -198,6 +241,18 @@ pub struct StoredMessage {
     /// The earlier messages stay in the session for the user.
     #[serde(default, skip_serializing_if = "is_default")]
     pub compaction: bool,
+    /// For a summary: how many of the messages right before it it leaves
+    /// out, so the model reads them word for word after it (the latest
+    /// turns, which carry the characters' voices).
+    #[serde(default, skip_serializing_if = "is_default")]
+    pub kept: usize,
+    /// For a prompt: the other replies it got, each a run of messages as
+    /// they followed it, oldest first; the one shown follows the prompt.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub swipes: Vec<Vec<StoredMessage>>,
+    /// For a prompt with `swipes`: where the reply shown sits among them.
+    #[serde(default, skip_serializing_if = "is_default")]
+    pub swipe: usize,
     /// What a reply's tool calls changed in its story, so deleting or
     /// regenerating it can undo that.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -263,6 +318,32 @@ impl StoryChange {
             scene.clone_from(before);
         }
     }
+
+    /// Makes the change again after [`StoryChange::undo`], in `cast`,
+    /// `scene` and `memories`, except where something changed them since.
+    pub fn redo(&self, cast: &mut Vec<CastMember>, scene: &mut String, memories: &mut Vec<String>) {
+        for (before, after) in &self.cast {
+            match before {
+                Some(before) => {
+                    if let Some(member) = cast.iter_mut().find(|m| *m == before) {
+                        *member = after.clone();
+                    }
+                }
+                None if !cast.iter().any(|m| m.id == after.id) => cast.push(after.clone()),
+                None => {}
+            }
+        }
+        if let Some((before, after)) = &self.scene
+            && scene == before
+        {
+            scene.clone_from(after);
+        }
+        for memory in &self.memories {
+            if !memories.contains(memory) {
+                memories.push(memory.clone());
+            }
+        }
+    }
 }
 
 impl StoredMessage {
@@ -280,8 +361,29 @@ impl StoredMessage {
             failed: false,
             tool_calls: Vec::new(),
             compaction: false,
+            kept: 0,
+            swipes: Vec::new(),
+            swipe: 0,
             change: None,
         }
+    }
+
+    /// A prompt the user sent (not an error note).
+    #[must_use]
+    pub fn is_prompt(&self) -> bool {
+        self.role == Role::User && !self.failed
+    }
+
+    /// What this message and the replies swiped away under it cost, in USD.
+    #[must_use]
+    pub fn total_cost(&self) -> f64 {
+        self.cost + self.swipes.iter().flatten().map(Self::total_cost).sum::<f64>()
+    }
+
+    /// Tokens billed for this message and the replies swiped away under it.
+    #[must_use]
+    pub fn total_tokens(&self) -> u64 {
+        self.usage.input_tokens + self.usage.output_tokens + self.swipes.iter().flatten().map(Self::total_tokens).sum::<u64>()
     }
 }
 
@@ -308,12 +410,22 @@ pub fn unix_now() -> u64 {
     SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_secs())
 }
 
-/// A fresh, file-name-safe id for a session, world or character (the
-/// creation time in hex nanoseconds).
+/// A fresh, file-name-safe id for a session, world or character: the
+/// creation time in hex nanoseconds, made unique within the process (two ids
+/// asked for in the same tick, on a clock that ticks in microseconds, differ).
 #[must_use]
 pub fn new_id() -> String {
-    let nanos = SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_nanos());
-    format!("{nanos:x}")
+    static LAST: AtomicU64 = AtomicU64::new(0);
+    let now = SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| u64::try_from(d.as_nanos()).unwrap_or(u64::MAX));
+    let mut last = LAST.load(Ordering::Relaxed);
+    let id = loop {
+        let next = now.max(last.saturating_add(1));
+        match LAST.compare_exchange_weak(last, next, Ordering::Relaxed, Ordering::Relaxed) {
+            Ok(_) => break next,
+            Err(actual) => last = actual,
+        }
+    };
+    format!("{id:x}")
 }
 
 /// Ids become file names, so only a conservative character set is allowed.
@@ -415,7 +527,8 @@ impl SessionStore {
             if !stale {
                 continue;
             }
-            match self.load(id) {
+            // A story from a newer version is listed, though it won't open.
+            match self.read(id) {
                 Ok(session) => {
                     let summary = session.summary();
                     match known {
@@ -447,14 +560,27 @@ impl SessionStore {
         Ok((self.index.clone(), errors))
     }
 
-    /// Reads one session with all its messages.
+    /// Reads one session with all its messages, upgraded to this format.
     ///
     /// # Errors
-    /// An invalid id, a missing or unreadable file, or malformed JSON.
+    /// An invalid id, a missing or unreadable file, malformed JSON, or
+    /// [`Error::Newer`] for a session saved by a newer version of the app.
     pub fn load(&self, id: &str) -> Result<Session> {
+        let session = self.read(id)?;
+        if session.version > Session::VERSION {
+            return Err(Error::Newer { what: "story" });
+        }
+        Ok(session)
+    }
+
+    /// Reads one session whatever version wrote it, upgrading older ones.
+    fn read(&self, id: &str) -> Result<Session> {
         let mut session: Session = serde_json::from_slice(&fs::read(self.path(id)?)?)?;
         // The file name is authoritative; it is what `delete` removes.
         id.clone_into(&mut session.id);
+        if session.version <= Session::VERSION {
+            session.upgrade();
+        }
         Ok(session)
     }
 
@@ -578,12 +704,69 @@ mod tests {
         reply.usage = Usage::new(10, 5);
         reply.cost = cost;
         Session {
+            version: Session::VERSION,
             id: id.into(),
             title: format!("Title {id}"),
             updated,
             messages: vec![StoredMessage::new(Role::User, "hi".into()), reply],
             ..Session::default()
         }
+    }
+
+    #[test]
+    fn versions_upgrade_or_stay_closed() {
+        let (dir, mut store) = temp_store("versions");
+        // A story from before versions counted reviewed messages, not prompts.
+        let mut old = session("o1", 1, 0.0);
+        old.version = 0;
+        old.messages.extend([StoredMessage::new(Role::User, "again".into()), StoredMessage::new(Role::Assistant, "ok".into())]);
+        old.reviewed = 3;
+        store.save(&old).unwrap();
+        let upgraded = store.load("o1").unwrap();
+        assert_eq!((upgraded.version, upgraded.reviewed), (Session::VERSION, 2), "two prompts were read");
+
+        // One from a newer version is listed, but never opened (or saved over).
+        let mut newer = serde_json::to_value(session("n1", 2, 0.0)).unwrap();
+        newer["version"] = (Session::VERSION + 1).into();
+        newer["future_field"] = "kept".into();
+        fs::write(dir.join("n1.json"), newer.to_string()).unwrap();
+        let (listed, errors) = SessionStore::at(dir.clone()).list().unwrap();
+        assert!(errors.is_empty() && listed.iter().any(|s| s.id == "n1"));
+        assert!(matches!(store.load("n1"), Err(Error::Newer { .. })));
+        fs::remove_dir_all(dir.parent().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn swiped_replies_still_count() {
+        let mut prompt = StoredMessage::new(Role::User, "hi".into());
+        let mut old = StoredMessage::new(Role::Assistant, "first".into());
+        (old.cost, old.usage) = (0.5, Usage::new(10, 5));
+        prompt.swipes = vec![vec![old]];
+        let mut reply = StoredMessage::new(Role::Assistant, "second".into());
+        (reply.cost, reply.usage) = (0.25, Usage::new(1, 1));
+        let s = Session { messages: vec![prompt, reply], ..Session::default() };
+        assert!((s.cost() - 0.75).abs() < 1e-12);
+        assert_eq!(s.tokens(), 17);
+    }
+
+    #[test]
+    fn renames_keep_the_old_name() {
+        let (mut name, mut aliases) = ("Stranger".to_owned(), Vec::new());
+        rename(&mut name, &mut aliases, " Aragorn ");
+        assert_eq!((name.as_str(), aliases.as_slice()), ("Aragorn", ["Stranger".to_owned()].as_slice()));
+        rename(&mut name, &mut aliases, "Strider");
+        assert_eq!(aliases, ["Stranger", "Aragorn"]);
+        // Back to an old name: it is no alias any more.
+        rename(&mut name, &mut aliases, "stranger");
+        assert_eq!((name.as_str(), aliases.as_slice()), ("stranger", ["Aragorn".to_owned(), "Strider".to_owned()].as_slice()));
+        rename(&mut name, &mut aliases, "  ");
+        assert_eq!(name, "stranger", "never nameless");
+    }
+
+    #[test]
+    fn ids_never_repeat() {
+        let ids: HashSet<String> = (0..1000).map(|_| new_id()).collect();
+        assert_eq!(ids.len(), 1000);
     }
 
     #[test]
@@ -594,7 +777,7 @@ mod tests {
         let (old, mut new) = (session("a1", 1, 0.5), session("b2", 2, 0.25));
         new.world = Some("w1".into());
         new.cast = vec![CastMember { id: "c1".into(), name: "Katniss".into(), present: true, ..CastMember::default() }];
-        new.player = Some(Player { name: "Gale".into(), description: "A hunter.".into() });
+        new.player = Some(Player { name: "Gale".into(), description: "A hunter.".into(), ..Player::default() });
         store.save(&old).unwrap();
         store.save(&new).unwrap();
         fs::write(dir.join("broken.json"), "{").unwrap();
@@ -705,6 +888,15 @@ mod tests {
         change.undo(&mut edited, &mut scene, &mut memories);
         assert_eq!((edited, scene.as_str()), (vec![member("a", true), member("b", false), member("c", false)], "Night."));
         assert_eq!(memories, ["Old."]);
+
+        // Redone (a swipe back to the reply), it applies again over what it undid.
+        let (mut redone, mut scene, mut memories) = (cast.clone(), String::new(), vec!["Old.".to_owned()]);
+        change.redo(&mut redone, &mut scene, &mut memories);
+        assert_eq!((redone, scene.as_str(), memories), (after.clone(), "Dusk.", vec!["Old.".to_owned(), "b owes a.".to_owned()]));
+        // Not over what someone changed since.
+        let (mut moved, mut scene) = (vec![member("a", true), member("b", true)], "Noon.".to_owned());
+        change.redo(&mut moved, &mut scene, &mut Vec::new());
+        assert_eq!((moved.len(), scene.as_str()), (3, "Noon."), "c joins; b was moved in by hand already; the scene stays");
 
         let mut message = StoredMessage::new(Role::Assistant, String::new());
         message.change = Some(change);

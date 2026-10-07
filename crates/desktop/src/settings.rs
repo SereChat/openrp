@@ -1,9 +1,10 @@
-//! Settings page: appearance, chat, usage, data and account.
+//! Settings page: appearance, chat, models, usage, data and account.
 
 use crate::app::Action;
 use crate::chat::{ReasoningView, format_cost, group_digits};
 use crate::paint::{Painter, Rect, fade, mix};
 use crate::text::{Align, Style};
+use crate::ui::chevron;
 use crate::theme::{self, Palette, Scheme};
 use crate::ui::{ButtonStyle, Ui, button, id, keycap};
 
@@ -30,16 +31,18 @@ pub struct Totals {
 enum Tab {
     #[default]
     Appearance,
+    Models,
     Usage,
     Account,
 }
 
 impl Tab {
-    const ALL: [Self; 3] = [Self::Appearance, Self::Usage, Self::Account];
+    const ALL: [Self; 4] = [Self::Appearance, Self::Models, Self::Usage, Self::Account];
 
     fn label(self) -> &'static str {
         match self {
             Self::Appearance => "Appearance",
+            Self::Models => "Models",
             Self::Usage => "Usage",
             Self::Account => "Account",
         }
@@ -57,6 +60,8 @@ pub struct SettingsView {
 
 impl SettingsView {
     /// Draws the page into `area` (the whole main area, header included).
+    /// `utility` names the background model. Returns where its button is
+    /// when it was clicked, to open the model menu there.
     #[allow(clippy::too_many_arguments, reason = "one argument per setting shown; a struct would only rename them")]
     pub fn draw(
         &mut self,
@@ -65,9 +70,10 @@ impl SettingsView {
         area: Rect,
         scheme: Scheme,
         reasoning: ReasoningView,
+        utility: &str,
         totals: Totals,
         actions: &mut Vec<Action>,
-    ) {
+    ) -> Option<Rect> {
         let t = p.theme;
         let bar = Rect::new(area.x, area.y, area.w, theme::HEADER_HEIGHT);
         p.rect(Rect::new(bar.x, bar.bottom() - 1.0, bar.w, 1.0), t.border, 0.0);
@@ -97,6 +103,7 @@ impl SettingsView {
         let mut y = top;
         // Theme cards and usage stats share a three-column grid.
         let card_w = ((width - 24.0) / 3.0).floor();
+        let mut pick_utility = None;
 
         match self.tab {
             Tab::Appearance => {
@@ -120,6 +127,24 @@ impl SettingsView {
                     actions.push(Action::SetReasoningView(ReasoningView::ALL[choice]));
                 }
                 y += ROW_H;
+            }
+            Tab::Models => {
+                y = section(p, x, y, "Models", "The story's model is picked under the message box.");
+                let row = group(p, x, y, width);
+                setting_row(p, row, "Background model", "Writes memory reviews, summaries and generated characters.");
+                let picker = control(row, 220.0);
+                if dropdown(p, ui, picker, utility) {
+                    pick_utility = Some(picker);
+                }
+                y += ROW_H + 12.0;
+                let tip = p.layout(
+                    "A cheaper model here saves money: it never writes the story itself. Summaries use the story's model when this \
+                     one holds less context.",
+                    theme::SMALL,
+                    Some(width),
+                );
+                p.text(&tip, x, y, t.text_faint);
+                y += tip.height();
             }
             Tab::Usage => {
                 y = section(p, x, y, "Usage", "Totals across every session saved on this device.");
@@ -162,7 +187,25 @@ impl SettingsView {
         p.set_clip(clip);
         ui.blocker = None;
         self.content_h = y - top + 64.0;
+        pick_utility
     }
+}
+
+/// A button showing `label` with a chevron, for opening a menu. Returns
+/// whether it was clicked.
+fn dropdown(p: &mut Painter, ui: &mut Ui, rect: Rect, label: &str) -> bool {
+    let t = p.theme;
+    let hovered = ui.hovered(rect);
+    let hover = ui.anim(id(("dropdown", rect.y.to_bits())), f32::from(u8::from(hovered)));
+    p.bordered(rect, mix(t.surface, t.hover, hover), theme::RADIUS_SM, 1.0, t.border_strong);
+    let mut text = p.layout(label, theme::LABEL, None);
+    text.truncate(p.fonts, rect.w - 40.0);
+    p.text(&text, rect.x + 12.0, rect.y + (rect.h - text.height()) * 0.5, t.text);
+    chevron(p, rect.right() - 20.0, rect.y + rect.h * 0.5 - 2.0, true, t.text_muted);
+    if hovered {
+        ui.cursor = winit::window::CursorIcon::Pointer;
+    }
+    ui.clicked(rect)
 }
 
 /// The tab strip in the header, starting at `x`; the open tab is underlined

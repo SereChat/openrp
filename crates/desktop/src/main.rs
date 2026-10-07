@@ -19,6 +19,7 @@ mod gpu;
 mod highlight;
 mod image;
 mod library;
+mod log;
 mod login;
 mod markdown;
 mod paint;
@@ -84,25 +85,47 @@ impl ApplicationHandler<WorkerEvent> for Handler {
             event_loop.set_control_flow(app.control_flow());
         }
     }
+
+    fn exiting(&mut self, _: &ActiveEventLoop) {
+        // On macOS, quitting from the menu (Cmd+Q) exits the process right
+        // after this, so `run_app` never returns: drop the app here, which
+        // finishes its queue of file writes.
+        self.app = None;
+    }
+}
+
+/// Name of the lock file in `~/.openrp/` that keeps a second copy away.
+const LOCK_FILE: &str = "desktop.lock";
+
+/// Tells the user why the app cannot run, in a dialog and the log.
+fn fail(message: &str) -> ExitCode {
+    log::error(message);
+    platform::alert("OpenRP cannot start", message);
+    ExitCode::FAILURE
 }
 
 fn main() -> ExitCode {
+    log::init();
+    // Two copies would write the same files over each other.
+    let _lock = match serechat::lock_instance(LOCK_FILE) {
+        Ok(Some(lock)) => Some(lock),
+        Ok(None) => return fail("OpenRP is already running. Switch to its window, or close it before starting it again."),
+        Err(e) => {
+            log::error(format!("cannot take the instance lock, running without it: {e}"));
+            None
+        }
+    };
     let event_loop = match EventLoop::<WorkerEvent>::with_user_event().build() {
         Ok(event_loop) => event_loop,
-        Err(e) => {
-            eprintln!("openrp: cannot start the event loop: {e}");
-            return ExitCode::FAILURE;
-        }
+        Err(e) => return fail(&format!("The window system could not be started: {e}")),
     };
     let mut handler = Handler { app: None, proxy: event_loop.create_proxy(), error: None };
     let result = event_loop.run_app(&mut handler);
     if let Err(e) = result {
-        eprintln!("openrp: event loop failed: {e}");
-        return ExitCode::FAILURE;
+        return fail(&format!("The window system stopped unexpectedly: {e}"));
     }
     if let Some(e) = handler.error {
-        eprintln!("openrp: {e}");
-        return ExitCode::FAILURE;
+        return fail(&format!("OpenRP could not open its window: {e}. Updating your graphics driver may help."));
     }
     ExitCode::SUCCESS
 }

@@ -69,6 +69,48 @@ pub fn open_folder(path: &Path) -> io::Result<()> {
     launch(command)
 }
 
+/// Shows a native error dialog with `title` and `message` and waits until
+/// the user closes it. For failures the window cannot show (it failed to
+/// start, or the app is crashing); safe from any thread. Does nothing where
+/// no dialog helper is installed.
+pub fn alert(title: &str, message: &str) {
+    #[cfg(target_os = "windows")]
+    {
+        // `MessageBoxW` from user32, which every Windows GUI process loads.
+        #[link(name = "user32")]
+        unsafe extern "system" {
+            fn MessageBoxW(owner: *mut std::ffi::c_void, text: *const u16, caption: *const u16, kind: u32) -> i32;
+        }
+        /// `MB_ICONERROR | MB_SETFOREGROUND | MB_TOPMOST`.
+        const KIND: u32 = 0x10 | 0x1_0000 | 0x4_0000;
+        let wide = |s: &str| s.encode_utf16().filter(|&c| c != 0).chain([0]).collect::<Vec<u16>>();
+        let (text, caption) = (wide(message), wide(title));
+        // SAFETY: both strings are NUL-terminated UTF-16 that outlive the
+        // call, and a null owner is allowed.
+        unsafe {
+            MessageBoxW(std::ptr::null_mut(), text.as_ptr(), caption.as_ptr(), KIND);
+        }
+    }
+    #[cfg(target_os = "macos")]
+    {
+        // The text goes in as arguments, never into the script itself.
+        let mut command = Command::new("osascript");
+        command.args(["-e", "on run argv", "-e", "display alert (item 1 of argv) message (item 2 of argv) as critical", "-e", "end run", title, message]);
+        let _ = command.stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null()).status();
+    }
+    #[cfg(all(unix, not(target_os = "macos")))]
+    {
+        let mut zenity = Command::new("zenity");
+        zenity.args(["--error", "--no-markup", "--title", title, "--text", message]);
+        let shown = zenity.stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null()).status().is_ok();
+        if !shown {
+            let mut kdialog = Command::new("kdialog");
+            kdialog.args(["--title", title, "--error", message]);
+            let _ = kdialog.stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null()).status();
+        }
+    }
+}
+
 /// Runs a picker helper and returns the non-empty lines it printed.
 fn run_picker(mut command: Command) -> io::Result<Vec<String>> {
     let output = no_window(&mut command).stdin(Stdio::null()).stderr(Stdio::null()).output()?;

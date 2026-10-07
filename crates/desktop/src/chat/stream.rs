@@ -10,10 +10,18 @@
 //! request reads the latest turns and adds what the story must not forget to
 //! its memories.
 //!
+//! The system prompt holds what rarely changes (the rules, the world, who the
+//! user plays and the whole cast), so providers can cache it with the
+//! history after it; the story state that changes every turn (the scene, who
+//! is in it, memories, the author's note) rides on the latest message only
+//! and is never saved (see [`story_state`]).
+//!
 //! Failures: dropped or silent connections, rate limits and server errors are
-//! retried after [`RETRY_DELAYS`]. A conversation whose last request used more
-//! than [`compact_limit`] tokens, or that the server rejects as too long, is
-//! first replaced (for the model only) by a summary the model writes.
+//! retried after [`RETRY_DELAYS`] (or as long as the server asks). A
+//! conversation whose last request used more than [`compact_limit`] tokens,
+//! or that the server rejects as too long, is first replaced (for the model
+//! only) by a summary the model writes; the latest turns stay word for word
+//! after it (see [`summary_cut`]).
 //!
 //! Every change is saved, so a reply interrupted by a crash, a restart or the
 //! user shows a Continue button (see [`Conversation::resumable`]).
@@ -24,11 +32,12 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use serechat::{
-    Completion, Error, InputItem, Role, StoredMessage, StoryChange, StreamEvent, ToolCall, ToolChoice, ToolResult, Usage, new_id, unix_now,
+    CastMember, Completion, Error, InputItem, Player, Role, StoredMessage, StoryChange, StreamEvent, ToolCall, ToolChoice, ToolResult, Usage, new_id,
+    unix_now,
 };
 
 use super::tools;
-use super::{Chat, Conversation, Entry, Load, Reasoning, StreamingCall};
+use super::{Chat, Conversation, Entry, Load, StreamingCall};
 use crate::app::Action;
 use crate::library::Kind;
 
@@ -41,6 +50,14 @@ const REVIEW_EVERY: usize = 8;
 /// Most characters of the latest turns a review reads. A story that was
 /// never reviewed (one from before reviews) is read from its end.
 const REVIEW_CHARS: usize = 40_000;
+/// A review this slow is given up; its turns are read again next time.
+const REVIEW_TIMEOUT: Duration = Duration::from_secs(180);
+/// Turns before the latest kept word for word after a summary, within
+/// [`keep_budget`].
+const KEEP_TURNS: usize = 3;
+/// The error code of a story reply that wrote text instead of calling its
+/// tools: it is retried once, then shown.
+const NO_TOOL_CALL: &str = "no_tool_call";
 
 /// Wait before each retry of a failed request; one retry per entry.
 const RETRY_DELAYS: [Duration; 5] =
@@ -62,6 +79,8 @@ const PLAIN_CHAT: &str = "You are OpenRP, a helpful AI assistant in a desktop ap
 const ROLEPLAY: &str = "You play every character in an interactive roleplay story except the user's own. There is no narrator: \
     the story is told only through the characters, by what they say and do. Stay true to the world's premise, rules and tone, and \
     keep each character consistent with their description.\n\n\
+    The latest message ends with the story state: the scene, who is in it, who is elsewhere, what the story must not forget and \
+    the user's author's note. The app writes it, not the user, and it is always current: trust it over older turns.\n\n\
     How to reply:\n\
     - Every reply is one speak call. Write nothing outside tool calls: there is no narration, ever. Never describe events, \
     surroundings or the passing of time in your own voice; the scene field holds the place and its ambiance, and everything \
@@ -77,6 +96,8 @@ const ROLEPLAY: &str = "You play every character in an interactive roleplay stor
     with a description, in the same call as their first lines. Never add bystanders, newcomers or interruptions on your own.\n\
     - A cast member elsewhere acts only when the user brings them in; they are then moved into the scene. Use create_character \
     only for someone the user refers to who does not act yet.\n\
+    - Call every character by their name in the cast. When the story changes someone for good (they reveal their real name, \
+    take a new one, or their role or appearance changes), call update_character.\n\
     - Keep track of the scene: where the characters are and what it is like there. When it is not set yet, or it changes (the \
     user goes somewhere, time passes, the mood or weather turns), set speak's scene to the place and its ambiance; otherwise \
     leave it empty. Cast members who stay behind or walk off go in speak's leave.\n\
@@ -86,16 +107,19 @@ const ROLEPLAY: &str = "You play every character in an interactive roleplay stor
     character speaking or acting. Follow it in this reply.\n\
     - Follow the author's note, if there is one, in every reply.\n\
     - Never speak, act or decide for the user's character. End where the user can respond.";
-/// Opens the memories section of a story's prompt.
+/// Opens the cast section of a story's prompt.
+const CAST: &str = "The characters you play. The story state says which of them are in the scene now.";
+/// Opens the story state sent with the latest message.
+const STATE: &str = "[Story state, kept by the app: not part of the user's message]";
+/// Opens the memories section of the story state.
 const MEMORIES: &str = "Facts this story must not forget, kept with remember. They hold even when the conversation above no longer shows them.";
-/// Opens the author's note section of a story's prompt.
+/// Opens the author's note section of the story state.
 const NOTE: &str = "The user's guidance for the whole story. Follow it in every reply.";
 /// Introduces an out-of-character instruction sent with a user message.
 const OOC: &str = "(OOC: the user's instruction for this reply, not something their character says or does.)";
 /// Opens the list of cast members away from the scene.
-const ELSEWHERE: &str = "These characters belong to the story but are not in the current scene. They may be mentioned, but do not \
-    have them act here unless the user brings them in; once they are in the scene, their description follows. Until then, keep \
-    them consistent with what the story has shown of them.";
+const ELSEWHERE: &str = "Part of the story, but not in the current scene. They may be mentioned, but do not have them act here unless the \
+    user brings them in.";
 /// Stands in for the description of a character who has none.
 const UNDESCRIBED: &str = "(Not described yet: keep them consistent with what they have said and done so far.)";
 /// Added when nobody is in the scene: the first thing to do is cast someone.
@@ -103,64 +127,79 @@ const NOBODY_HERE: &str = "No one is in the scene yet. Introduce who the user me
     description, and have them act in its lines: the characters the user's message names or refers to, or, if it names no one, \
     the one character the moment most needs.";
 
-/// The system prompt of a story in `world`, played by `player`, with the
-/// characters `present` in the scene (name and description) and the names
-/// of those `absent` from it, its `memories`, in `scene` (empty until the
-/// model sets it), with the user's author's `note` last. `None` for a
-/// plain chat. It changes only when the story's setup, memories or scene
-/// do, so the provider can cache it.
-pub(super) fn story_prompt(
-    world: Option<(&str, &str)>,
-    player: Option<(&str, &str)>,
-    present: &[(&str, &str)],
-    absent: &[&str],
-    memories: &[String],
-    scene: &str,
-    note: &str,
-) -> String {
+/// `(Formerly called …)` for someone with former `aliases`; empty without.
+fn formerly(aliases: &[String]) -> String {
+    if aliases.is_empty() { String::new() } else { format!("(Formerly called {}; they are the same person.)\n\n", aliases.join(", ")) }
+}
+
+/// The system prompt of a story in `world` (name and description), played
+/// by `player`, with this `cast`; `None` for a plain chat. It holds only
+/// what rarely changes, so providers can cache it: who is in the scene,
+/// memories and the note go in [`story_state`].
+pub(super) fn story_prompt(world: Option<(&str, &str)>, player: Option<&Player>, cast: &[CastMember]) -> String {
     let Some((name, description)) = world else {
         return PLAIN_CHAT.to_owned();
     };
     let mut prompt = format!("{ROLEPLAY}\n\n# World: {name}\n\n{description}");
-    if let Some((name, description)) = player {
-        let _ = write!(prompt, "\n\n# The user's character: {name}\n\n{description}");
+    if let Some(player) = player {
+        let _ = write!(prompt, "\n\n# The user's character: {}\n\n{}{}", player.name, formerly(&player.aliases), player.description);
     }
-    if !present.is_empty() {
-        prompt.push_str("\n\n# Characters in the scene\n\nThese characters are here now; you play them.");
-        for (name, description) in present {
+    if !cast.is_empty() {
+        let _ = write!(prompt, "\n\n# Cast\n\n{CAST}");
+        for member in cast {
             // Someone who joined by speaking has no description yet.
-            let description = if description.trim().is_empty() { UNDESCRIBED } else { description };
-            let _ = write!(prompt, "\n\n## {name}\n\n{description}");
+            let description = if member.description.trim().is_empty() { UNDESCRIBED } else { &member.description };
+            let _ = write!(prompt, "\n\n## {}\n\n{}{description}", member.name, formerly(&member.aliases));
         }
     }
-    // Names only: descriptions cost tokens and pull absent people into the scene.
+    prompt.trim_end().to_owned()
+}
+
+/// What a story is like right now, sent after the latest message: the
+/// `scene`, who of the `cast` is in it and who is elsewhere, the `memories`
+/// and the author's `note`, which weighs most there, at the end.
+pub(super) fn story_state(cast: &[CastMember], memories: &[String], scene: &str, note: &str) -> String {
+    let mut state = STATE.to_owned();
+    let scene = scene.trim();
+    let _ = write!(state, "\n\n# The scene\n\n{}", if scene.is_empty() { "Not set yet: set it in your speak call." } else { scene });
+    let present: Vec<&str> = cast.iter().filter(|m| m.present).map(|m| m.name.as_str()).collect();
+    if present.is_empty() {
+        let _ = write!(state, "\n\n# In the scene\n\n{NOBODY_HERE}");
+    } else {
+        let _ = write!(state, "\n\n# In the scene\n\n{}", present.join(", "));
+    }
+    let absent: Vec<&str> = cast.iter().filter(|m| !m.present).map(|m| m.name.as_str()).collect();
     if !absent.is_empty() {
-        let _ = write!(prompt, "\n\n# Characters elsewhere\n\n{ELSEWHERE}\n");
-        for name in absent {
-            let _ = write!(prompt, "\n- {name}");
-        }
+        let _ = write!(state, "\n\n# Elsewhere\n\n{ELSEWHERE} {}", absent.join(", "));
     }
     if !memories.is_empty() {
-        let _ = write!(prompt, "\n\n# Memories\n\n{MEMORIES}\n");
+        let _ = write!(state, "\n\n# Memories\n\n{MEMORIES}\n");
         for memory in memories {
-            let _ = write!(prompt, "\n- {memory}");
-        }
-    }
-    let scene = scene.trim();
-    if !scene.is_empty() || present.is_empty() {
-        prompt.push_str("\n\n# The scene");
-        if !scene.is_empty() {
-            let _ = write!(prompt, "\n\n{scene}");
-        }
-        if present.is_empty() {
-            let _ = write!(prompt, "\n\n{NOBODY_HERE}");
+            let _ = write!(state, "\n- {memory}");
         }
     }
     let note = note.trim();
     if !note.is_empty() {
-        let _ = write!(prompt, "\n\n# Author's note\n\n{NOTE}\n\n{note}");
+        let _ = write!(state, "\n\n# Author's note\n\n{NOTE}\n\n{note}");
     }
-    prompt
+    state
+}
+
+/// Adds the story `state` to the end of what the model reads last: the
+/// latest prompt, or the result of the latest call when a reply carries on
+/// by itself (so turns keep alternating, as some models require).
+pub fn attach_state(items: &mut Vec<InputItem>, state: &str) {
+    match items.last_mut() {
+        Some(InputItem::Message { role: Role::User, text }) => {
+            text.push_str("\n\n");
+            text.push_str(state);
+        }
+        Some(InputItem::ToolOutput { output, .. }) => {
+            output.push_str("\n\n");
+            output.push_str(state);
+        }
+        _ => items.push(InputItem::text(Role::User, state)),
+    }
 }
 
 /// A user message as the model reads it: what their character says and
@@ -177,6 +216,13 @@ const COMPACT_PROMPT: &str = "The conversation is about to exceed the context wi
     summary that you write now; the next turn sees only the summary. Write it as a handoff to yourself: the user's requests and \
     constraints (quote them where the wording matters); key facts, events and decisions so far; open threads; and where things \
     stand now. Be specific: names, places, details. Reply with the summary only.";
+/// Asks for the summary that replaces a story's earlier turns.
+const COMPACT_STORY: &str = "The story is about to outgrow the context window, so the turns above will be replaced by a summary \
+    that you write now (the latest turns stay word for word after it). Write it for yourself, to carry on the roleplay as if you \
+    remembered everything: what happened, in order, with names, places and details; where each character stands now (what they \
+    know, want and feel, their relationships, injuries and belongings); how each of them speaks; promises, secrets and open \
+    threads; and where the scene is. Leave out what the memories already hold. Reply with the summary only, as plain text: call \
+    no tools.";
 /// Introduces a summary when it is sent in place of the history.
 const SUMMARY_INTRO: &str = "Earlier messages were replaced by this summary to fit the context window. Continue from where it leaves off.";
 
@@ -198,6 +244,8 @@ pub(super) struct ActiveStream {
     pub incomplete: Option<String>,
     /// What the server billed for it if it failed.
     pub charged: Usage,
+    /// A story reply wrote text outside its calls (dropped: no narration).
+    pub wrote_text: bool,
 }
 
 /// A failed request waiting to be sent again.
@@ -226,12 +274,26 @@ pub struct SendJob {
     pub instructions: String,
     /// Conversation so far.
     pub history: Vec<StoredMessage>,
+    /// The story state, sent after the latest message; `None` outside a story.
+    pub state: Option<String>,
     /// Offer the story's tools (stories do; plain chats don't).
     pub tools: bool,
     /// `tool_choice`, or `None` to let the model decide.
     pub tool_choice: Option<ToolChoice<'static>>,
     /// Raised to abort the stream.
     pub cancel: Arc<AtomicBool>,
+}
+
+impl SendJob {
+    /// The request's input: the history, with the story state after it.
+    #[must_use]
+    pub fn input(&self) -> Vec<InputItem> {
+        let mut items = input_items(&self.history);
+        if let Some(state) = &self.state {
+            attach_state(&mut items, state);
+        }
+        items
+    }
 }
 
 /// Everything a worker thread needs to review a story's memories.
@@ -248,17 +310,40 @@ pub struct ReviewJob {
     pub instructions: String,
     /// The latest turns, as plain text.
     pub transcript: String,
+    /// Raised to give up on the review.
+    pub cancel: Arc<AtomicBool>,
 }
 
-/// Converts saved messages into API input, starting at the latest summary.
-/// A reply's tool calls follow its text, each with its result.
+/// A memory review on its way.
+pub(super) struct Review {
+    /// Its request id.
+    pub request: u64,
+    /// The model reviewing, for pricing it.
+    pub model: String,
+    /// Raised to give up on it.
+    pub cancel: Arc<AtomicBool>,
+    /// When it is given up.
+    pub deadline: Instant,
+    /// The prompts reviewed before it, restored if it fails.
+    pub before: usize,
+}
+
+/// Converts saved messages into API input, starting at the latest summary
+/// and the turns it kept word for word. A reply's tool calls follow its
+/// text, each with its result.
 #[must_use]
 pub fn input_items(history: &[StoredMessage]) -> Vec<InputItem> {
-    let start = history.iter().rposition(is_summary).unwrap_or(0);
-    let mut items = Vec::with_capacity(history.len() - start);
-    for message in history[start..].iter().filter(|m| !m.failed) {
+    let (summary, kept, after) = match history.iter().rposition(is_summary) {
+        Some(at) => (Some(&history[at]), &history[at - history[at].kept.min(at)..at], &history[at + 1..]),
+        None => (None, &history[..0], history),
+    };
+    let mut items = Vec::with_capacity(kept.len() + after.len() + 1);
+    // The summary first, then the turns it kept, then what came after.
+    if let Some(summary) = summary {
+        items.push(InputItem::text(Role::User, format!("{SUMMARY_INTRO}\n\n{}", summary.content)));
+    }
+    for message in kept.iter().chain(after).filter(|m| !m.failed) {
         if message.compaction {
-            items.push(InputItem::text(Role::User, format!("{SUMMARY_INTRO}\n\n{}", message.content)));
             continue;
         }
         if message.role == Role::User {
@@ -274,8 +359,17 @@ pub fn input_items(history: &[StoredMessage]) -> Vec<InputItem> {
     items
 }
 
+/// Where a memory review starts reading: the first entry after the first
+/// `read` prompts of `entries` and their replies.
+pub(super) fn first_unread(entries: &[Entry], read: usize) -> usize {
+    if read == 0 {
+        return 0;
+    }
+    entries.iter().enumerate().filter(|(_, e)| e.message.is_prompt()).nth(read).map_or(entries.len(), |(i, _)| i)
+}
+
 /// A finished summary, which the model's view of the conversation starts from.
-fn is_summary(message: &StoredMessage) -> bool {
+pub(super) fn is_summary(message: &StoredMessage) -> bool {
     message.compaction && !message.failed && !message.content.is_empty()
 }
 
@@ -294,6 +388,45 @@ fn context_used(entries: &[Entry]) -> u64 {
 fn compact_limit(window: u64) -> u64 {
     let window = if window == 0 { DEFAULT_WINDOW } else { window };
     (window / 4 * 3).min(MAX_CONTEXT)
+}
+
+/// Characters of latest turns a summary may keep word for word under a
+/// compaction `limit`: a quarter of it, at about four characters a token.
+fn keep_budget(limit: u64) -> usize {
+    usize::try_from(limit).unwrap_or(usize::MAX)
+}
+
+/// Characters a message sends the model (its text, calls and results).
+fn size(messages: &[StoredMessage]) -> usize {
+    let calls = |m: &StoredMessage| m.tool_calls.iter().map(|r| r.call.arguments.len() + r.output.len()).sum::<usize>();
+    messages.iter().filter(|m| !m.failed).map(|m| m.content.len() + calls(m)).sum()
+}
+
+/// Where a summary written now, before `history[at]`, stops: the start of
+/// the turns it leaves word for word after it. A turn still under way (no
+/// new prompt at `at`) is kept whole; up to [`KEEP_TURNS`] turns before it
+/// join while they fit in `budget` characters, never reaching back past
+/// the previous summary. Something is always left to summarise.
+fn summary_cut(history: &[StoredMessage], at: usize, budget: usize) -> usize {
+    let floor = history[..at].iter().rposition(is_summary).map_or(0, |s| s + 1);
+    let prompts: Vec<usize> = (floor..at).filter(|&i| history[i].is_prompt()).collect();
+    let under_way = !history.get(at).is_some_and(StoredMessage::is_prompt);
+    let mandatory = if under_way { prompts.last().copied().unwrap_or(at) } else { at };
+    let (mut cut, mut used) = (mandatory, 0);
+    for &start in prompts.iter().rev().filter(|&&p| p < mandatory).take(KEEP_TURNS) {
+        used += size(&history[start..cut]);
+        if used > budget {
+            break;
+        }
+        cut = start;
+    }
+    // Without an earlier summary, the summary needs messages of its own:
+    // give up kept turns, oldest first, until it has some.
+    let summarises = |cut: usize| floor > 0 || history[..cut].iter().any(|m| !m.failed);
+    if !summarises(cut) {
+        cut = prompts.iter().copied().find(|&p| p > cut && p <= mandatory && summarises(p)).unwrap_or(at);
+    }
+    cut
 }
 
 impl Entry {
@@ -341,20 +474,20 @@ impl Chat {
     /// Has the model add what the latest turns taught the story to its
     /// memories, when [`REVIEW_EVERY`] prompts went by since the last time
     /// or `force`d (and there is a prompt to read). The request runs apart
-    /// from the story: the user can carry on, and a failed one is not
-    /// retried until the next review is due.
+    /// from the story: the user can carry on. A review that fails or takes
+    /// longer than [`REVIEW_TIMEOUT`] leaves its turns for the next one.
     pub(super) fn review_memories(&mut self, id: u64, force: bool, actions: &mut Vec<Action>) {
         let request = self.next_id();
-        let reasoning = Some(self.reasoning_in_use()).filter(|r| *r != Reasoning::Auto).map(Reasoning::key);
+        let (model, reasoning) = self.side_model();
         let Some(conversation) = self.conversations.iter().find(|c| c.id == id) else {
             return;
         };
         if conversation.world.is_none() || conversation.load != Load::Loaded || conversation.reviewing.is_some() {
             return;
         }
-        let from = conversation.reviewed.min(conversation.entries.len());
+        let from = first_unread(&conversation.entries, conversation.reviewed);
         let unread: Vec<StoredMessage> = conversation.entries[from..].iter().map(|e| e.message.clone()).collect();
-        let prompts = unread.iter().filter(|m| m.role == Role::User && !m.failed).count();
+        let prompts = unread.iter().filter(|m| m.is_prompt()).count();
         if prompts == 0 || (!force && prompts < REVIEW_EVERY) {
             return;
         }
@@ -363,29 +496,33 @@ impl Chat {
         let player = conversation.player.as_ref().map_or("The user", |p| p.name.as_str());
         let transcript = tools::transcript(&unread, player, REVIEW_CHARS);
         let instructions = tools::reviewer_prompt(world, conversation.player.as_ref().map(|p| p.name.as_str()), &cast, &conversation.memories);
-        let job = ReviewJob { conversation: id, request, model: self.model.clone(), reasoning, instructions, transcript };
+        let cancel = Arc::new(AtomicBool::new(false));
+        let job = ReviewJob { conversation: id, request, model: model.clone(), reasoning, instructions, transcript, cancel: Arc::clone(&cancel) };
         if let Some(conversation) = self.find(id) {
-            conversation.reviewed = conversation.entries.len();
-            conversation.reviewing = Some((request, job.model.clone()));
+            let before = conversation.reviewed;
+            conversation.reviewed = before + prompts;
+            conversation.reviewing = Some(Review { request, model, cancel, deadline: Instant::now() + REVIEW_TIMEOUT, before });
             actions.push(Action::ReviewMemories(job));
         }
     }
 
     /// The review of `request` answered: what it found joins the story's
     /// memories (once each), and the request is billed with its next reply.
-    /// An answer for a story deleted, or reviewed again since, is dropped.
+    /// A failed one leaves its turns for the next review. An answer for a
+    /// story deleted, or given up on since, is dropped.
     pub fn memories_reviewed(&mut self, conversation: u64, request: u64, result: Result<(Option<ToolCall>, Usage), Error>, actions: &mut Vec<Action>) {
-        let Some(index) = self.conversations.iter().position(|c| c.id == conversation && c.reviewing.as_ref().is_some_and(|(r, _)| *r == request)) else {
+        let waiting = |c: &Conversation| c.id == conversation && c.reviewing.as_ref().is_some_and(|r| r.request == request);
+        let Some(index) = self.conversations.iter().position(waiting) else {
             return;
         };
-        let Some((_, model)) = self.conversations[index].reviewing.take() else {
+        let Some(review) = self.conversations[index].reviewing.take() else {
             return;
         };
-        // The user keeps their memories as they are when it failed.
         let Ok((call, usage)) = result else {
+            self.conversations[index].reviewed = review.before;
             return;
         };
-        let cost = self.models.iter().find(|m| m.id == model).map_or(0.0, |m| m.cost(usage));
+        let cost = self.models.iter().find(|m| m.id == review.model).map_or(0.0, |m| m.cost(usage));
         let conversation = &mut self.conversations[index];
         conversation.carried_cost += cost;
         if let Some(call) = call.filter(|c| c.name == tools::REMEMBER) {
@@ -400,9 +537,12 @@ impl Chat {
     /// counts the retries already spent on it.
     fn start_request(&mut self, id: u64, compaction: bool, attempt: usize, actions: &mut Vec<Action>) {
         let (entry_id, stream_id) = (self.next_id(), self.next_id());
-        let model = self.model.clone();
-        let reasoning = Some(self.reasoning_in_use()).filter(|r| *r != Reasoning::Auto).map(Reasoning::key);
+        // A summary is side work, for the background model if it can hold
+        // as much as the story's.
+        let (model, reasoning) = if compaction { self.summary_model() } else { (self.model.clone(), self.reasoning_key()) };
         let instructions = self.instructions(id);
+        let state = self.state(id);
+        let budget = keep_budget(compact_limit(self.context_window()));
         let Some(conversation) = self.find(id) else {
             return;
         };
@@ -413,12 +553,16 @@ impl Chat {
         let mut at = history.len();
         if compaction {
             message.compaction = true;
-            // A prompt sent just now stays word for word after the summary.
-            if history.last().is_some_and(|m| m.role == Role::User && !m.failed) {
+            // A prompt sent just now stays word for word after the summary,
+            // and so do the latest turns before it.
+            if history.last().is_some_and(StoredMessage::is_prompt) {
                 at -= 1;
-                history.truncate(at);
             }
-            history.push(StoredMessage::new(Role::User, COMPACT_PROMPT.to_owned()));
+            let cut = summary_cut(&history, at, budget);
+            message.kept = at - cut;
+            history.truncate(cut);
+            let ask = if conversation.world.is_some() { COMPACT_STORY } else { COMPACT_PROMPT };
+            history.push(StoredMessage::new(Role::User, ask.to_owned()));
         }
         conversation.entries.insert(at, Entry::new(entry_id, message));
         let cancel = Arc::new(AtomicBool::new(false));
@@ -433,6 +577,7 @@ impl Chat {
             last_event: now,
             incomplete: None,
             charged: Usage::default(),
+            wrote_text: false,
         });
         actions.push(Action::SaveSession(conversation.to_session()));
         let job = SendJob {
@@ -442,6 +587,7 @@ impl Chat {
             reasoning,
             instructions,
             history,
+            state,
             tools: conversation.world.is_some(),
             // A story is told only through its characters, so a reply must
             // call a tool, and a repair must describe who acted undescribed;
@@ -498,7 +644,7 @@ impl Chat {
             StreamEvent::Charged(usage) => stream.charged = usage,
             // A story has no narrator: what its replies write outside their
             // calls is dropped. A summary is text, though.
-            StreamEvent::Text(_) if story && !message.compaction => {}
+            StreamEvent::Text(delta) if story && !message.compaction => stream.wrote_text |= !delta.trim().is_empty(),
             StreamEvent::Text(delta) => {
                 // Models often open with blank lines; don't render them.
                 let delta = if message.content.is_empty() { delta.trim_start() } else { &delta };
@@ -554,6 +700,12 @@ impl Chat {
         let failure = |code: &str, message: &str| Err(Error::Response { code: Some(code.to_owned()), message: message.to_owned() });
         let result = match (result, active.incomplete.as_deref()) {
             (Ok(true), incomplete) if message.content.is_empty() && message.tool_calls.is_empty() => match incomplete {
+                // It wrote, but not through the characters: tried once more.
+                None if active.wrote_text => failure(
+                    NO_TOOL_CALL,
+                    "The model answered in plain text instead of through the characters, so there is nothing to show. Some models \
+                     don't follow the story's tools reliably: try again, or pick another model.",
+                ),
                 None => failure("server_error", "The model returned an empty response."),
                 Some("max_output_tokens") => failure("incomplete", "The reply reached the model's output limit before it said anything."),
                 Some(reason) => failure("incomplete", &format!("The provider stopped the reply early ({reason}).")),
@@ -565,7 +717,7 @@ impl Chat {
             Err(error) => self.request_failed(id, &active, index, &error, actions),
             Ok(_) if target.entries[index].message.compaction => self.compacted(id, index, active.incomplete.is_some(), actions),
             Ok(_) => {
-                let player = target.player.as_ref().map(|p| p.name.clone());
+                let player = target.player.clone();
                 let Conversation { entries, cast, scene, memories, auto_rounds, repairing, .. } = target;
                 let was_repair = std::mem::take(repairing);
                 let calls = &mut entries[index].message.tool_calls;
@@ -587,7 +739,7 @@ impl Chat {
                     // New characters first, so they can speak in the reply that made them.
                     for creating in [true, false] {
                         for result in calls.iter_mut().filter(|r| (r.call.name == tools::CREATE_CHARACTER) == creating) {
-                            result.output = tools::run(&result.call, cast, scene, memories, player.as_deref());
+                            result.output = tools::run(&result.call, cast, scene, memories, player.as_ref());
                         }
                     }
                     // Kept so deleting or regenerating the reply can undo it.
@@ -599,7 +751,7 @@ impl Chat {
                 // next, made to call create_character.
                 let turn = entries.iter().rposition(|e| e.message.role == Role::User).map_or(0, |i| i + 1);
                 let calls = entries[turn..].iter().flat_map(|e| e.message.tool_calls.iter().map(|r| &r.call));
-                let repair = complete && !tools::undescribed(calls, cast, player.as_deref()).is_empty();
+                let repair = complete && !tools::undescribed(calls, cast, player.as_ref()).is_empty();
                 // A reply that only called tools (say, created a character)
                 // showed nothing yet: the model carries on. A repair showed
                 // its turn already.
@@ -640,10 +792,13 @@ impl Chat {
             self.start_request(id, true, 0, actions);
             return;
         }
-        if error.is_retryable() && active.attempt < MAX_RETRIES {
+        // A reply that skipped the tools gets one more chance.
+        let skipped_tools = error.code() == Some(NO_TOOL_CALL) && active.attempt == 0;
+        if (error.is_retryable() || skipped_tools) && active.attempt < MAX_RETRIES {
             conversation.entries.remove(index);
-            conversation.retry =
-                Some(Retry { at: Instant::now() + RETRY_DELAYS[active.attempt], attempt: active.attempt + 1, compaction, error: error.to_string() });
+            // As long as the server asks, if it says.
+            let wait = error.retry_after().unwrap_or(RETRY_DELAYS[active.attempt]);
+            conversation.retry = Some(Retry { at: Instant::now() + wait, attempt: active.attempt + 1, compaction, error: error.to_string() });
             return;
         }
         let text = if error.is_context_overflow() {
@@ -713,10 +868,20 @@ impl Chat {
         }
     }
 
-    /// Sends due retries and gives up on streams that went silent.
+    /// Sends due retries and gives up on streams that went silent and on
+    /// memory reviews that take too long.
     pub fn tick(&mut self, now: Instant, actions: &mut Vec<Action>) {
         let mut due = Vec::new();
         let mut silent = Vec::new();
+        for c in &mut self.conversations {
+            if c.reviewing.as_ref().is_some_and(|r| r.deadline <= now)
+                && let Some(review) = c.reviewing.take()
+            {
+                review.cancel.store(true, Ordering::Relaxed);
+                c.reviewed = review.before;
+            }
+        }
+        self.notices.retain(|n| n.until > now);
         for c in &self.conversations {
             if let Some(retry) = c.retry.as_ref().filter(|r| r.at <= now) {
                 due.push((c.id, retry.compaction, retry.attempt));
@@ -739,7 +904,9 @@ impl Chat {
     #[must_use]
     pub fn next_deadline(&self) -> Option<Instant> {
         let deadline = |c: &Conversation| c.retry.as_ref().map(|r| r.at).or_else(|| c.stream.as_ref().map(|s| s.last_event + IDLE_TIMEOUT));
-        self.conversations.iter().filter_map(deadline).min()
+        let reviews = self.conversations.iter().filter_map(|c| c.reviewing.as_ref().map(|r| r.deadline));
+        let notices = self.notices.iter().map(|n| n.until);
+        self.conversations.iter().filter_map(deadline).chain(reviews).chain(notices).min()
     }
 
     /// Asks for the user's attention when conversation `id` finished or failed.
@@ -762,25 +929,89 @@ mod tests {
 
     #[test]
     fn story_prompts() {
-        assert_eq!(story_prompt(None, None, &[], &[], &[], "", ""), PLAIN_CHAT);
-        // Nobody in the scene: the model is told to cast someone first.
-        let alone = story_prompt(Some(("Panem", "Twelve districts.")), None, &[], &[], &[], "", "");
-        assert!(alone.starts_with(ROLEPLAY) && alone.ends_with(&format!("# World: Panem\n\nTwelve districts.\n\n# The scene\n\n{NOBODY_HERE}")));
-        let away = story_prompt(Some(("Panem", "")), Some(("Gale", "A hunter.")), &[], &["Peeta"], &[], "", "");
-        assert!(!away.contains("# Characters in the scene") && away.contains("# The user's character: Gale\n\nA hunter."));
-        assert!(away.contains(&format!("{ELSEWHERE}\n\n- Peeta")) && away.ends_with(NOBODY_HERE), "someone elsewhere is no one here");
-        let here = story_prompt(Some(("Panem", "")), None, &[("Katniss", "A hunter.")], &[], &[], "", "");
-        assert!(here.ends_with("## Katniss\n\nA hunter.") && !here.contains(NOBODY_HERE));
-        let joined = story_prompt(Some(("Panem", "")), None, &[("Rue", " ")], &[], &[], "", "");
-        assert!(joined.ends_with(&format!("## Rue\n\n{UNDESCRIBED}")), "someone who joined by speaking");
-        let kitchen = story_prompt(Some(("Panem", "")), None, &[("Katniss", "A hunter.")], &[], &[], " The bakery, before dawn. ", "");
-        assert!(kitchen.ends_with("## Katniss\n\nA hunter.\n\n# The scene\n\nThe bakery, before dawn."));
+        let member = |name: &str, description: &str, present: bool| CastMember {
+            id: name.to_lowercase(),
+            name: name.into(),
+            description: description.into(),
+            present,
+            ..CastMember::default()
+        };
+        assert_eq!(story_prompt(None, None, &[]), PLAIN_CHAT);
+        let alone = story_prompt(Some(("Panem", "Twelve districts.")), None, &[]);
+        assert!(alone.starts_with(ROLEPLAY) && alone.ends_with("# World: Panem\n\nTwelve districts."));
+        let gale = Player { name: "Gale".into(), aliases: vec!["Hunter".into()], description: "A hunter.".into() };
+        let cast = [member("Katniss", "A hunter.", true), member("Rue", " ", true), member("Peeta", "A baker.", false)];
+        let full = story_prompt(Some(("Panem", "")), Some(&gale), &cast);
+        assert!(full.contains("# The user's character: Gale\n\n(Formerly called Hunter; they are the same person.)\n\nA hunter."));
+        assert!(full.contains(&format!("# Cast\n\n{CAST}\n\n## Katniss\n\nA hunter.\n\n## Rue\n\n{UNDESCRIBED}\n\n## Peeta\n\nA baker.")));
+        // Who is here, the scene and memories change every turn: never in the prompt.
+        let moved = [member("Katniss", "A hunter.", false), member("Rue", " ", true), member("Peeta", "A baker.", true)];
+        assert_eq!(story_prompt(Some(("Panem", "")), Some(&gale), &moved), full, "the prompt stays cacheable");
+    }
 
-        // Memories before the scene; the author's note last, where it weighs most.
+    #[test]
+    fn the_story_state_rides_on_the_latest_message() {
+        let member = |name: &str, present: bool| CastMember { name: name.into(), present, ..CastMember::default() };
+        let nobody = story_state(&[member("Peeta", false)], &[], "", "");
+        assert!(nobody.starts_with(STATE) && nobody.contains(NOBODY_HERE) && nobody.ends_with(&format!("{ELSEWHERE} Peeta")));
+        assert!(nobody.contains("Not set yet"), "the model is asked to set the scene");
         let memories = ["Peeta saved Katniss.".to_owned(), "Rue is hurt.".to_owned()];
-        let full = story_prompt(Some(("Panem", "")), None, &[("Katniss", "A hunter.")], &[], &memories, "The woods.", " Keep it short. ");
-        let expected = format!("# Memories\n\n{MEMORIES}\n\n- Peeta saved Katniss.\n- Rue is hurt.\n\n# The scene\n\nThe woods.\n\n# Author's note\n\n{NOTE}\n\nKeep it short.");
-        assert!(full.ends_with(&expected), "{full}");
+        let full = story_state(&[member("Katniss", true), member("Rue", true)], &memories, " The woods. ", " Keep it short. ");
+        let expected = format!(
+            "# The scene\n\nThe woods.\n\n# In the scene\n\nKatniss, Rue\n\n# Memories\n\n{MEMORIES}\n\n- Peeta saved Katniss.\n- Rue is hurt.\n\n# Author's note\n\n{NOTE}\n\nKeep it short."
+        );
+        assert!(full.ends_with(&expected), "the author's note last, where it weighs most: {full}");
+
+        // After the prompt, or after the result of the last call.
+        let mut items = vec![InputItem::text(Role::User, "Hi.")];
+        attach_state(&mut items, "STATE");
+        assert!(matches!(&items[..], [InputItem::Message { text, .. }] if text == "Hi.\n\nSTATE"));
+        items.push(InputItem::ToolOutput { call_id: "c".into(), output: "Done.".into() });
+        attach_state(&mut items, "STATE");
+        assert!(matches!(&items[1], InputItem::ToolOutput { output, .. } if output == "Done.\n\nSTATE"));
+        let mut items = vec![InputItem::text(Role::Assistant, "Hello.")];
+        attach_state(&mut items, "STATE");
+        assert_eq!(items.len(), 2);
+    }
+
+    #[test]
+    fn summaries_keep_the_latest_turns() {
+        let prompt = |text: &str| StoredMessage::new(Role::User, text.into());
+        let reply = |text: &str| StoredMessage::new(Role::Assistant, text.into());
+        let history = [prompt("a"), reply("A"), prompt("b"), reply("B"), prompt("c"), reply("C"), prompt("d"), reply("D"), prompt("new")];
+        // Before a new prompt: up to three earlier turns stay, while they fit.
+        assert_eq!(summary_cut(&history, 8, 10_000), 2);
+        assert_eq!(summary_cut(&history, 8, 4), 4, "only what fits the budget");
+        assert_eq!(summary_cut(&history, 8, 0), 8, "nothing fits: everything is summarised");
+        // Mid-turn (no new prompt): the turn under way stays whole.
+        let under_way = &history[..8];
+        assert_eq!(summary_cut(under_way, 8, 0), 6);
+        // A single turn: something must be summarised.
+        assert_eq!(summary_cut(&history[..2], 2, 10_000), 2);
+        // Never back past the previous summary.
+        let mut summary = reply("S");
+        summary.compaction = true;
+        let after = [prompt("a"), reply("A"), summary, prompt("b"), reply("B"), prompt("new")];
+        assert_eq!(summary_cut(&after, 5, 10_000), 3);
+
+        // The model reads the summary, the turns it kept, then the rest.
+        let mut summary = reply("Earlier: a and b.");
+        (summary.compaction, summary.kept) = (true, 2);
+        let history = [prompt("a"), reply("A"), prompt("b"), reply("B"), summary, prompt("new")];
+        let items = input_items(&history);
+        let texts: Vec<&str> = items.iter().filter_map(|i| if let InputItem::Message { text, .. } = i { Some(text.as_str()) } else { None }).collect();
+        assert_eq!(texts.len(), 4);
+        assert!(texts[0].ends_with("Earlier: a and b.") && texts[1..] == ["b", "B", "new"]);
+    }
+
+    #[test]
+    fn reviews_start_after_the_prompts_read() {
+        let entry = |role, id| Entry::new(id, StoredMessage::new(role, "x".into()));
+        let entries = [entry(Role::User, 1), entry(Role::Assistant, 2), entry(Role::User, 3), entry(Role::Assistant, 4)];
+        assert_eq!(first_unread(&entries, 0), 0);
+        assert_eq!(first_unread(&entries, 1), 2);
+        assert_eq!(first_unread(&entries, 2), 4);
+        assert_eq!(first_unread(&entries, 9), 4);
     }
 
     #[test]

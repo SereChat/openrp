@@ -13,7 +13,9 @@
 //!
 //! Files are written atomically with the same private permissions as the
 //! config. Fields added later must be `#[serde(default)]` so older files keep
-//! loading.
+//! loading. Each record notes the format version that wrote it: one from a
+//! newer version of the app is shown but must not be saved over (see
+//! [`World::is_newer`]), since that would drop what this version does not know.
 
 use std::collections::HashSet;
 use std::fs;
@@ -32,6 +34,9 @@ use crate::session::valid_id;
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct World {
+    /// The format version that wrote the file; `0` for files from before
+    /// versions were recorded.
+    pub version: u32,
     /// Identifier, also the file name without `.json`.
     pub id: String,
     /// Display name.
@@ -51,6 +56,8 @@ pub struct World {
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Character {
+    /// The format version that wrote the file, as for [`World::version`].
+    pub version: u32,
     /// Identifier, also the file name without `.json`.
     pub id: String,
     /// Display name.
@@ -64,6 +71,28 @@ pub struct Character {
     pub created: u64,
     /// Last edit, seconds since the Unix epoch.
     pub updated: u64,
+}
+
+impl World {
+    /// The format this version of the app writes.
+    pub const VERSION: u32 = 1;
+
+    /// Saved by a newer version of the app: show it, but don't save over it.
+    #[must_use]
+    pub fn is_newer(&self) -> bool {
+        self.version > Self::VERSION
+    }
+}
+
+impl Character {
+    /// The format this version of the app writes.
+    pub const VERSION: u32 = 1;
+
+    /// Saved by a newer version of the app: show it, but don't save over it.
+    #[must_use]
+    pub fn is_newer(&self) -> bool {
+        self.version > Self::VERSION
+    }
 }
 
 /// A folder of records of one kind, one `<id>.json` file each.

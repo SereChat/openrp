@@ -10,6 +10,12 @@
 //! Portraits are never deleted from here: stories copy them from the
 //! library, so a sweep at startup removes the ones nothing uses any more
 //! (see `serechat::Portraits::collect_garbage`).
+//!
+//! Nothing typed is lost by looking elsewhere: a form with unsaved changes
+//! is kept as a draft (one per page) and reopens with the page. Going back
+//! or pressing Esc discards it, after a second press. Deleting asks twice
+//! too. A record saved by a newer version of the app is shown but cannot
+//! be saved over.
 
 use arboard::Clipboard;
 use serechat::{Character, Portraits, World, new_id, unix_now};
@@ -124,27 +130,31 @@ pub struct Record {
     pub portrait: String,
     created: u64,
     updated: u64,
+    /// Saved by a newer version of the app: shown, but never saved over.
+    locked: bool,
 }
 
 impl From<World> for Record {
     fn from(w: World) -> Self {
-        Self { id: w.id, name: w.name, description: w.description, portrait: w.portrait, created: w.created, updated: w.updated }
+        let locked = w.is_newer();
+        Self { id: w.id, name: w.name, description: w.description, portrait: w.portrait, created: w.created, updated: w.updated, locked }
     }
 }
 
 impl From<Character> for Record {
     fn from(c: Character) -> Self {
-        Self { id: c.id, name: c.name, description: c.description, portrait: c.portrait, created: c.created, updated: c.updated }
+        let locked = c.is_newer();
+        Self { id: c.id, name: c.name, description: c.description, portrait: c.portrait, created: c.created, updated: c.updated, locked }
     }
 }
 
 impl Record {
     /// The action that saves this record as a `kind`.
     fn save_action(self, kind: Kind) -> Action {
-        let Self { id, name, description, portrait, created, updated } = self;
+        let Self { id, name, description, portrait, created, updated, .. } = self;
         match kind {
-            Kind::World => Action::SaveWorld(World { id, name, description, portrait, created, updated }),
-            Kind::Character => Action::SaveCharacter(Character { id, name, description, portrait, created, updated }),
+            Kind::World => Action::SaveWorld(World { version: World::VERSION, id, name, description, portrait, created, updated }),
+            Kind::Character => Action::SaveCharacter(Character { version: Character::VERSION, id, name, description, portrait, created, updated }),
         }
     }
 }
@@ -180,8 +190,15 @@ struct Form {
     picking: bool,
     /// Why the last portrait could not be used.
     error: Option<String>,
-    /// Delete was clicked once on a character and waits for a second click.
+    /// Delete was clicked once and waits for a second click.
     confirm_delete: bool,
+    /// Back or Esc was pressed once with unsaved changes, and discards
+    /// them when pressed again.
+    confirm_discard: bool,
+    /// Name, description and portrait as last saved, to tell edits apart.
+    original: (String, String, String),
+    /// Saved by a newer version of the app: it cannot be saved here.
+    locked: bool,
     /// The generator request whose answer fills the form.
     generating: Option<u64>,
     /// Why the last generation failed.
@@ -199,13 +216,22 @@ impl Form {
             created: record.created,
             new,
             fields: Fields::new([name_editor(&record.name), text_editor(&record.description)], [false, true]),
+            original: (record.name, record.description, record.portrait.clone()),
             portrait: record.portrait,
             picking: false,
             error: None,
             confirm_delete: false,
+            confirm_discard: false,
+            locked: record.locked,
             generating: None,
             generate_error: None,
         }
+    }
+
+    /// Whether it holds changes that were not saved.
+    fn dirty(&self) -> bool {
+        let (name, description, portrait) = &self.original;
+        self.fields.text(NAME).trim() != name.trim() || self.fields.text(DESCRIPTION).trim() != description.trim() || self.portrait != *portrait
     }
 
     /// What the generator is asked for: the name and description typed so
@@ -230,6 +256,7 @@ impl Form {
             portrait: self.portrait.clone(),
             created: self.created,
             updated: unix_now(),
+            locked: self.locked,
         })
     }
 }
@@ -246,16 +273,30 @@ pub struct LibraryView {
     loaded: bool,
     /// The record being created or edited; the index shows otherwise.
     form: Option<Form>,
+    /// Forms with unsaved changes left for another page, at most one per
+    /// kind; each reopens with its page.
+    drafts: Vec<Form>,
     scroll: f32,
     /// Content height measured last frame, for clamping the scroll.
     content_h: f32,
 }
 
 impl LibraryView {
-    /// Shows the index, dropping any unsaved form.
-    pub fn show_index(&mut self) {
-        self.form = None;
+    /// Shows the page of `kind`: the draft left there, if there is one,
+    /// or the index. A form with unsaved changes is kept as a draft.
+    pub fn show(&mut self, kind: Kind) {
+        self.stash();
+        self.form = self.drafts.iter().position(|d| d.kind == kind).map(|i| self.drafts.remove(i));
         self.scroll = 0.0;
+    }
+
+    /// Keeps the open form as a draft if it has unsaved changes (replacing
+    /// an older draft of its kind), and closes it.
+    fn stash(&mut self) {
+        if let Some(form) = self.form.take().filter(Form::dirty) {
+            self.drafts.retain(|d| d.kind != form.kind);
+            self.drafts.push(form);
+        }
     }
 
     /// Stores the records read from disk, most recently edited first.
@@ -358,6 +399,8 @@ impl LibraryView {
         };
         let primary = if cfg!(target_os = "macos") { mods.super_key() } else { mods.control_key() };
         match &event.logical_key {
+            // Unsaved changes go only on a second Esc.
+            Key::Named(NamedKey::Escape) if form.dirty() && !form.confirm_discard => form.confirm_discard = true,
             Key::Named(NamedKey::Escape) => self.form = None,
             Key::Character(c) if primary && c.eq_ignore_ascii_case("s") => self.save(actions),
             _ => {
@@ -368,9 +411,9 @@ impl LibraryView {
     }
 
     /// Saves the open form and returns to the index; does nothing while
-    /// the form has no name.
+    /// the form has no name, or holds a record from a newer version.
     fn save(&mut self, actions: &mut Vec<Action>) {
-        let Some(form) = self.form.take_if(|f| f.record().is_some()) else {
+        let Some(form) = self.form.take_if(|f| f.record().is_some() && !f.locked) else {
             return;
         };
         let Some(record) = form.record() else { return };
@@ -388,6 +431,10 @@ impl LibraryView {
     /// Stores a story's cast member as library character `id`: updates the
     /// one it was cast from, or adds a new one.
     pub fn store_character(&mut self, id: &str, name: &str, description: &str, portrait: &str, actions: &mut Vec<Action>) {
+        // One saved by a newer version is never saved over.
+        if self.get(Kind::Character, id).is_some_and(|r| r.locked) {
+            return;
+        }
         let created = self.get(Kind::Character, id).map_or_else(unix_now, |r| r.created);
         let record = Record {
             id: id.to_owned(),
@@ -396,13 +443,22 @@ impl LibraryView {
             portrait: portrait.to_owned(),
             created,
             updated: unix_now(),
+            locked: false,
         };
         self.put(Kind::Character, record, actions);
     }
 
-    /// Opens the form of record `id`, as clicking its card does.
+    /// Opens the form of record `id`, as clicking its card does: its draft,
+    /// if one was left. A form open with unsaved changes becomes a draft.
     pub fn open_form(&mut self, kind: Kind, id: &str) {
-        self.form = self.get(kind, id).cloned().map(|r| Form::new(kind, Some(r)));
+        if self.form.as_ref().is_some_and(|f| f.kind == kind && f.id == id) {
+            return;
+        }
+        self.stash();
+        self.form = match self.drafts.iter().position(|d| d.kind == kind && d.id == id) {
+            Some(index) => Some(self.drafts.remove(index)),
+            None => self.get(kind, id).cloned().map(|r| Form::new(kind, Some(r))),
+        };
     }
 
     /// The saved world whose form is open, whose stories it lists.
@@ -461,6 +517,7 @@ impl LibraryView {
         let label = format!("New {}", kind.noun());
         let new = Rect::new(bar.right() - 16.0 - 130.0, bar.y + (bar.h - 30.0) * 0.5, 130.0, 30.0);
         if button(p, ui, new, &label, ButtonStyle::Primary, true) {
+            self.stash();
             self.form = Some(Form::new(kind, None));
             self.scroll = 0.0;
             return None;
@@ -563,9 +620,17 @@ impl LibraryView {
             name => name.to_owned(),
         };
         let bar = header(p, area, &title, back.right() + 12.0);
-        let go_back = button(p, ui, back, &format!("← {}", kind.plural()), ButtonStyle::Ghost, true);
+        // With unsaved changes, going back discards them on a second click.
+        let go_back = if form.confirm_discard {
+            button(p, ui, back, "Discard changes", ButtonStyle::Danger, true)
+        } else {
+            button(p, ui, back, &format!("← {}", kind.plural()), ButtonStyle::Ghost, true)
+        };
+        if !go_back && ui.released && !back.contains(ui.press_pos) {
+            form.confirm_discard = false;
+        }
         let save = Rect::new(bar.right() - 16.0 - 80.0, back.y, 80.0, 30.0);
-        let can_save = !form.fields.text(NAME).trim().is_empty();
+        let can_save = !form.fields.text(NAME).trim().is_empty() && !form.locked;
         let saved = button(p, ui, save, "Save", ButtonStyle::Primary, can_save);
         let mut right = save.x - 8.0;
         let mut play = false;
@@ -590,11 +655,17 @@ impl LibraryView {
         }
         let mut deleted = false;
         if !form.new {
-            // A world (and its stories) goes at once; a character asks first.
-            let (label, w) = if form.confirm_delete { ("Confirm delete", 130.0) } else { ("Delete", 90.0) };
+            // Deleting asks first; a world says how many stories go with it.
+            let confirm = match stories.len() {
+                _ if kind == Kind::Character => "Confirm delete".to_owned(),
+                0 => "Delete world".to_owned(),
+                1 => "Delete world and 1 story".to_owned(),
+                n => format!("Delete world and {n} stories"),
+            };
+            let (label, w) = if form.confirm_delete { (confirm.as_str(), p.layout(&confirm, theme::LABEL, None).width() + 28.0) } else { ("Delete", 90.0) };
             let delete = Rect::new(right - w, back.y, w, 30.0);
             if button(p, ui, delete, label, ButtonStyle::Danger, true) {
-                deleted = form.confirm_delete || kind == Kind::World;
+                deleted = form.confirm_delete;
                 form.confirm_delete = true;
             } else if ui.released && !delete.contains(ui.press_pos) {
                 form.confirm_delete = false;
@@ -654,6 +725,13 @@ impl LibraryView {
             let mut text = p.layout(error, theme::TINY, None);
             text.truncate(p.fonts, fw);
             p.text(&text, fx, top + 24.0 + name_h + 10.0, t.danger);
+        } else if form.locked {
+            let text = format!("Saved by a newer version of OpenRP: update OpenRP to change this {}.", kind.noun());
+            let mut text = p.layout(&text, theme::TINY, None);
+            text.truncate(p.fonts, fw);
+            p.text(&text, fx, top + 24.0 + name_h + 10.0, t.danger);
+        } else if form.confirm_discard {
+            p.label("Unsaved changes: Esc again discards them.", theme::TINY, fx, top + 24.0 + name_h + 10.0, t.danger);
         } else {
             let save = if cfg!(target_os = "macos") { "Cmd+S" } else { "Ctrl+S" };
             let tip = if kind == Kind::Character {
@@ -718,13 +796,17 @@ impl LibraryView {
         } else if duplicated {
             self.duplicate(actions);
         } else if let Some(story) = opened {
-            // Unsaved edits are dropped, as when going back.
-            self.form = None;
+            // Unsaved edits wait as a draft.
+            self.stash();
             return Some(Event::Open(story));
         } else if deleted {
             return self.delete(actions).map(Event::WorldDeleted);
         } else if go_back {
-            self.form = None;
+            // Unsaved changes go only on a second click.
+            match self.form.as_mut() {
+                Some(form) if form.dirty() && !form.confirm_discard => form.confirm_discard = true,
+                _ => self.form = None,
+            }
         } else if play {
             // Play what is shown: unsaved edits are saved first.
             self.save(actions);
@@ -788,6 +870,20 @@ mod tests {
         assert_eq!((w.id.as_str(), w.description.as_str(), w.portrait.as_str(), w.created), ("a", "Twelve districts.", "face.png", 0));
         assert_eq!(view.worlds[0].id, "a");
 
+        // Unsaved changes survive looking elsewhere, as a draft.
+        view.form = Some(Form::new(Kind::World, Some(view.worlds[0].clone())));
+        view.form.as_mut().unwrap().fields.insert("Draft ");
+        view.show(Kind::Character);
+        assert!(view.form.is_none() && view.drafts.len() == 1);
+        view.show(Kind::World);
+        assert!(view.form.as_ref().is_some_and(|f| f.fields.text(NAME).contains("Draft")) && view.drafts.is_empty());
+        view.open_form(Kind::World, "b");
+        assert_eq!(view.drafts.len(), 1, "opening another keeps the draft");
+        view.open_form(Kind::World, "a");
+        assert!(view.form.as_ref().is_some_and(Form::dirty), "and opening it again brings it back");
+        view.form = None;
+        view.drafts.clear();
+
         // Deleting a new record only drops the form; a saved world reports
         // itself so its stories go too.
         let mut actions = Vec::new();
@@ -815,6 +911,15 @@ mod tests {
         // A pick landing after the form closed changes nothing.
         view.portrait_picked(Ok(Some("late.png".into())));
         assert!(view.form.is_none());
+
+        // A world from a newer version is shown but never saved over.
+        let newer = World { id: "n".into(), name: "Newer".into(), version: World::VERSION + 1, ..World::default() };
+        view.loaded(vec![newer], Vec::new(), Portraits::at("p".into()));
+        let mut actions = Vec::new();
+        view.open_form(Kind::World, "n");
+        view.form.as_mut().unwrap().fields.insert("x");
+        view.save(&mut actions);
+        assert!(actions.is_empty() && view.form.is_some());
     }
 
     #[test]

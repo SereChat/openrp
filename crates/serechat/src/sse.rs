@@ -20,6 +20,11 @@ pub struct Decoder {
 }
 
 impl Decoder {
+    /// Bytes of data held for the event not finished yet.
+    pub fn pending(&self) -> usize {
+        self.event.data.len()
+    }
+
     /// Feeds one line (without its terminator). Returns the event when the
     /// line completes one.
     pub fn line(&mut self, line: &str) -> Option<Event> {

@@ -7,19 +7,24 @@
 //!   stays bubbles and the model sees the call as edited. A reply without
 //!   characters (a plain chat's) keeps its edited text only.
 //! * Regenerate (last turn only) sends its prompt again, as if just sent.
+//!   The replies it had are kept as a swipe: the last turn's ‹ › switch
+//!   between every reply its prompt got.
 //! * Delete removes the prompt and everything that answered it.
 //!
-//! Regenerating, or deleting the last turn, rewinds the story too: each
-//! reply recorded what its tools changed (cast, scene), and that is undone
-//! in reverse, except what was changed again since. Deleting an earlier
-//! turn only removes messages, as later turns build on what it did. What
-//! the removed replies cost is not forgotten: a regenerated reply is billed
-//! with it, and a deleted turn's cost moves to the reply before it.
+//! Regenerating, swiping, or deleting the last turn rewinds the story too:
+//! each reply recorded what its tools changed (cast, scene, memories), and
+//! that is undone in reverse, except what was changed again since; swiping
+//! to a reply makes its changes again. Deleting an earlier turn only
+//! removes messages, as later turns build on what it did. What removed
+//! replies cost is not forgotten: swiped-away replies keep theirs, a reply
+//! that failed is billed with the one replacing it, and a deleted turn's
+//! cost moves to the reply before it.
 
 use std::ops::Range;
 
-use serechat::Role;
+use serechat::{Role, StoredMessage};
 
+use super::stream::is_summary;
 use super::tools::{self, Part};
 use super::{Chat, Conversation, Entry, Load};
 use crate::app::Action;
@@ -90,6 +95,34 @@ impl Conversation {
             }
         }
     }
+
+    /// Entries in `range` are about to go: a summary after them that keeps
+    /// some of them word for word keeps fewer, and a prompt among them the
+    /// memory reviews read counts no more.
+    fn forget(&mut self, range: &Range<usize>) {
+        let prompts_before = self.entries[..range.start].iter().filter(|e| e.message.is_prompt()).count();
+        let removed = self.entries[range.clone()].iter().filter(|e| e.message.is_prompt()).count();
+        let read = self.reviewed.saturating_sub(prompts_before).min(removed);
+        self.reviewed -= read;
+        if let Some(at) = self.entries.iter().rposition(|e| is_summary(&e.message)).filter(|&at| at >= range.end) {
+            let kept = &mut self.entries[at].message.kept;
+            let window = at - (*kept).min(at)..at;
+            *kept -= range.end.min(window.end).saturating_sub(range.start.max(window.start));
+        }
+    }
+
+    /// The last prompt's index and how its replies can be swiped: the one
+    /// shown (from 0) and how many there are. `None` without a prompt.
+    pub(super) fn swipes(&self) -> Option<(usize, usize, usize)> {
+        let prompt = self.entries.iter().rposition(|e| e.message.role == Role::User)?;
+        let message = &self.entries[prompt].message;
+        Some((prompt, message.swipe.min(message.swipes.len()), message.swipes.len() + 1))
+    }
+}
+
+/// Whether `replies` showed the user anything worth swiping back to.
+fn worth_keeping(replies: &[StoredMessage]) -> bool {
+    replies.iter().any(|m| m.role == Role::Assistant && !m.failed && !m.compaction && (!m.content.is_empty() || !m.tool_calls.is_empty()))
 }
 
 impl Chat {
@@ -158,6 +191,7 @@ impl Chat {
             if fields.iter().all(|(_, text)| text.is_empty()) {
                 // Its cost stays in the story, on the reply before it.
                 let cost = conversation.entries[index].message.cost;
+                conversation.forget(&(index..index + 1));
                 conversation.entries.remove(index);
                 carry_cost(conversation, index, cost);
                 continue;
@@ -181,25 +215,78 @@ impl Chat {
         }
     }
 
-    /// Sends the last prompt again: its replies are removed and what they
-    /// changed in the story undone.
+    /// Sends the last prompt again: its replies become a swipe (if they
+    /// showed anything) and what they changed in the story is undone.
     pub(super) fn regenerate(&mut self, actions: &mut Vec<Action>) {
         let id = self.current;
         let conversation = self.current();
-        let Some(prompt) = conversation.entries.iter().rposition(|e| e.message.role == Role::User) else { return };
+        let Some((prompt, shown, _)) = conversation.swipes() else { return };
         if !conversation.settled() {
             return;
         }
         let replies = prompt + 1..conversation.entries.len();
         conversation.rewind(replies.clone());
-        let cost: f64 = conversation.entries.drain(replies).map(|e| e.message.cost).sum();
-        // Billed with the reply that replaces them.
-        conversation.carried_cost += cost;
+        conversation.forget(&replies);
+        // The new reply is read by the next memory review.
+        let prompts = conversation.entries.iter().filter(|e| e.message.is_prompt()).count();
+        if conversation.reviewed >= prompts {
+            conversation.reviewed = prompts.saturating_sub(1);
+        }
+        let old: Vec<StoredMessage> = conversation.entries.drain(replies).map(|e| e.message).collect();
+        let keep = worth_keeping(&old);
+        if !keep {
+            // A failure is billed with the reply that replaces it.
+            conversation.carried_cost += old.iter().map(StoredMessage::total_cost).sum::<f64>();
+        }
+        let message = &mut conversation.entries[prompt].message;
+        if keep {
+            message.swipes.insert(shown, old);
+        }
+        message.swipe = message.swipes.len();
         conversation.auto_rounds = 0;
         conversation.repairing = false;
         self.selection = None;
         self.turn_edit = None;
         self.request_reply(id, actions);
+    }
+
+    /// Shows reply `target` (from 0) of the last prompt's swipes in place
+    /// of the one shown: the story rewinds what the shown one changed and
+    /// makes the changes of the one swiped to. Saves the story.
+    pub(super) fn swipe_to(&mut self, target: usize, actions: &mut Vec<Action>) {
+        let first = self.next_id;
+        let conversation = self.current();
+        let Some((prompt, shown, count)) = conversation.swipes() else { return };
+        if !conversation.settled() || target >= count || target == shown {
+            return;
+        }
+        let replies = prompt + 1..conversation.entries.len();
+        conversation.rewind(replies.clone());
+        conversation.forget(&replies);
+        let old: Vec<StoredMessage> = conversation.entries.drain(replies).map(|e| e.message).collect();
+        let mut all = std::mem::take(&mut conversation.entries[prompt].message.swipes);
+        // The reply shown goes back among the others, unless it only failed.
+        let target = if worth_keeping(&old) {
+            all.insert(shown, old);
+            target
+        } else {
+            conversation.carried_cost += old.iter().map(StoredMessage::total_cost).sum::<f64>();
+            if target > shown { target - 1 } else { target }
+        };
+        let chosen = if target < all.len() { all.remove(target) } else { Vec::new() };
+        let message = &mut conversation.entries[prompt].message;
+        (message.swipes, message.swipe) = (all, target);
+        let added = chosen.len() as u64;
+        for (message, id) in chosen.into_iter().zip(first + 1..) {
+            if let Some(change) = &message.change {
+                change.redo(&mut conversation.cast, &mut conversation.scene, &mut conversation.memories);
+            }
+            conversation.entries.push(Entry::new(id, message));
+        }
+        actions.push(Action::SaveSession(conversation.to_session()));
+        self.next_id += added;
+        self.selection = None;
+        self.turn_edit = None;
     }
 
     /// Deletes the turn holding entry `index`: its prompt and every reply
@@ -213,8 +300,9 @@ impl Chat {
         if turn.end == conversation.entries.len() {
             conversation.rewind(turn.clone());
         }
+        conversation.forget(&turn);
         let start = turn.start;
-        let cost: f64 = conversation.entries.drain(turn).map(|e| e.message.cost).sum();
+        let cost: f64 = conversation.entries.drain(turn).map(|e| e.message.total_cost()).sum();
         carry_cost(conversation, start, cost);
         if start == 0 {
             // The title came from the first prompt.
@@ -265,12 +353,14 @@ mod tests {
     fn story() -> Chat {
         let mut chat = Chat::new(None, Reasoning::Auto, Vec::new());
         chat.play("w".into());
-        chat.current().player = Some(serechat::Player { name: "Gale".into(), description: String::new() });
+        chat.current().player = Some(serechat::Player { name: "Gale".into(), ..serechat::Player::default() });
         chat
     }
 
     const RUE: &str =
         r#"{"scene":"The woods.","introduce":[{"name":"Rue","description":"A girl from 11."}],"lines":[{"character":"Rue","text":"Hi."}]}"#;
+    const THRESH: &str =
+        r#"{"scene":"The lake.","introduce":[{"name":"Thresh","description":"Big."}],"lines":[{"character":"Thresh","text":"Yes?"}]}"#;
     const LEAVES: &str = r#"{"scene":"The lake.","lines":[{"character":"Rue","text":"Bye."}],"leave":["Rue"]}"#;
 
     #[test]
@@ -319,6 +409,57 @@ mod tests {
         assert_eq!(chat.current().entries.len(), 2);
     }
 
+    /// Completes `job` with a speak call of `args`.
+    fn complete(chat: &mut Chat, job: &SendJob, args: &str) {
+        let call = ToolCall { call_id: format!("c{}", job.stream), name: super::super::tools::SPEAK.into(), arguments: args.into() };
+        let completion = Completion { tool_calls: vec![call], usage: serechat::Usage::new(10, 5), ..Completion::default() };
+        chat.stream_event(job.conversation, job.stream, StreamEvent::Completed(completion));
+        chat.stream_end(job.conversation, job.stream, Ok(true), &mut Vec::new());
+    }
+
+    #[test]
+    fn regenerated_replies_are_swiped_between() {
+        let mut chat = story();
+        answer(&mut chat, "Hello.", RUE);
+        chat.current().entries[1].message.cost = 0.5;
+        let mut actions = Vec::new();
+        chat.regenerate(&mut actions);
+        let Some(Action::Send(job)) = actions.pop() else { panic!("not sent") };
+        assert!(chat.current().cast.is_empty(), "the first reply's newcomer is undone");
+        complete(&mut chat, &job, THRESH);
+        let conversation = chat.current();
+        assert_eq!(conversation.swipes(), Some((0, 1, 2)), "the new reply is the second of two");
+        assert!(conversation.scene == "The lake." && conversation.cast.iter().map(|m| m.name.as_str()).eq(["Thresh"]));
+        assert!(conversation.cost() >= 0.5, "the reply swiped away still counts");
+
+        // Back to the first: its story comes back, the second's goes.
+        let mut actions = Vec::new();
+        chat.swipe_to(0, &mut actions);
+        let conversation = chat.current();
+        assert_eq!(conversation.swipes(), Some((0, 0, 2)));
+        assert!(conversation.scene == "The woods." && conversation.cast.iter().map(|m| m.name.as_str()).eq(["Rue"]));
+        assert!(matches!(&actions[..], [Action::SaveSession(s)] if s.messages[0].swipes.len() == 1 && s.messages.len() == 2));
+        let entry = conversation.entries.last_mut().unwrap();
+        entry.refresh_display(false, true);
+        assert!(entry.display.ends_with("**Rue**: Hi."), "{}", entry.display);
+
+        // And forward again; out of range does nothing.
+        chat.swipe_to(1, &mut Vec::new());
+        assert!(chat.current().scene == "The lake." && chat.current().swipes() == Some((0, 1, 2)));
+        chat.swipe_to(5, &mut Vec::new());
+        assert_eq!(chat.current().swipes(), Some((0, 1, 2)));
+
+        // Regenerating again adds a third; a reply that failed is not kept.
+        let mut actions = Vec::new();
+        chat.regenerate(&mut actions);
+        let Some(Action::Send(job)) = actions.pop() else { panic!("not sent") };
+        let error = serechat::Error::Response { code: Some("invalid_request_error".into()), message: "bad".into() };
+        chat.stream_end(job.conversation, job.stream, Err(error), &mut Vec::new());
+        assert_eq!(chat.current().swipes(), Some((0, 2, 3)), "two kept, the failure shown");
+        chat.swipe_to(0, &mut Vec::new());
+        assert_eq!(chat.current().swipes(), Some((0, 0, 2)), "the failure is dropped when swiped away");
+    }
+
     #[test]
     fn deleting_an_earlier_turn_keeps_the_story() {
         let mut chat = story();
@@ -352,7 +493,7 @@ mod tests {
         let reply = &entry.message;
         assert!(reply.content.is_empty() && reply.tool_calls.len() == 1 && reply.change.is_some(), "deleting it still undoes what it did");
         assert!(matches!(&actions[..], [Action::SaveSession(_)]));
-        let items = crate::chat::input_items(&[prompt, reply.clone()]);
+        let items = crate::chat::stream::input_items(&[prompt, reply.clone()]);
         assert!(matches!(&items[1], serechat::InputItem::ToolCall(call) if call.arguments.contains("Hi. Changed.")), "the model sees the edit");
 
         // An emptied character leaves the reply; emptied entirely, it is removed.

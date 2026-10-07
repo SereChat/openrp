@@ -1,7 +1,7 @@
 //! Streaming access to `POST /v1/responses`: text messages, function tools
 //! and their results.
 
-use std::io::BufRead;
+use std::io::{BufRead, Read as _};
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use serde::{Deserialize, Serialize};
@@ -10,6 +10,11 @@ use serde_json::{Value, json};
 use crate::client::{Client, parse_error_body};
 use crate::error::{Error, Result};
 use crate::sse;
+
+/// Longest SSE line accepted, in bytes; a longer one fails the stream.
+const MAX_LINE: u64 = 8 << 20;
+/// Most data one SSE event may carry, in bytes.
+const MAX_EVENT: usize = 16 << 20;
 
 /// Author of a conversation turn.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -247,20 +252,28 @@ impl Client {
     /// the stream ([`Error::Response`]).
     pub fn stream_response(&self, request: &ResponseRequest<'_>, cancel: &AtomicBool, mut on_event: impl FnMut(StreamEvent)) -> Result<bool> {
         let response = self.post("/v1/responses", &request.to_json(), true)?;
-        let reader = std::io::BufReader::new(response.into_body().into_reader());
+        let mut reader = std::io::BufReader::new(response.into_body().into_reader());
         let mut decoder = sse::Decoder::default();
+        let mut buffer = Vec::new();
+        let mut ended = false;
 
-        // The trailing empty line flushes an event the server did not terminate.
-        for line in reader.lines().chain([Ok(String::new())]) {
+        while !ended {
             if cancel.load(Ordering::Relaxed) {
                 return Ok(false);
             }
-            let line = line?;
+            // The trailing empty line flushes an event the server did not terminate.
+            let line = read_line(&mut reader, &mut buffer)?.unwrap_or_else(|| {
+                ended = true;
+                String::new()
+            });
             if line.starts_with(':') {
                 on_event(StreamEvent::Ping);
                 continue;
             }
             let Some(event) = decoder.line(&line) else {
+                if decoder.pending() > MAX_EVENT {
+                    return Err(too_large("event"));
+                }
                 continue;
             };
             if event.name == "response.failed"
@@ -279,6 +292,31 @@ impl Client {
         }
         Ok(false)
     }
+}
+
+/// Reads one line (without its terminator) of at most [`MAX_LINE`] bytes
+/// into `buffer`, which is reused between calls; `None` at the end of the
+/// stream. Invalid UTF-8 is replaced: a line is JSON or a comment.
+fn read_line(reader: &mut impl BufRead, buffer: &mut Vec<u8>) -> Result<Option<String>> {
+    buffer.clear();
+    let read = reader.by_ref().take(MAX_LINE + 1).read_until(b'\n', buffer)?;
+    if read == 0 {
+        return Ok(None);
+    }
+    if buffer.last() == Some(&b'\n') {
+        buffer.pop();
+    } else if buffer.len() as u64 > MAX_LINE {
+        return Err(too_large("line"));
+    }
+    if buffer.last() == Some(&b'\r') {
+        buffer.pop();
+    }
+    Ok(Some(String::from_utf8_lossy(buffer).into_owned()))
+}
+
+/// The error for a stream sending more than we accept in one `what`.
+fn too_large(what: &str) -> Error {
+    Error::Response { code: Some("stream_too_large".into()), message: format!("The response stream sent an oversized {what}.") }
 }
 
 /// Interprets one SSE event. Its kind comes from the SSE `event` field,
@@ -444,6 +482,20 @@ mod tests {
             completion.tool_calls,
             [ToolCall { call_id: "call-1".into(), name: "list_directory".into(), arguments: r#"{"path":"."}"#.into() }]
         );
+    }
+
+    #[test]
+    fn lines_are_bounded() {
+        let mut buffer = Vec::new();
+        let mut reader = std::io::Cursor::new(b"data: a\r\n\nlast".to_vec());
+        assert_eq!(read_line(&mut reader, &mut buffer).unwrap().as_deref(), Some("data: a"));
+        assert_eq!(read_line(&mut reader, &mut buffer).unwrap().as_deref(), Some(""));
+        assert_eq!(read_line(&mut reader, &mut buffer).unwrap().as_deref(), Some("last"));
+        assert_eq!(read_line(&mut reader, &mut buffer).unwrap(), None);
+
+        let huge = vec![b'x'; usize::try_from(MAX_LINE).unwrap() + 2];
+        let err = read_line(&mut std::io::Cursor::new(huge), &mut buffer).unwrap_err();
+        assert!(!err.is_retryable() && err.code() == Some("stream_too_large"));
     }
 
     #[test]

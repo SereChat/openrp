@@ -1,6 +1,7 @@
 //! The single error type used across the crate.
 
 use std::fmt;
+use std::time::Duration;
 
 /// Convenience alias for results produced by this crate.
 pub type Result<T, E = Error> = std::result::Result<T, E>;
@@ -20,6 +21,9 @@ pub enum Error {
         code: Option<String>,
         /// Human-readable description suitable for display.
         message: String,
+        /// How long the server asked us to wait before trying again
+        /// (`Retry-After`), when it said.
+        retry_after: Option<Duration>,
     },
     /// A streamed response failed after it started (`response.failed` or an
     /// `error` event). The server's codes: `server_error` and
@@ -44,6 +48,12 @@ pub enum Error {
     },
     /// The user's home directory could not be determined.
     NoHomeDir,
+    /// A file was saved by a newer version of OpenRP, in a format this one
+    /// does not know; it is left untouched rather than rewritten.
+    Newer {
+        /// What the file holds, e.g. `story`.
+        what: &'static str,
+    },
 }
 
 impl Error {
@@ -64,12 +74,22 @@ impl Error {
     }
 
     /// Whether trying the same request again later may succeed: network
-    /// failures, dropped connections, rate limits and server errors.
+    /// failures, dropped connections, rate limits and server errors. TLS,
+    /// certificate, proxy and malformed-URL failures are final: retrying
+    /// cannot fix them.
     #[must_use]
     pub fn is_retryable(&self) -> bool {
         use std::io::ErrorKind;
         match self {
-            Self::Transport(_) => true,
+            Self::Transport(e) => matches!(
+                **e,
+                ureq::Error::Timeout(_)
+                    | ureq::Error::HostNotFound
+                    | ureq::Error::ConnectionFailed
+                    | ureq::Error::Protocol(_)
+                    | ureq::Error::BodyStalled
+                    | ureq::Error::Io(_)
+            ),
             Self::Io(e) => matches!(
                 e.kind(),
                 ErrorKind::ConnectionReset
@@ -84,7 +104,16 @@ impl Error {
             ),
             Self::Api { status, .. } => *status == 429 || *status >= 500,
             Self::Response { code, .. } => matches!(code.as_deref(), Some("server_error" | "rate_limit_exceeded") | None),
-            Self::Decode(_) | Self::Config { .. } | Self::NoHomeDir => false,
+            Self::Decode(_) | Self::Config { .. } | Self::NoHomeDir | Self::Newer { .. } => false,
+        }
+    }
+
+    /// How long the server asked us to wait before retrying, if it said.
+    #[must_use]
+    pub fn retry_after(&self) -> Option<Duration> {
+        match self {
+            Self::Api { retry_after, .. } => *retry_after,
+            _ => None,
         }
     }
 
@@ -105,6 +134,7 @@ impl fmt::Display for Error {
             Self::Io(e) => write!(f, "I/O error: {e}"),
             Self::Config { line, message } => write!(f, "config line {line}: {message}"),
             Self::NoHomeDir => f.write_str("could not determine the home directory"),
+            Self::Newer { what } => write!(f, "this {what} was saved by a newer version of OpenRP; update OpenRP to open it"),
         }
     }
 }
@@ -115,7 +145,7 @@ impl std::error::Error for Error {
             Self::Transport(e) => Some(e.as_ref()),
             Self::Decode(e) => Some(e),
             Self::Io(e) => Some(e),
-            Self::Api { .. } | Self::Response { .. } | Self::Config { .. } | Self::NoHomeDir => None,
+            Self::Api { .. } | Self::Response { .. } | Self::Config { .. } | Self::NoHomeDir | Self::Newer { .. } => None,
         }
     }
 }
@@ -149,12 +179,15 @@ mod tests {
     #[test]
     fn classifies_failures() {
         let response = |code: &str| Error::Response { code: Some(code.into()), message: String::new() };
-        let api = |status| Error::Api { status, code: None, message: String::new() };
+        let api = |status| Error::Api { status, code: None, message: String::new(), retry_after: None };
         assert!(response("server_error").is_retryable() && response("rate_limit_exceeded").is_retryable());
         assert!(!response("invalid_request_error").is_retryable());
         assert!(response("context_length_exceeded").is_context_overflow() && !response("context_length_exceeded").is_retryable());
         assert!(api(503).is_retryable() && api(429).is_retryable() && !api(402).is_retryable() && !api(401).is_retryable());
         assert!(Error::Io(std::io::ErrorKind::ConnectionReset.into()).is_retryable());
         assert!(!Error::Io(std::io::Error::other("attachment missing")).is_retryable());
+        assert!(Error::Transport(Box::new(ureq::Error::HostNotFound)).is_retryable(), "offline");
+        assert!(!Error::Transport(Box::new(ureq::Error::Tls("bad certificate"))).is_retryable());
+        assert!(!Error::Transport(Box::new(ureq::Error::BadUri("x".into()))).is_retryable());
     }
 }

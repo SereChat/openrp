@@ -2,8 +2,9 @@
 //!
 //! The file is a flat TOML document of `key = "string"` pairs. Only that
 //! subset is parsed: basic (`"..."`) and literal (`'...'`) strings, comments
-//! and blank lines. Unknown keys are ignored so older builds tolerate newer
-//! files.
+//! and blank lines. Lines this build does not know (other keys, values of
+//! other types, tables) are kept word for word and written back, so an older
+//! build neither fails on a newer file nor drops what it added.
 //!
 //! ponytail: flat string-only TOML subset; switch to the `toml` crate once
 //! the config needs tables, arrays or numbers.
@@ -12,6 +13,7 @@ use std::fmt::Write as _;
 use std::fs;
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::error::{Error, Result};
 
@@ -21,7 +23,7 @@ const DIR_NAME: &str = ".openrp";
 const FILE_NAME: &str = "config.toml";
 
 /// Persistent user settings.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Clone, Default, PartialEq, Eq)]
 pub struct Config {
     /// Bearer token obtained through the device-code flow.
     pub token: Option<String>,
@@ -34,7 +36,30 @@ pub struct Config {
     pub theme: Option<String>,
     /// How replies show the model's reasoning, interpreted by the app.
     pub reasoning_view: Option<String>,
+    /// Model for the work done beside the story (memory reviews, summaries,
+    /// character generation); `None` uses the story's model.
+    pub utility_model: Option<String>,
+    /// Lines this build does not understand, kept as they were.
+    pub extra: Vec<String>,
 }
+
+impl std::fmt::Debug for Config {
+    // Hand-written so the bearer token never ends up in logs.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Config")
+            .field("token", &self.token.as_ref().map(|_| "<redacted>"))
+            .field("model", &self.model)
+            .field("reasoning", &self.reasoning)
+            .field("theme", &self.theme)
+            .field("reasoning_view", &self.reasoning_view)
+            .field("utility_model", &self.utility_model)
+            .field("extra", &self.extra.len())
+            .finish()
+    }
+}
+
+/// The keys this build reads; see [`Config`].
+const KEYS: [&str; 6] = ["token", "model", "reasoning", "theme", "reasoning_view", "utility_model"];
 
 impl Config {
     /// Returns `~/.openrp`, the directory holding all local app data.
@@ -95,31 +120,38 @@ impl Config {
     /// Parses the flat TOML subset described in the module docs.
     ///
     /// # Errors
-    /// [`Error::Config`] pointing at the first malformed line.
+    /// [`Error::Config`] pointing at the first malformed line holding a key
+    /// this build reads.
     pub fn parse(text: &str) -> Result<Self> {
         let mut config = Self::default();
+        // Keys after a table header belong to that table: none are ours.
+        let mut in_table = false;
         for (index, raw) in text.lines().enumerate() {
             let line = raw.trim();
             if line.is_empty() || line.starts_with('#') {
                 continue;
             }
-            let err = |message| Error::Config { line: index + 1, message };
-            let (key, rest) = line.split_once('=').ok_or_else(|| err("expected `key = \"value\"`"))?;
-            let key = key.trim();
-            let value = parse_string(rest.trim()).map_err(err)?;
+            in_table |= line.starts_with('[');
+            let known = line.split_once('=').map(|(key, rest)| (key.trim(), rest)).filter(|(key, _)| !in_table && KEYS.contains(key));
+            let Some((key, rest)) = known else {
+                config.extra.push(raw.to_owned());
+                continue;
+            };
+            let value = parse_string(rest.trim()).map_err(|message| Error::Config { line: index + 1, message })?;
             match key {
                 "token" => config.token = Some(value),
                 "model" => config.model = Some(value),
                 "reasoning" => config.reasoning = Some(value),
                 "theme" => config.theme = Some(value),
                 "reasoning_view" => config.reasoning_view = Some(value),
-                _ => {}
+                _ => config.utility_model = Some(value),
             }
         }
         Ok(config)
     }
 
-    /// Serializes to TOML text.
+    /// Serializes to TOML text: the keys this build reads, then the lines
+    /// it kept as they were.
     #[must_use]
     pub fn serialize(&self) -> String {
         let mut out = String::from("# OpenRP configuration.\n");
@@ -129,6 +161,7 @@ impl Config {
             ("reasoning", &self.reasoning),
             ("theme", &self.theme),
             ("reasoning_view", &self.reasoning_view),
+            ("utility_model", &self.utility_model),
         ];
         for (key, value) in fields {
             if let Some(value) = value {
@@ -137,6 +170,10 @@ impl Config {
                 push_quoted(&mut out, value);
                 out.push('\n');
             }
+        }
+        for line in &self.extra {
+            out.push_str(line);
+            out.push('\n');
         }
         out
     }
@@ -201,23 +238,54 @@ fn push_quoted(out: &mut String, value: &str) {
 
 /// Atomically replaces `path` with `bytes`, readable only by the user.
 ///
-/// Writes a sibling `.tmp` file and renames it over the original, so a crash
-/// mid-write never leaves a truncated file behind. On Unix the file is
-/// created `0600` inside a `0700` directory; on Windows the profile ACLs apply.
+/// Writes a sibling temporary file and renames it over the original, so a
+/// crash mid-write never leaves a truncated file behind. The temporary name
+/// is unique to this process and write, so two writers never share one. On
+/// Unix the file is created `0600` inside a `0700` directory, which is synced
+/// after the rename; on Windows the profile ACLs apply.
 pub(crate) fn write_private(path: &Path, bytes: &[u8]) -> Result<()> {
-    if let Some(dir) = path.parent() {
+    static WRITES: AtomicU64 = AtomicU64::new(0);
+    let dir = path.parent();
+    if let Some(dir) = dir {
         create_private_dir(dir)?;
     }
     let mut tmp = path.as_os_str().to_owned();
-    tmp.push(".tmp");
+    tmp.push(format!(".{}-{}.tmp", std::process::id(), WRITES.fetch_add(1, Ordering::Relaxed)));
     let tmp = PathBuf::from(tmp);
-    {
-        let mut file = private_file(&tmp)?;
+    let written = private_file(&tmp).and_then(|mut file| {
         file.write_all(bytes)?;
         file.sync_all()?;
+        drop(file);
+        fs::rename(&tmp, path)
+    });
+    if let Err(e) = written {
+        let _ = fs::remove_file(&tmp);
+        return Err(e.into());
     }
-    fs::rename(&tmp, path)?;
+    #[cfg(unix)]
+    if let Some(dir) = dir {
+        // Makes the rename itself durable; best effort, the data is safe.
+        let _ = fs::File::open(dir).and_then(|d| d.sync_all());
+    }
     Ok(())
+}
+
+/// Takes the lock named `name` in `~/.openrp/` that keeps a second copy of
+/// the app off the same data: `Ok(None)` when another process holds it.
+/// The lock lasts while the returned file is open, and the OS releases it
+/// when the process ends, so a crash never leaves it stuck.
+///
+/// # Errors
+/// No home directory, or the lock file cannot be opened.
+pub fn lock_instance(name: &str) -> Result<Option<fs::File>> {
+    let dir = Config::dir()?;
+    create_private_dir(&dir)?;
+    let file = fs::OpenOptions::new().read(true).write(true).create(true).truncate(false).open(dir.join(name))?;
+    match file.try_lock() {
+        Ok(()) => Ok(Some(file)),
+        Err(fs::TryLockError::WouldBlock) => Ok(None),
+        Err(fs::TryLockError::Error(e)) => Err(e.into()),
+    }
 }
 
 #[cfg(unix)]
@@ -234,14 +302,14 @@ fn create_private_dir(dir: &Path) -> Result<()> {
 }
 
 #[cfg(unix)]
-fn private_file(path: &Path) -> Result<fs::File> {
+fn private_file(path: &Path) -> std::io::Result<fs::File> {
     use std::os::unix::fs::OpenOptionsExt;
-    Ok(fs::OpenOptions::new().write(true).create(true).truncate(true).mode(0o600).open(path)?)
+    fs::OpenOptions::new().write(true).create_new(true).mode(0o600).open(path)
 }
 
 #[cfg(not(unix))]
-fn private_file(path: &Path) -> Result<fs::File> {
-    Ok(fs::File::create(path)?)
+fn private_file(path: &Path) -> std::io::Result<fs::File> {
+    fs::OpenOptions::new().write(true).create_new(true).open(path)
 }
 
 #[cfg(test)]
@@ -256,8 +324,12 @@ mod tests {
             reasoning: Some("high".into()),
             theme: Some("light".into()),
             reasoning_view: Some("expanded".into()),
+            utility_model: Some("gemma".into()),
+            extra: Vec::new(),
         };
         assert_eq!(Config::parse(&config.serialize()).unwrap(), config);
+        let secret = Config { token: Some("s3cr3t".into()), ..Config::default() };
+        assert!(!format!("{secret:?}").contains("s3cr3t"), "the token never shows in Debug output");
     }
 
     #[test]
@@ -266,11 +338,18 @@ mod tests {
         let config = Config::parse(text).unwrap();
         assert_eq!(config.token.as_deref(), Some("raw\\n"));
         assert_eq!(config.model.as_deref(), Some("aé"));
+
+        // A newer build's settings survive an older one: kept and written back.
+        let newer = "token = \"t\"\nfont_size = 14\nlist = [1, 2]\n[window]\ntheme = \"not ours\"\n";
+        let config = Config::parse(newer).unwrap();
+        assert_eq!((config.token.as_deref(), config.theme.as_deref()), (Some("t"), None), "keys in a table are not ours");
+        assert_eq!(config.extra, ["font_size = 14", "list = [1, 2]", "[window]", "theme = \"not ours\""]);
+        assert_eq!(Config::parse(&config.serialize()).unwrap(), config);
     }
 
     #[test]
     fn rejects_garbage() {
-        for bad in ["token", "token = x", "token = \"open", "token = \"a\" b", "token = \"\\q\""] {
+        for bad in ["token = x", "token = \"open", "token = \"a\" b", "token = \"\\q\""] {
             assert!(matches!(Config::parse(bad), Err(Error::Config { line: 1, .. })), "{bad}");
         }
     }
@@ -282,6 +361,8 @@ mod tests {
         let config = Config { token: Some("abc".into()), ..Config::default() };
         config.save_to(&path).unwrap();
         assert_eq!(Config::load_from(&path).unwrap(), config);
+        config.save_to(&path).unwrap();
+        assert_eq!(fs::read_dir(&dir).unwrap().count(), 1, "no temporary file is left behind");
         fs::remove_dir_all(&dir).unwrap();
         assert_eq!(Config::load_from(&path).unwrap(), Config::default());
     }

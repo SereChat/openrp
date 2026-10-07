@@ -4,9 +4,10 @@
 use winit::window::CursorIcon;
 
 use super::stream::MAX_RETRIES;
-use serechat::{CastMember, Role};
+use serechat::{CastMember, Player, Role};
 
-use super::tools::{self, Part};
+use super::names;
+use super::tools::Part;
 use super::{Chat, Entry, Load, PRIMARY_KEY, Page, ReasoningView, SelPos, model_name, turns, usage_caption};
 use crate::app::Action;
 use crate::doc::{Doc, INK_MUTED, INK_TEXT};
@@ -243,6 +244,10 @@ impl Chat {
         let editable: Vec<bool> = anchors.iter().map(|t| t.as_ref().is_some_and(|t| turns::has_editable(&conversation.entries, t))).collect();
         // Regenerate sends the last prompt again: there must be one.
         let regen_ok = conversation.entries.iter().any(|e| e.message.role == Role::User);
+        // The last prompt's replies, to swipe between: (shown, how many).
+        let swipes = conversation.swipes().map(|(_, shown, count)| (shown, count)).filter(|(_, count)| *count > 1);
+        let confirm_delete = self.turn_confirm;
+        let player = conversation.player.clone();
 
         // Measure everything (layouts are cached) to know the scroll range.
         let mut content_h = 24.0 + footer_h;
@@ -330,14 +335,21 @@ impl Chat {
             let actions_for = anchor.filter(|_| !busy && slots.is_empty() && turn_hovered).map(|turn| TurnButtons {
                 edit: editable[index],
                 regen: turn.end == entry_count && regen_ok,
+                swipes: swipes.filter(|_| turn.end == entry_count),
+                confirm_delete: confirm_delete == Some(entry.id),
             });
+            // A Delete waiting for its second click gives up once the turn
+            // is left.
+            if confirm_delete == Some(entry.id) && actions_for.is_none() {
+                effects.unconfirm = true;
+            }
             let sel = |doc: u8, d: &Doc| selected_range(selection, index, doc, d);
             if editing.is_some() {
                 let mut top = area.y;
                 for (k, (_, character)) in slots.iter().enumerate().filter(|(_, (id, _))| *id == entry.id) {
                     let field = if let Some(name) = character {
                         // Where the bubble was: under the name, beside the portrait.
-                        let column = speaker(p, (&conversation.cast, library), name, (x, top), width);
+                        let column = speaker(p, (&conversation.cast, player.as_ref(), library), name, (x, top), width);
                         Rect::new(column, top + NAME_H, width - AVATAR - AVATAR_GAP, field_heights[k])
                     } else {
                         Rect::new(x, top, width, field_heights[k])
@@ -372,8 +384,8 @@ impl Chat {
                     targets.push(Target { entry: index, doc: 1, origin, rect: Rect::new(origin.0, origin.1, width, doc.height) });
                 }
                 if let Some(buttons) = &actions_for {
-                    effects.turn =
-                        effects.turn.take().or(turn_buttons(p, ui, area.right(), boxed.bottom() + 6.0, buttons).map(|c| (c, index)));
+                    let clicked = turn_buttons(p, ui, area.right(), boxed.bottom() + 6.0, buttons).map(|c| (c, index, entry.id));
+                    effects.turn = effects.turn.take().or(clicked);
                 }
                 continue;
             }
@@ -383,7 +395,12 @@ impl Chat {
                 // A summary replaced the messages above for the model; it
                 // opens like a reasoning block.
                 let open = !live && entry.reasoning_open == Some(true);
-                let label = if live { "Summarising the conversation to free up context" } else { "Summarised the messages above to free up context" };
+                let label = match (live, entry.message.kept) {
+                    (true, _) => "Summarising the conversation to free up context",
+                    (false, 0) => "Summarised the messages above to free up context",
+                    // The latest turns above stay as they are.
+                    (false, _) => "Summarised the earlier messages to free up context",
+                };
                 let row = Toggle { label, expandable: !live, open, pulse: live, key: id(("summary", entry.id)) };
                 if toggle_row(p, ui, (x, top), &row, in_view) {
                     entry.reasoning_open = Some(!open);
@@ -469,7 +486,7 @@ impl Chat {
                             ((column, top), t.text_faint, Rect::new(column, top, width - AVATAR - AVATAR_GAP, doc.height))
                         }
                         Part::Said { character, .. } => {
-                            speaker(p, (&conversation.cast, library), character, (x, top), width);
+                            speaker(p, (&conversation.cast, player.as_ref(), library), character, (x, top), width);
                             // Every bubble spans the column, whatever its text.
                             let bubble = Rect::new(column, top + NAME_H, width - AVATAR - AVATAR_GAP, doc.height + 2.0 * BOX_PAD.1);
                             p.bordered(bubble, t.surface, theme::RADIUS, 1.0, t.border);
@@ -527,7 +544,7 @@ impl Chat {
             // The turn's actions, left of Copy (which keeps its place).
             if let Some(buttons) = &actions_for {
                 let right = area.right() - if has_copy { 76.0 } else { 0.0 };
-                effects.turn = effects.turn.take().or(turn_buttons(p, ui, right, meta_y, buttons).map(|c| (c, index)));
+                effects.turn = effects.turn.take().or(turn_buttons(p, ui, right, meta_y, buttons).map(|c| (c, index, entry.id)));
             }
         }
         if let Some(status) = &retry {
@@ -607,10 +624,22 @@ impl Chat {
         if effects.resume {
             self.resume(current, actions);
         }
+        if effects.unconfirm {
+            self.turn_confirm = None;
+        }
         match effects.turn {
-            Some((TurnClick::Edit, index)) => self.edit_turn(index),
-            Some((TurnClick::Regen, _)) => self.regenerate(actions),
-            Some((TurnClick::Delete, index)) => self.delete_turn(index, actions),
+            Some((TurnClick::Edit, index, _)) => self.edit_turn(index),
+            Some((TurnClick::Regen, ..)) => self.regenerate(actions),
+            Some((TurnClick::Swipe(target), ..)) => self.swipe_to(target, actions),
+            // Deleting takes a second click.
+            Some((TurnClick::Delete, index, id)) => {
+                if self.turn_confirm == Some(id) {
+                    self.turn_confirm = None;
+                    self.delete_turn(index, actions);
+                } else {
+                    self.turn_confirm = Some(id);
+                }
+            }
             None => {}
         }
         if effects.save_edit {
@@ -653,8 +682,11 @@ struct Effects {
     link: Option<String>,
     /// The Continue button was clicked.
     resume: bool,
-    /// A turn's button: what and an entry of the turn.
-    turn: Option<(TurnClick, usize)>,
+    /// A turn's button: what, an entry of the turn and the id of the entry
+    /// the buttons are under.
+    turn: Option<(TurnClick, usize, u64)>,
+    /// A Delete waiting for its second click lost its turn's hover.
+    unconfirm: bool,
     /// The edited replies' Save or Cancel was clicked.
     save_edit: bool,
     cancel_edit: bool,
@@ -666,6 +698,10 @@ struct TurnButtons {
     edit: bool,
     /// It is the last turn: its prompt can be sent again.
     regen: bool,
+    /// The last turn's replies to swipe between: (shown, how many).
+    swipes: Option<(usize, usize)>,
+    /// Delete was clicked once and waits for a second click.
+    confirm_delete: bool,
 }
 
 /// A turn button that was clicked.
@@ -674,15 +710,18 @@ enum TurnClick {
     Edit,
     Regen,
     Delete,
+    /// Show this reply (from 0) of the last prompt's.
+    Swipe(usize),
 }
 
-/// Draws a turn's Edit, Regenerate and Delete buttons, ending at `right`, on
-/// the row at `y`. Returns the one clicked.
+/// Draws a turn's swipe arrows and its Edit, Regenerate and Delete buttons,
+/// ending at `right`, on the row at `y`. Returns the one clicked.
 fn turn_buttons(p: &mut Painter, ui: &mut Ui, right: f32, y: f32, buttons: &TurnButtons) -> Option<TurnClick> {
     let mut right = right;
     let mut clicked = None;
+    let delete = if buttons.confirm_delete { ("Confirm delete", ButtonStyle::Danger, 118.0) } else { ("Delete", ButtonStyle::Ghost, 64.0) };
     let row = [
-        (true, TurnClick::Delete, ("Delete", ButtonStyle::Ghost, 64.0)),
+        (true, TurnClick::Delete, delete),
         (buttons.regen, TurnClick::Regen, ("Regenerate", ButtonStyle::Ghost, 92.0)),
         (buttons.edit, TurnClick::Edit, ("Edit", ButtonStyle::Ghost, 52.0)),
     ];
@@ -696,15 +735,34 @@ fn turn_buttons(p: &mut Painter, ui: &mut Ui, right: f32, y: f32, buttons: &Turn
         }
         right -= 4.0;
     }
+    // ‹ 2/3 › between the replies the last prompt got.
+    if let Some((shown, count)) = buttons.swipes {
+        let t = p.theme;
+        right -= 8.0;
+        let next = Rect::new(right - 24.0, y, 24.0, 24.0);
+        if button(p, ui, next, "›", ButtonStyle::Ghost, shown + 1 < count) {
+            clicked = Some(TurnClick::Swipe(shown + 1));
+        }
+        let position = p.layout(&format!("{}/{count}", shown + 1), theme::TINY, None);
+        let label_x = next.x - 4.0 - position.width();
+        p.text(&position, label_x, y + (24.0 - position.height()) * 0.5, t.text_faint);
+        let previous = Rect::new(label_x - 28.0, y, 24.0, 24.0);
+        if button(p, ui, previous, "‹", ButtonStyle::Ghost, shown > 0) {
+            clicked = Some(TurnClick::Swipe(shown - 1));
+        }
+    }
     clicked
 }
 
-/// Draws `name`'s portrait (from the story's cast, with the library that
-/// holds the images) at `(x, top)` and their name beside it, in a column
-/// `width` wide. Returns where their bubble starts.
-fn speaker(p: &mut Painter, (cast, library): (&[CastMember], &LibraryView), name: &str, (x, top): (f32, f32), width: f32) -> f32 {
-    let member = cast.iter().find(|m| tools::same(&m.name, name));
+/// Draws the portrait of whoever `name` means in the story (from its
+/// cast, with the library that holds the images) at `(x, top)` and their
+/// name beside it, in a column `width` wide: the member's name now, even
+/// when the reply used an older or shorter one. Returns where their bubble
+/// starts.
+fn speaker(p: &mut Painter, (cast, player, library): (&[CastMember], Option<&Player>, &LibraryView), name: &str, (x, top): (f32, f32), width: f32) -> f32 {
+    let member = names::member(cast, player, name).map(|i| &cast[i]);
     let path = member.and_then(|m| library.portrait_path(&m.portrait));
+    let name = member.map_or(name, |m| m.name.as_str());
     portrait(p, path.as_deref(), name, Rect::new(x, top, AVATAR, AVATAR), AVATAR * 0.5);
     let column = x + AVATAR + AVATAR_GAP;
     let mut label = p.layout(name, theme::LABEL, None);
@@ -784,7 +842,6 @@ fn selected_range(selection: Option<(SelPos, SelPos)>, entry: usize, doc_id: u8,
     (from != to).then_some((from, to))
 }
 
-/// The welcome state of an empty conversation.
 /// The welcome state of an empty conversation: the opening of a story in
 /// `story` (the world's name and portrait), or, outside any world, a way to
 /// pick one. Returns whether "Choose a world" was clicked.

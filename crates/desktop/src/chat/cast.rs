@@ -44,11 +44,16 @@ impl Chat {
             .world
             .as_deref()
             .map(|w| self.library.get(Kind::World, w).map_or(("this world", ""), |w| (w.name.as_str(), w.description.as_str())));
-        let present: Vec<_> = conversation.cast.iter().filter(|m| m.present).map(|m| (m.name.as_str(), m.description.as_str())).collect();
-        let absent: Vec<_> = conversation.cast.iter().filter(|m| !m.present).map(|m| m.name.as_str()).collect();
-        let player = conversation.player.as_ref().map(|p| (p.name.as_str(), p.description.as_str()));
-        let (memories, scene, note) = (&conversation.memories, &conversation.scene, &conversation.note);
-        super::stream::story_prompt(world, player, &present, &absent, memories, scene, note)
+        super::stream::story_prompt(world, conversation.player.as_ref(), &conversation.cast)
+    }
+
+    /// The story state sent after the latest message of conversation `id`:
+    /// its scene, who is in it, memories and author's note. `None` outside
+    /// a story.
+    pub(super) fn state(&self, id: u64) -> Option<String> {
+        let conversation = self.conversations.iter().find(|c| c.id == id)?;
+        conversation.world.as_ref()?;
+        Some(super::stream::story_state(&conversation.cast, &conversation.memories, &conversation.scene, &conversation.note))
     }
 
     /// Library characters that can still join the open story: (id, name).
@@ -98,6 +103,7 @@ impl Chat {
                     description: character.description.clone(),
                     portrait: character.portrait.clone(),
                     present: true,
+                    ..CastMember::default()
                 };
                 self.change_cast(actions, |cast| cast.push(member));
                 // Stays open to add more; whoever joined leaves the list.
@@ -337,7 +343,7 @@ mod tests {
 
         chat.play("w".into());
         assert!(chat.page == Page::Chat && !chat.current().playable(), "first: who does the user play");
-        chat.current().player = Some(serechat::Player { name: "Gale".into(), description: "A hunter too.".into() });
+        chat.current().player = Some(serechat::Player { name: "Gale".into(), description: "A hunter too.".into(), ..serechat::Player::default() });
         assert!(chat.current().playable());
         let mut actions = Vec::new();
         chat.library_menu_picked(0, &mut actions);
@@ -358,8 +364,10 @@ mod tests {
         let id = chat.current().id;
         let prompt = chat.instructions(id);
         assert!(prompt.contains("# World: Panem\n\nTwelve districts.") && prompt.contains("# The user's character: Gale\n\nA hunter too."));
-        let (here, away) = prompt.split_once("# Characters elsewhere").unwrap();
-        assert!(here.contains("## Katniss\n\nA hunter.") && away.contains("- Peeta") && !away.contains("A baker"), "names only for the absent");
+        assert!(prompt.contains("## Katniss\n\nA hunter.") && prompt.contains("## Peeta\n\nA baker."), "the whole cast, described");
+        // Who is where is the story state's.
+        let state = chat.state(id).unwrap();
+        assert!(state.contains("# In the scene\n\nKatniss") && state.contains("Peeta") && !state.contains("A baker"));
 
         // Sending saves the story with its world, cast and player.
         actions.clear();
@@ -378,7 +386,7 @@ mod tests {
     fn members_are_stored_in_characters() {
         let mut chat = Chat::new(None, Reasoning::Auto, Vec::new());
         chat.play("w".into());
-        let rue = CastMember { id: "r".into(), name: "Rue".into(), description: "Small.".into(), portrait: "rue.png".into(), present: true };
+        let rue = CastMember { id: "r".into(), name: "Rue".into(), description: "Small.".into(), portrait: "rue.png".into(), present: true, ..CastMember::default() };
         chat.current().cast.push(rue);
         assert_eq!(chat.member_menu(0)[0].label, "Store in Characters");
         let mut actions = Vec::new();
@@ -399,7 +407,7 @@ mod tests {
         let mut chat = Chat::new(None, Reasoning::Auto, Vec::new());
         for world in ["a", "b"] {
             chat.play(world.into());
-            chat.current().player = Some(serechat::Player { name: "Gale".into(), description: String::new() });
+            chat.current().player = Some(serechat::Player { name: "Gale".into(), ..serechat::Player::default() });
             chat.composer.insert("Hello.");
             chat.send(&mut Vec::new());
         }
