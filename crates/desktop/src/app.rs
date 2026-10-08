@@ -8,15 +8,15 @@
 
 use std::fmt;
 use std::path::PathBuf;
-use std::sync::atomic::AtomicBool;
-use std::sync::{Arc, mpsc};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex, PoisonError, mpsc};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use arboard::Clipboard;
 use serechat::{
-    AccessToken, Character, Client, Config, Error, InputItem, Library, Model, Portraits, ResponseRequest, Role, SearchHit, Session, SessionStore,
-    SessionSummary, StreamEvent, ToolCall, ToolChoice, ToolSpec, Usage, World,
+    Character, Client, Config, Error, InputItem, Library, LoreEntry, Model, Persona, Portraits, ResponseRequest, Role, SearchHit, Session,
+    SessionStore, SessionSummary, SignIn, StreamEvent, ToolCall, ToolChoice, ToolSpec, Usage, World,
 };
 use winit::dpi::{LogicalPosition, LogicalSize};
 use winit::event::{ElementState, Ime, MouseButton, MouseScrollDelta, WindowEvent};
@@ -31,6 +31,7 @@ use crate::log;
 use crate::login::Login;
 use crate::paint::{Painter, Rect};
 use crate::platform;
+use crate::settings::Provider;
 use crate::text::{Fonts, GlyphAtlas};
 use crate::theme::{Palette, Scheme};
 use crate::ui::{Ui, copy};
@@ -38,8 +39,14 @@ use crate::ui::{Ui, copy};
 /// Length of the cross-fade when the colour scheme changes.
 const THEME_FADE_SECS: f32 = 0.25;
 
-/// Name shown on the SereChat approval page.
-const APP_NAME: &str = "OpenRP";
+/// The keychain entry holding the SereChat sign-in's refresh token.
+const SIGN_IN: &str = "serechat";
+/// The config's `provider` when replies come from a custom provider.
+const CUSTOM: &str = "custom";
+/// Window size on first start, in logical pixels.
+const WINDOW_SIZE: (u32, u32) = (1200, 800);
+/// Smallest window size, in logical pixels.
+const MIN_WINDOW_SIZE: (u32, u32) = (760, 520);
 /// Waits before trying to load the model list again, one per failure.
 const MODEL_RETRIES: [Duration; 5] =
     [Duration::from_secs(5), Duration::from_secs(15), Duration::from_secs(30), Duration::from_secs(60), Duration::from_secs(120)];
@@ -48,18 +55,34 @@ const GPU_RETRY: Duration = Duration::from_secs(2);
 
 /// Results delivered from worker threads.
 pub enum WorkerEvent {
-    /// Step 1 of sign-in finished.
-    AuthRequested(Result<String, Error>),
-    /// Step 2 of sign-in finished.
-    AuthExchanged(Result<AccessToken, Error>),
+    /// A sign-in is listening for the browser: its consent page can open.
+    SignInOpened {
+        /// The sign-in it is for (see `Login`).
+        attempt: u64,
+        /// The consent page.
+        url: String,
+    },
+    /// A sign-in finished.
+    SignedIn {
+        /// The sign-in it is for.
+        attempt: u64,
+        /// The signed-in client, or why there is none.
+        result: Result<Client, Error>,
+    },
     /// The model list arrived.
-    Models(Result<Vec<Model>, Error>),
+    Models {
+        /// The connection it was asked for (see `App::connection`).
+        connection: u64,
+        /// The models, or why they could not be listed.
+        result: Result<Vec<Model>, Error>,
+    },
     /// A session's messages were read from disk.
     SessionLoaded {
         /// Conversation that requested them.
         conversation: u64,
-        /// The session, or why it could not be read.
-        result: Result<Session, Error>,
+        /// The session (boxed: it dwarfs the other events), or why it
+        /// could not be read.
+        result: Result<Box<Session>, Error>,
     },
     /// A streamed update for a reply.
     Stream {
@@ -97,18 +120,34 @@ pub enum WorkerEvent {
         /// The call it made, if it made one, and what the request used.
         result: Result<(Option<ToolCall>, Usage), Error>,
     },
-    /// The saved worlds and characters were read.
+    /// The saved worlds, characters and personas were read.
     Library {
         /// Every world, in no particular order.
         worlds: Vec<World>,
         /// Every character, in no particular order.
         characters: Vec<Character>,
+        /// Every persona, in no particular order.
+        personas: Vec<Persona>,
         /// Where their portraits are.
         portraits: Portraits,
     },
     /// The portrait picker closed: the name of the copied-in file, `None`
     /// when cancelled, or why it failed.
     PortraitPicked(Result<Option<String>, String>),
+    /// Character cards were read: the characters (portraits copied in)
+    /// and, for each file that could not be, why.
+    CardsImported {
+        /// One per card read, without ids yet.
+        characters: Vec<Character>,
+        /// What went wrong with the others.
+        errors: Vec<String>,
+    },
+    /// A lorebook was read for the open form: its entries (none when the
+    /// picker was cancelled), or why it could not be.
+    LoreImported(Result<Vec<LoreEntry>, String>),
+    /// A card or story was saved where the user chose; `None` when they
+    /// cancelled.
+    Exported(Option<PathBuf>),
     /// Message-content search results.
     SearchResults {
         /// Request generation, to drop stale results.
@@ -130,17 +169,15 @@ pub enum WorkerEvent {
 
 /// Something a screen wants done that needs app-level resources.
 pub enum Action {
-    /// Begin the device-code flow.
-    StartLogin,
-    /// Open the approval page for a request id.
-    OpenAuthPage(String),
-    /// Exchange a code for a token.
-    VerifyCode {
-        /// Request being approved.
-        request_id: String,
-        /// Six-digit code typed by the user.
-        code: String,
+    /// Begin a browser sign-in to SereChat.
+    StartLogin {
+        /// Numbers it, for its results.
+        attempt: u64,
+        /// Raised to give up on it.
+        cancel: Arc<AtomicBool>,
     },
+    /// Open a sign-in's consent page again.
+    OpenAuthPage(String),
     /// Stream a reply.
     Send(SendJob),
     /// Ask the character generator for someone.
@@ -177,10 +214,35 @@ pub enum Action {
     SaveWorld(World),
     /// Write a character to disk.
     SaveCharacter(Character),
-    /// Delete a world's or character's file by id.
+    /// Write a persona to disk.
+    SavePersona(Persona),
+    /// Delete a world's, character's or persona's file by id.
     DeleteRecord(Kind, String),
     /// Ask for an image and copy it in as a portrait.
     PickPortrait,
+    /// Ask for character cards (PNG or JSON) and read them in.
+    ImportCards,
+    /// Ask for a lorebook and read its entries, for the open form.
+    ImportLore,
+    /// Ask where to save a character card and write it: a PNG made from
+    /// the portrait when it has one, JSON otherwise.
+    ExportCard {
+        /// Who.
+        character: Character,
+        /// Their portrait's file.
+        portrait: Option<PathBuf>,
+    },
+    /// Ask where to save a story and write it.
+    ExportStory {
+        /// The story, with every message.
+        session: Session,
+        /// The name of its world.
+        world: String,
+        /// As a SillyTavern chat (JSONL) rather than a readable transcript.
+        jsonl: bool,
+    },
+    /// Show a folder (one a file was exported to) in the file manager.
+    OpenFolder(PathBuf),
     /// Load the model list again (it failed before).
     LoadModels,
     /// Persist the model for work beside the story; `None`: the story's.
@@ -193,7 +255,19 @@ pub enum Action {
     Copy(String),
     /// A reply finished or failed: flash the window if it is in the background.
     Attention,
-    /// Forget the token and return to sign-in.
+    /// Use a custom OpenAI-compatible provider from now on.
+    ConnectCustom {
+        /// Its API root, e.g. `https://openrouter.ai/api/v1`.
+        base_url: String,
+        /// Its key; `None` keeps the saved one if it was for the same address.
+        api_key: Option<String>,
+    },
+    /// Use SereChat from now on, signing in first if needed.
+    UseSereChat,
+    /// Forget the custom provider's key (and stop using it).
+    ForgetKey,
+    /// Forget the credentials of the provider in use and move on: to
+    /// SereChat when still signed in to it, to sign-in otherwise.
     SignOut,
 }
 
@@ -242,6 +316,9 @@ pub struct App {
     models_retry: Option<Instant>,
     /// Loads of the model list that failed in a row.
     models_failures: usize,
+    /// Counts provider changes, so a model list asked of an earlier
+    /// provider is dropped.
+    connection: u64,
     fonts: Fonts,
     atlas: GlyphAtlas,
     images: ImageAtlas,
@@ -252,10 +329,13 @@ pub struct App {
     start: Instant,
     last_frame: Instant,
     config: Config,
+    /// The client for the provider in use.
     client: Client,
+    /// Signed in to SereChat: its client, whose clones share the tokens.
+    serechat: Option<Client>,
     /// Where sessions are saved; `None` when there is no home directory.
     sessions_dir: Option<PathBuf>,
-    /// Where worlds and characters are saved; `None` without a home directory.
+    /// Where worlds, characters and personas are saved; `None` without a home directory.
     library: Option<Store>,
     /// Performs every file write, in order, off the UI thread.
     writer: Writer,
@@ -284,10 +364,14 @@ impl App {
             Config::default()
         });
         let scheme = Scheme::from_key(config.theme.as_deref());
+        let ((width, height), maximized) = window_state(config.window.as_deref());
         let attributes = Window::default_attributes()
             .with_title("OpenRP")
-            .with_inner_size(LogicalSize::new(1200.0, 800.0))
-            .with_min_inner_size(LogicalSize::new(760.0, 520.0))
+            .with_inner_size(LogicalSize::new(width, height))
+            .with_min_inner_size(LogicalSize::new(MIN_WINDOW_SIZE.0, MIN_WINDOW_SIZE.1))
+            // Windows shows a window as it maximizes it, so there it waits
+            // for the first frame (see `frame`).
+            .with_maximized(maximized && !cfg!(windows))
             .with_theme(Some(window_theme(scheme)))
             // Shown after the first frame so the user never sees a blank window.
             .with_visible(false);
@@ -308,12 +392,20 @@ impl App {
         let display = event_loop.owned_display_handle();
         let renderer = block_on(Renderer::new(Arc::clone(&window), display.clone())).map_err(StartupError::Gpu)?;
 
-        let client = Client::new(config.token.clone());
+        let serechat = match platform::secret(SIGN_IN) {
+            Ok(token) => token.map(|token| Client::signed_in(token, keychain(proxy.clone()))),
+            Err(e) => {
+                log::error(format!("cannot read the sign-in from the keychain: {e}"));
+                None
+            }
+        };
+        let client = client_for(&config, serechat.as_ref());
+        let signed_in = client.is_some();
         let sessions_dir =
             SessionStore::open().inspect_err(|e| log::error(format!("sessions will not be saved: {e}"))).ok().map(|store| store.dir().to_owned());
         let library = Library::worlds()
-            .and_then(|worlds| Ok(Store { worlds, characters: Library::characters()?, portraits: Portraits::open()? }))
-            .inspect_err(|e| log::error(format!("worlds and characters will not be saved: {e}")))
+            .and_then(|worlds| Ok(Store { worlds, characters: Library::characters()?, personas: Library::personas()?, portraits: Portraits::open()? }))
+            .inspect_err(|e| log::error(format!("worlds, characters and personas will not be saved: {e}")))
             .ok();
         let reporter = proxy.clone();
         let report = move |text: String| {
@@ -327,6 +419,7 @@ impl App {
             gpu_retry: None,
             models_retry: None,
             models_failures: 0,
+            connection: 0,
             fonts: Fonts::load(),
             atlas: GlyphAtlas::default(),
             images: ImageAtlas::default(),
@@ -338,7 +431,8 @@ impl App {
             last_frame: now,
             screen: Screen::Login(Login::new(None)),
             config,
-            client,
+            client: client.unwrap_or_default(),
+            serechat,
             writer: Writer::start(sessions_dir.clone(), report),
             sessions_dir,
             library,
@@ -350,7 +444,7 @@ impl App {
             ime_area: None,
         };
         app.ui.focused = true;
-        if app.config.token.is_some() {
+        if signed_in {
             app.enter_chat();
         }
         // Draw the first frame directly: hidden windows never receive
@@ -368,22 +462,24 @@ impl App {
         let mut chat = Chat::new(self.config.model.clone(), reasoning, sessions);
         chat.set_reasoning_view(ReasoningView::from_key(self.config.reasoning_view.as_deref()));
         chat.set_utility_model(self.config.utility_model.clone());
+        chat.set_provider(provider(&self.config, self.serechat.is_some()));
         if unreadable > 0 {
             let stories = if unreadable == 1 { "1 saved story" } else { "Some saved stories" };
             chat.notify(format!("{stories} could not be read and are not listed. Their files are left untouched."), true);
         }
         self.screen = Screen::Chat(Box::new(chat));
         self.load_models();
-        if let Some(Store { worlds, characters, portraits }) = self.library.clone() {
+        if let Some(Store { worlds, characters, personas, portraits }) = self.library.clone() {
             let proxy = self.proxy.clone();
             self.spawn(move |_, _| {
                 let (worlds, world_errors) = report(worlds.list(), "worlds");
                 let (characters, character_errors) = report(characters.list(), "characters");
-                if world_errors + character_errors > 0 {
-                    let text = "Some saved worlds or characters could not be read and are not shown. Their files are left untouched.";
+                let (personas, persona_errors) = report(personas.list(), "personas");
+                if world_errors + character_errors + persona_errors > 0 {
+                    let text = "Some saved worlds, characters or personas could not be read and are not shown. Their files are left untouched.";
                     let _ = proxy.send_event(WorkerEvent::Problem { text: text.to_owned(), folder: true });
                 }
-                WorkerEvent::Library { worlds, characters, portraits }
+                WorkerEvent::Library { worlds, characters, personas, portraits }
             });
         }
         // A story that could not be read might use any portrait.
@@ -395,7 +491,8 @@ impl App {
     /// Fetches the model list on a worker thread.
     fn load_models(&mut self) {
         self.models_retry = None;
-        self.spawn(|client, _| WorkerEvent::Models(client.models()));
+        let connection = self.connection;
+        self.spawn(move |client, _| WorkerEvent::Models { connection, result: client.models() });
     }
 
     /// Deletes, on a background thread, portraits no world, character or
@@ -409,14 +506,17 @@ impl App {
             let mut keep = std::collections::HashSet::new();
             let (worlds, world_errors) = store.worlds.list::<World>().ok()?;
             let (characters, character_errors) = store.characters.list::<Character>().ok()?;
+            let (personas, persona_errors) = store.personas.list::<Persona>().ok()?;
             // An unreadable file might use any portrait: keep them all.
-            if !world_errors.is_empty() || !character_errors.is_empty() {
+            if !world_errors.is_empty() || !character_errors.is_empty() || !persona_errors.is_empty() {
                 return None;
             }
             keep.extend(worlds.into_iter().map(|w| w.portrait));
             keep.extend(characters.into_iter().map(|c| c.portrait));
+            keep.extend(personas.into_iter().map(|p| p.portrait));
             for id in session_ids {
-                keep.extend(sessions.load(&id).ok()?.cast.into_iter().map(|m| m.portrait));
+                let session = sessions.load(&id).ok()?;
+                keep.extend(session.cast.into_iter().map(|m| m.portrait).chain(session.player.map(|p| p.portrait)));
             }
             store.portraits.collect_garbage(&keep, Duration::from_secs(24 * 60 * 60)).ok()
         };
@@ -439,14 +539,86 @@ impl App {
         self.save_config();
     }
 
+    /// Forgets the credentials of the provider in use (a custom one keeps
+    /// its address) and moves on; see [`Action::SignOut`]. `reason` says
+    /// why, when it was not the user's choice.
     fn sign_out(&mut self, reason: Option<String>) {
-        if let Screen::Chat(chat) = &mut self.screen {
-            chat.cancel_all();
+        let custom = provider(&self.config, self.serechat.is_some()).custom;
+        if custom {
+            self.config.provider = None;
+            self.config.api_key = None;
+        } else if let Some(client) = self.serechat.take() {
+            // Its keychain entry goes first, then the grant is revoked.
+            let spawned = std::thread::Builder::new().name("openrp-sign-out".into()).spawn(move || {
+                if let Err(e) = client.sign_out() {
+                    log::error(format!("could not revoke the sign-in: {e}"));
+                }
+            });
+            if let Err(e) = spawned {
+                log::error(format!("cannot spawn the sign-out thread: {e}"));
+            }
         }
-        self.config.token = None;
+        self.connect(reason.clone());
+        // Sign-in offers the custom provider's address again.
+        if custom && let (Screen::Login(_), Some(url)) = (&self.screen, &self.config.base_url) {
+            self.screen = Screen::Login(Login::custom(reason, url));
+        }
+    }
+
+    /// Saves the config and talks to the provider it names from now on: the
+    /// chat lists that provider's models, or sign-in comes up when there is
+    /// nothing to sign in with. `reason` is told to the user.
+    fn connect(&mut self, reason: Option<String>) {
         self.save_config();
-        self.client = Client::new(None);
-        self.screen = Screen::Login(Login::new(reason));
+        self.connection += 1;
+        self.models_failures = 0;
+        let Some(client) = client_for(&self.config, self.serechat.as_ref()) else {
+            if let Screen::Chat(chat) = &mut self.screen {
+                chat.cancel_all();
+            }
+            self.client = Client::new();
+            self.models_retry = None;
+            self.screen = Screen::Login(Login::new(reason));
+            return;
+        };
+        self.client = client;
+        let Screen::Chat(chat) = &mut self.screen else {
+            self.enter_chat();
+            if let (Some(reason), Screen::Chat(chat)) = (reason, &mut self.screen) {
+                chat.notify(reason, false);
+            }
+            return;
+        };
+        // The old provider's models mean nothing to the new one.
+        chat.set_models(Vec::new());
+        chat.set_provider(provider(&self.config, self.serechat.is_some()));
+        if let Some(reason) = reason {
+            chat.notify(reason, false);
+        }
+        self.load_models();
+    }
+
+    /// Whether a reply is streaming, which the provider must not change
+    /// under; the user is told so.
+    fn refuse_switch(&mut self) -> bool {
+        let Screen::Chat(chat) = &mut self.screen else {
+            return false;
+        };
+        let busy = chat.is_busy();
+        if busy {
+            chat.notify("Wait for the reply to finish, or stop it, before changing the provider.".into(), false);
+        }
+        busy
+    }
+
+    /// Why the provider stopped taking requests, for the user.
+    fn rejected(&self) -> String {
+        let text = if provider(&self.config, self.serechat.is_some()).custom {
+            "The provider refused the API key. Enter it again to keep using it."
+        } else {
+            "Your session has expired. Please sign in again."
+        };
+        text.to_owned()
     }
 
     fn save_config(&mut self) {
@@ -518,7 +690,7 @@ impl App {
             WindowEvent::Ime(ime) => {
                 match (ime, &mut self.screen) {
                     (Ime::Commit(text), Screen::Chat(chat)) => chat.ime_commit(&text),
-                    (Ime::Commit(text), Screen::Login(login)) => login.commit(&text, &mut actions),
+                    (Ime::Commit(text), Screen::Login(login)) => login.commit(&text),
                     (Ime::Preedit(text, cursor), Screen::Chat(chat)) => chat.ime_preedit(text, cursor),
                     (Ime::Disabled, Screen::Chat(chat)) => chat.ime_preedit(String::new(), None),
                     _ => return,
@@ -536,27 +708,27 @@ impl App {
         let mut actions = Vec::new();
         match (event, &mut self.screen) {
             (WorkerEvent::Thumbnail(key, pixels), _) => self.images.insert(key, pixels),
-            (WorkerEvent::AuthRequested(result), Screen::Login(login)) => {
-                if let Some(request_id) = login.requested(result) {
-                    self.open_auth_page(&request_id);
+            (WorkerEvent::SignInOpened { attempt, url }, Screen::Login(login)) => {
+                if login.opened(attempt, &url) {
+                    self.open_auth_page(&url);
                 }
             }
-            (WorkerEvent::AuthExchanged(result), Screen::Login(login)) => {
-                if let Some(token) = login.exchanged(result) {
-                    self.client = self.client.with_token(token.access_token.clone());
-                    self.config.token = Some(token.access_token);
-                    self.save_config();
-                    self.enter_chat();
+            (WorkerEvent::SignedIn { attempt, result }, Screen::Login(login)) => {
+                if let Some(client) = login.signed_in(attempt, result) {
+                    let problem = login.problem.take();
+                    self.serechat = Some(client);
+                    self.config.provider = None;
+                    self.connect(problem);
                 }
             }
-            (WorkerEvent::Models(Ok(models)), Screen::Chat(chat)) => {
+            // Asked of a provider no longer in use.
+            (WorkerEvent::Models { connection, .. }, _) if connection != self.connection => return,
+            (WorkerEvent::Models { result: Ok(models), .. }, Screen::Chat(chat)) => {
                 (self.models_retry, self.models_failures) = (None, 0);
                 chat.set_models(models);
             }
-            (WorkerEvent::Models(Err(e)), Screen::Chat(_)) if e.is_unauthorized() => {
-                self.sign_out(Some("Your session has expired. Please sign in again.".into()));
-            }
-            (WorkerEvent::Models(Err(e)), Screen::Chat(chat)) => {
+            (WorkerEvent::Models { result: Err(e), .. }, Screen::Chat(_)) if e.is_unauthorized() => self.sign_out(Some(self.rejected())),
+            (WorkerEvent::Models { result: Err(e), .. }, Screen::Chat(chat)) => {
                 log::error(format!("could not load models: {e}"));
                 chat.models_failed(format!("Could not load the models: {e}"));
                 let wait = MODEL_RETRIES[self.models_failures.min(MODEL_RETRIES.len() - 1)];
@@ -564,21 +736,26 @@ impl App {
                 self.models_retry = Some(Instant::now() + wait);
             }
             (WorkerEvent::Problem { text, folder }, Screen::Chat(chat)) => chat.notify(text, folder),
-            (WorkerEvent::Problem { text, .. }, Screen::Login(_)) => log::error(text),
-            (WorkerEvent::SessionLoaded { conversation, result }, Screen::Chat(chat)) => chat.session_loaded(conversation, result, &mut actions),
+            (WorkerEvent::Problem { text, .. }, Screen::Login(login)) => login.problem = Some(text),
+            (WorkerEvent::SessionLoaded { conversation, result }, Screen::Chat(chat)) => chat.session_loaded(conversation, result.map(|s| *s), &mut actions),
             (WorkerEvent::Stream { conversation, stream, event }, Screen::Chat(chat)) => {
                 chat.stream_event(conversation, stream, event);
             }
             (WorkerEvent::StreamEnded { conversation, stream, result }, Screen::Chat(chat)) => {
                 if chat.stream_end(conversation, stream, result, &mut actions) {
                     self.apply(actions);
-                    self.sign_out(Some("Your session has expired. Please sign in again.".into()));
+                    self.sign_out(Some(self.rejected()));
                     self.window.request_redraw();
                     return;
                 }
             }
-            (WorkerEvent::Library { worlds, characters, portraits }, Screen::Chat(chat)) => chat.library_loaded(worlds, characters, portraits),
+            (WorkerEvent::Library { worlds, characters, personas, portraits }, Screen::Chat(chat)) => {
+                chat.library_loaded(worlds, characters, personas, portraits);
+            }
             (WorkerEvent::PortraitPicked(result), Screen::Chat(chat)) => chat.portrait_picked(result),
+            (WorkerEvent::CardsImported { characters, errors }, Screen::Chat(chat)) => chat.cards_imported(characters, errors, &mut actions),
+            (WorkerEvent::LoreImported(result), Screen::Chat(chat)) => chat.lore_imported(result),
+            (WorkerEvent::Exported(path), Screen::Chat(chat)) => chat.exported(path),
             (WorkerEvent::CharacterGenerated { conversation, request, result }, Screen::Chat(chat)) => {
                 chat.character_generated(conversation, request, result);
             }
@@ -601,13 +778,17 @@ impl App {
 
     fn run(&mut self, action: Action) {
         match action {
-            Action::StartLogin => {
-                self.spawn(|client, _| WorkerEvent::AuthRequested(client.request_authorization(APP_NAME)));
+            Action::StartLogin { attempt, cancel } => {
+                let save = keychain(self.proxy.clone());
+                self.spawn(move |_, proxy| {
+                    let result = SignIn::start().and_then(|sign_in| {
+                        let _ = proxy.send_event(WorkerEvent::SignInOpened { attempt, url: sign_in.url().to_owned() });
+                        sign_in.finish(&cancel, save)
+                    });
+                    WorkerEvent::SignedIn { attempt, result }
+                });
             }
-            Action::OpenAuthPage(request_id) => self.open_auth_page(&request_id),
-            Action::VerifyCode { request_id, code } => {
-                self.spawn(move |client, _| WorkerEvent::AuthExchanged(client.exchange_code(&request_id, &code)));
-            }
+            Action::OpenAuthPage(url) => self.open_auth_page(&url),
             Action::Send(job) => self.spawn(move |client, proxy| {
                 let (conversation, stream) = (job.conversation, job.stream);
                 let input = job.input();
@@ -693,7 +874,7 @@ impl App {
             }
             Action::LoadSession { conversation, session } => {
                 if let Some(store) = self.reader() {
-                    self.spawn(move |_, _| WorkerEvent::SessionLoaded { conversation, result: store.load(&session) });
+                    self.spawn(move |_, _| WorkerEvent::SessionLoaded { conversation, result: store.load(&session).map(Box::new) });
                 }
             }
             Action::SaveSession(session) => self.writer.send(Job::SaveSession(session)),
@@ -713,9 +894,18 @@ impl App {
                     self.writer.send(Job::SaveCharacter(characters.clone(), character));
                 }
             }
+            Action::SavePersona(persona) => {
+                if let Some(Store { personas, .. }) = &self.library {
+                    self.writer.send(Job::SavePersona(personas.clone(), persona));
+                }
+            }
             Action::DeleteRecord(kind, id) => {
-                if let Some(Store { worlds, characters, .. }) = &self.library {
-                    let library = if kind == Kind::World { worlds } else { characters };
+                if let Some(Store { worlds, characters, personas, .. }) = &self.library {
+                    let library = match kind {
+                        Kind::World => worlds,
+                        Kind::Character => characters,
+                        Kind::Persona => personas,
+                    };
                     self.writer.send(Job::DeleteRecord(library.clone(), id));
                 }
             }
@@ -730,6 +920,41 @@ impl App {
                         None => Ok(None),
                     }))
                 });
+            }
+            Action::ImportCards => {
+                let Some(Store { portraits, .. }) = self.library.clone() else {
+                    return;
+                };
+                self.spawn(move |_, _| import_cards(&portraits));
+            }
+            Action::ImportLore => self.spawn(|_, _| {
+                let picked = platform::pick_files("Import a lorebook", ("Lorebooks and cards", &["json", "png"]), false);
+                let read = |path: &std::path::Path| read_file(path).and_then(|bytes| serechat::read_lorebook(&bytes).map_err(|e| e.to_string()));
+                WorkerEvent::LoreImported(match picked {
+                    Ok(paths) => paths.first().map_or(Ok(Vec::new()), |path| read(path)),
+                    Err(e) => Err(format!("Could not open the file picker: {e}")),
+                })
+            }),
+            // The file goes where the user chose, written by the worker that
+            // asked: nothing else writes there.
+            Action::ExportCard { character, portrait } => self.spawn(move |_, _| {
+                let kind = if portrait.is_some() { "png" } else { "json" };
+                let card = || match &portrait {
+                    Some(path) => image::png_bytes(path).and_then(|png| serechat::embed_card(&png, &character).map_err(|e| e.to_string())),
+                    None => Ok(serechat::card_json(&character).into_bytes()),
+                };
+                export("Export character card", &character.name, ("Character card", &[kind]), card)
+            }),
+            Action::ExportStory { session, world, jsonl } => self.spawn(move |_, _| {
+                let name = if session.title.is_empty() { world.as_str() } else { session.title.as_str() };
+                let (filter, render): (platform::Filter<'_>, fn(&Session, &str) -> String) =
+                    if jsonl { (("SillyTavern chat", &["jsonl"]), chat::export::jsonl) } else { (("Text", &["txt"]), chat::export::text) };
+                export("Export story", name, filter, || Ok(render(&session, &world).into_bytes()))
+            }),
+            Action::OpenFolder(path) => {
+                if let Err(e) = platform::open_folder(&path) {
+                    log::error(format!("cannot open the folder: {e}"));
+                }
             }
             Action::LoadModels => self.load_models(),
             Action::SetUtilityModel(model) => {
@@ -758,15 +983,44 @@ impl App {
             Action::Copy(text) => copy(&mut self.clipboard, &text),
             Action::Attention if !self.ui.focused => self.window.request_user_attention(Some(UserAttentionType::Informational)),
             Action::Attention => {}
+            Action::ConnectCustom { base_url, api_key } => {
+                if self.refuse_switch() {
+                    return;
+                }
+                // A saved key only ever goes to the address it was saved for.
+                let saved = self.config.api_key.take().filter(|_| self.config.base_url.as_deref() == Some(base_url.as_str()));
+                self.config.api_key = api_key.or(saved);
+                self.config.provider = Some(CUSTOM.to_owned());
+                self.config.base_url = Some(base_url);
+                self.connect(None);
+            }
+            Action::UseSereChat => {
+                if !self.refuse_switch() {
+                    self.config.provider = None;
+                    self.connect(None);
+                }
+            }
+            Action::ForgetKey if provider(&self.config, self.serechat.is_some()).custom => {
+                if !self.refuse_switch() {
+                    self.sign_out(None);
+                }
+            }
+            Action::ForgetKey => {
+                self.config.api_key = None;
+                self.save_config();
+                if let Screen::Chat(chat) = &mut self.screen {
+                    chat.set_provider(provider(&self.config, self.serechat.is_some()));
+                }
+            }
             Action::SignOut => self.sign_out(None),
         }
     }
 
-    fn open_auth_page(&mut self, request_id: &str) {
-        let url = self.client.authorize_url(request_id);
-        if let Err(e) = platform::open_url(&url) {
+    /// Opens a sign-in's consent page in the browser, or copies its link.
+    fn open_auth_page(&mut self, url: &str) {
+        if let Err(e) = platform::open_url(url) {
             log::error(format!("cannot open browser: {e}"));
-            copy(&mut self.clipboard, &url);
+            copy(&mut self.clipboard, url);
             if let Screen::Login(login) = &mut self.screen {
                 login.browser_failed();
             }
@@ -850,6 +1104,10 @@ impl App {
         }
         if !self.shown {
             self.shown = true;
+            // Windows shows a window as it maximizes it: only now, drawn.
+            if cfg!(windows) && window_state(self.config.window.as_deref()).1 {
+                self.window.set_maximized(true);
+            }
             self.window.set_visible(true);
             // Some platforms refuse to present to a hidden surface; draw
             // again now that the window is visible.
@@ -862,7 +1120,7 @@ impl App {
         // Keep the input method's candidate window next to the caret.
         let area = match &self.screen {
             Screen::Chat(chat) => chat.ime_area(),
-            Screen::Login(_) => None,
+            Screen::Login(login) => login.ime_area(),
         };
         if area != self.ime_area {
             self.ime_area = area;
@@ -925,11 +1183,87 @@ impl App {
     }
 }
 
-/// Where worlds, characters and portraits are saved.
+impl Drop for App {
+    fn drop(&mut self) {
+        // The next start opens the window as it was closed. A minimized
+        // window tells nothing, and a maximized one keeps its normal size.
+        if self.window.is_minimized() == Some(true) {
+            return;
+        }
+        // macOS's green button makes it fullscreen: as good as maximized.
+        let maximized = self.window.is_maximized() || self.window.fullscreen().is_some();
+        let (mut size, _) = window_state(self.config.window.as_deref());
+        if !maximized {
+            let logical = self.window.inner_size().to_logical::<f64>(self.window.scale_factor());
+            size = (logical.width.round() as u32, logical.height.round() as u32);
+        }
+        let state = format!("{}x{}{}", size.0, size.1, if maximized { " maximized" } else { "" });
+        if self.config.window.as_deref() != Some(state.as_str()) {
+            self.config.window = Some(state);
+            // The writer, dropped after this, finishes the write.
+            self.save_config();
+        }
+    }
+}
+
+/// The client for the provider `config` names, or `None` when there is
+/// nothing to sign in with: no custom provider in use and not signed in to
+/// SereChat (`serechat`).
+fn client_for(config: &Config, serechat: Option<&Client>) -> Option<Client> {
+    match (config.provider.as_deref(), &config.base_url) {
+        (Some(CUSTOM), Some(url)) => Some(Client::custom(url, config.api_key.clone())),
+        _ => serechat.cloned(),
+    }
+}
+
+/// Keeps SereChat's refresh token in the OS keychain (`None`: removes it),
+/// for [`Client::signed_in`]. Runs on whichever worker refreshed; a failure
+/// is logged and told once.
+fn keychain(proxy: EventLoopProxy<WorkerEvent>) -> impl Fn(Option<&str>) + Send + Sync + 'static {
+    let (proxy, told) = (Mutex::new(proxy), AtomicBool::new(false));
+    move |token| {
+        let Err(e) = platform::keep_secret(SIGN_IN, token) else { return };
+        log::error(format!("cannot keep the sign-in in the keychain: {e}"));
+        if !told.swap(true, Ordering::Relaxed) {
+            let text = if token.is_some() {
+                format!("Could not save your sign-in in the system keychain, so you will have to sign in again next time: {e}")
+            } else {
+                format!("Could not remove your sign-in from the system keychain: {e}")
+            };
+            let _ = proxy.lock().unwrap_or_else(PoisonError::into_inner).send_event(WorkerEvent::Problem { text, folder: false });
+        }
+    }
+}
+
+/// What the settings page shows of the providers in `config`, and whether
+/// SereChat is `signed_in`.
+fn provider(config: &Config, signed_in: bool) -> Provider {
+    Provider {
+        custom: config.provider.as_deref() == Some(CUSTOM) && config.base_url.is_some(),
+        signed_in,
+        base_url: config.base_url.clone().unwrap_or_default(),
+        has_key: config.api_key.is_some(),
+    }
+}
+
+/// Logical size and maximized state of the window from the config's
+/// `window` (`1200x800`, `1200x800 maximized`); the first-start size when
+/// absent or unreadable.
+fn window_state(saved: Option<&str>) -> ((u32, u32), bool) {
+    let saved = saved.unwrap_or_default();
+    let (size, state) = saved.split_once(' ').unwrap_or((saved, ""));
+    let size = size.split_once('x').and_then(|(w, h)| Some((w.parse::<u32>().ok()?, h.parse::<u32>().ok()?)));
+    let (w, h) = size.unwrap_or(WINDOW_SIZE);
+    // Never smaller than allowed, nor absurdly large from an edited file.
+    ((w.clamp(MIN_WINDOW_SIZE.0, 16_384), h.clamp(MIN_WINDOW_SIZE.1, 16_384)), state == "maximized")
+}
+
+/// Where worlds, characters, personas and portraits are saved.
 #[derive(Clone)]
 struct Store {
     worlds: Library,
     characters: Library,
+    personas: Library,
     portraits: Portraits,
 }
 
@@ -940,7 +1274,8 @@ enum Job {
     SaveConfig(Config),
     SaveWorld(Library, World),
     SaveCharacter(Library, Character),
-    /// Delete a world's or character's file from its library.
+    SavePersona(Library, Persona),
+    /// Delete a world's, character's or persona's file from its library.
     DeleteRecord(Library, String),
     /// List the saved sessions and send them back, with how many files
     /// could not be read.
@@ -961,6 +1296,7 @@ impl Job {
             (Self::SaveConfig(config), _) => config.save().map_err(|e| ("save the settings", e)),
             (Self::SaveWorld(library, world), _) => library.save(&world.id, &world).map_err(|e| ("save the world", e)),
             (Self::SaveCharacter(library, character), _) => library.save(&character.id, &character).map_err(|e| ("save the character", e)),
+            (Self::SavePersona(library, persona), _) => library.save(&persona.id, &persona).map_err(|e| ("save the persona", e)),
             (Self::DeleteRecord(library, id), _) => library.delete(&id).map_err(|e| ("delete the file", e)),
             (Self::ListSessions(reply), store) => {
                 let listed = match store.map(SessionStore::list) {
@@ -1072,6 +1408,58 @@ fn report<T>(listing: Result<(Vec<T>, Vec<Error>), Error>, what: &str) -> (Vec<T
     }
 }
 
+/// Largest file read for an import, as for portraits.
+const MAX_IMPORT: u64 = 20 << 20;
+
+/// Reads a file the user picked, refusing huge ones.
+fn read_file(path: &std::path::Path) -> Result<Vec<u8>, String> {
+    let too_big = std::fs::metadata(path).map_err(|e| e.to_string())?.len() > MAX_IMPORT;
+    if too_big { Err("the file is larger than 20 MB".to_owned()) } else { std::fs::read(path).map_err(|e| e.to_string()) }
+}
+
+/// Asks for character cards and reads each: a PNG card's image becomes
+/// the character's portrait, copied in under a fresh name. Runs on a worker.
+fn import_cards(portraits: &Portraits) -> WorkerEvent {
+    let paths = match platform::pick_files("Import character cards", ("Character cards", &["png", "json"]), true) {
+        Ok(paths) => paths,
+        Err(e) => return WorkerEvent::CardsImported { characters: Vec::new(), errors: vec![format!("Could not open the file picker: {e}")] },
+    };
+    let (mut characters, mut errors) = (Vec::new(), Vec::new());
+    for path in paths {
+        let read = read_file(&path).and_then(|bytes| {
+            let mut character = serechat::read_card(&bytes).map_err(|e| e.to_string())?;
+            if bytes.starts_with(b"\x89PNG") {
+                character.portrait = portraits.add(&bytes).map_err(|e| e.to_string())?;
+            }
+            Ok(character)
+        });
+        match read {
+            Ok(character) => characters.push(character),
+            Err(e) => {
+                let name = path.file_name().map_or_else(|| path.display().to_string(), |n| n.to_string_lossy().into_owned());
+                log::error(format!("could not import {name}: {e}"));
+                errors.push(format!("Could not import {name}: {e}"));
+            }
+        }
+    }
+    WorkerEvent::CardsImported { characters, errors }
+}
+
+/// Asks where to save a file named after `name`, then writes what `bytes`
+/// makes there. Runs on a worker; a failure is told as a problem.
+fn export(title: &str, name: &str, filter: platform::Filter<'_>, bytes: impl FnOnce() -> Result<Vec<u8>, String>) -> WorkerEvent {
+    let written = platform::save_file(title, name, filter)
+        .map_err(|e| format!("Could not open the file picker: {e}"))
+        .and_then(|path| path.map(|path| bytes().and_then(|b| std::fs::write(&path, b).map_err(|e| e.to_string())).map(|()| path)).transpose());
+    match written {
+        Ok(path) => WorkerEvent::Exported(path),
+        Err(e) => {
+            log::error(format!("could not export: {e}"));
+            WorkerEvent::Problem { text: format!("Could not export: {e}"), folder: false }
+        }
+    }
+}
+
 /// The OS window decoration style matching `scheme`.
 fn window_theme(scheme: Scheme) -> Theme {
     if scheme.is_light() { Theme::Light } else { Theme::Dark }
@@ -1126,6 +1514,28 @@ fn block_on<F: Future>(future: F) -> F::Output {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn window_state_survives_odd_input() {
+        assert_eq!(window_state(None), (WINDOW_SIZE, false));
+        assert_eq!(window_state(Some("1440x900")), ((1440, 900), false));
+        assert_eq!(window_state(Some("1440x900 maximized")), ((1440, 900), true));
+        assert_eq!(window_state(Some("10x99999")), ((MIN_WINDOW_SIZE.0, 16_384), false), "clamped");
+        assert_eq!(window_state(Some("NaNxinf maximized")), (WINDOW_SIZE, true));
+        assert_eq!(window_state(Some("")), (WINDOW_SIZE, false));
+    }
+
+    #[test]
+    fn custom_provider_needs_an_address() {
+        let config = Config { provider: Some(CUSTOM.into()), ..Config::default() };
+        assert!(client_for(&config, None).is_none() && !provider(&config, false).custom, "nothing to talk to");
+        let config = Config { base_url: Some("http://localhost:11434/v1".into()), ..config };
+        assert!(client_for(&config, None).is_some() && provider(&config, false).custom, "a local server needs no key");
+        let config = Config { provider: None, ..config };
+        let serechat = Client::signed_in("refresh".into(), |_| {});
+        assert!(client_for(&config, Some(&serechat)).is_some() && !provider(&config, true).custom);
+        assert!(client_for(&config, None).is_none(), "signed out of SereChat");
+    }
 
     #[test]
     fn writer_keeps_order_and_flushes_on_drop() {

@@ -245,7 +245,9 @@ impl Chat {
         // Regenerate sends the last prompt again: there must be one.
         let regen_ok = conversation.entries.iter().any(|e| e.message.role == Role::User);
         // The last prompt's replies, to swipe between: (shown, how many).
-        let swipes = conversation.swipes().map(|(_, shown, count)| (shown, count)).filter(|(_, count)| *count > 1);
+        // Or, before anyone wrote, the greetings the story can open with.
+        let swipes = conversation.swipes().map(|(_, shown, count)| (shown, count)).or_else(|| conversation.greetings()).filter(|(_, count)| *count > 1);
+        let greeting = conversation.greetings().is_some();
         let confirm_delete = self.turn_confirm;
         let player = conversation.player.clone();
 
@@ -630,6 +632,7 @@ impl Chat {
         match effects.turn {
             Some((TurnClick::Edit, index, _)) => self.edit_turn(index),
             Some((TurnClick::Regen, ..)) => self.regenerate(actions),
+            Some((TurnClick::Swipe(target), ..)) if greeting => self.swipe_greeting(target, actions),
             Some((TurnClick::Swipe(target), ..)) => self.swipe_to(target, actions),
             // Deleting takes a second click.
             Some((TurnClick::Delete, index, id)) => {
@@ -698,7 +701,8 @@ struct TurnButtons {
     edit: bool,
     /// It is the last turn: its prompt can be sent again.
     regen: bool,
-    /// The last turn's replies to swipe between: (shown, how many).
+    /// The last turn's replies (or the greetings) to swipe between:
+    /// (shown, how many).
     swipes: Option<(usize, usize)>,
     /// Delete was clicked once and waits for a second click.
     confirm_delete: bool,

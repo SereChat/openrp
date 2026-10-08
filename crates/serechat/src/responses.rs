@@ -246,52 +246,73 @@ impl Client {
     /// [`Completion::incomplete`]) and `Ok(false)` when `cancel` was raised or
     /// the stream ended early. `cancel` is checked between SSE lines, which
     /// arrive at least every 15 seconds thanks to the server's keep-alives.
+    /// A custom provider ([`Client::custom`]) is asked with Chat Completions
+    /// and its stream translated into the same events.
     ///
     /// # Errors
     /// Network failures, non-success statuses, and failures reported inside
     /// the stream ([`Error::Response`]).
     pub fn stream_response(&self, request: &ResponseRequest<'_>, cancel: &AtomicBool, mut on_event: impl FnMut(StreamEvent)) -> Result<bool> {
-        let response = self.post("/v1/responses", &request.to_json(), true)?;
-        let mut reader = std::io::BufReader::new(response.into_body().into_reader());
-        let mut decoder = sse::Decoder::default();
-        let mut buffer = Vec::new();
-        let mut ended = false;
-
-        while !ended {
-            if cancel.load(Ordering::Relaxed) {
-                return Ok(false);
-            }
-            // The trailing empty line flushes an event the server did not terminate.
-            let line = read_line(&mut reader, &mut buffer)?.unwrap_or_else(|| {
-                ended = true;
-                String::new()
-            });
-            if line.starts_with(':') {
-                on_event(StreamEvent::Ping);
-                continue;
-            }
-            let Some(event) = decoder.line(&line) else {
-                if decoder.pending() > MAX_EVENT {
-                    return Err(too_large("event"));
-                }
-                continue;
-            };
+        if self.custom {
+            return crate::completions::stream(self, request, cancel, &mut on_event);
+        }
+        let response = self.post("/v1/responses", &request.to_json())?;
+        read_events(response, cancel, &mut on_event, |event, on_event| {
             if event.name == "response.failed"
                 && let Ok(value) = serde_json::from_str::<Value>(&event.data)
                 && let Some(usage) = usage_at(&value).filter(|u| *u != Usage::default())
             {
                 on_event(StreamEvent::Charged(usage));
             }
-            if let Some(event) = parse_event(&event.name, &event.data)? {
-                let done = matches!(event, StreamEvent::Completed(_));
-                on_event(event);
-                if done {
-                    return Ok(true);
-                }
-            }
-        }
-        Ok(false)
+            let Some(event) = parse_event(&event.name, &event.data)? else {
+                return Ok(false);
+            };
+            let done = matches!(event, StreamEvent::Completed(_));
+            on_event(event);
+            Ok(done)
+        })
     }
+}
+
+/// Reads `response` as server-sent events, handing each to `handle` until it
+/// returns `Ok(true)`: the response is complete. Comments are the server's
+/// keep-alives. Returns `Ok(true)` when complete and `Ok(false)` when
+/// `cancel` was raised or the stream ended first; `cancel` is checked
+/// between lines.
+pub(crate) fn read_events(
+    response: ureq::http::Response<ureq::Body>,
+    cancel: &AtomicBool,
+    on_event: &mut dyn FnMut(StreamEvent),
+    mut handle: impl FnMut(sse::Event, &mut dyn FnMut(StreamEvent)) -> Result<bool>,
+) -> Result<bool> {
+    let mut reader = std::io::BufReader::new(response.into_body().into_reader());
+    let mut decoder = sse::Decoder::default();
+    let mut buffer = Vec::new();
+    let mut ended = false;
+    while !ended {
+        if cancel.load(Ordering::Relaxed) {
+            return Ok(false);
+        }
+        // The trailing empty line flushes an event the server did not terminate.
+        let line = read_line(&mut reader, &mut buffer)?.unwrap_or_else(|| {
+            ended = true;
+            String::new()
+        });
+        if line.starts_with(':') {
+            on_event(StreamEvent::Ping);
+            continue;
+        }
+        let Some(event) = decoder.line(&line) else {
+            if decoder.pending() > MAX_EVENT {
+                return Err(too_large("event"));
+            }
+            continue;
+        };
+        if handle(event, on_event)? {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 /// Reads one line (without its terminator) of at most [`MAX_LINE`] bytes

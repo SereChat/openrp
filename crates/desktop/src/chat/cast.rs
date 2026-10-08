@@ -8,13 +8,17 @@
 //! also shows who the user plays, and opens the player form, and above
 //! the cast, the scene (set by the model, or by clicking it), beside the
 //! buttons that open the story's memories and author's note.
+//!
+//! A story nobody has written in yet opens with a greeting: the first
+//! message of the first character in the scene whose library character has
+//! one, the others to swipe to (see [`Chat::greet`]).
 
-use serechat::CastMember;
+use serechat::{CastMember, StoredMessage, macros};
 use winit::window::CursorIcon;
 
-use super::{Chat, Menu, MenuItem, Page};
+use super::{Chat, Entry, Load, Menu, MenuItem, Page, tools};
 use crate::app::Action;
-use crate::library::{Kind, portrait};
+use crate::library::{Kind, Record, portrait};
 use crate::paint::{Painter, Rect, fade, mix};
 use crate::theme;
 use crate::ui::{ButtonStyle, Ui, button, id};
@@ -33,6 +37,39 @@ impl Chat {
         self.current().world = Some(world);
     }
 
+    /// Starts a story in `world` with the character Play was pressed for
+    /// in the scene; their greeting opens it once the user says who they are.
+    pub(super) fn play_character_in(&mut self, world: String, actions: &mut Vec<Action>) {
+        let id = std::mem::take(&mut self.play_character);
+        let Some(member) = self.library.get(Kind::Character, &id).map(cast_member) else { return };
+        self.play(world);
+        self.change_cast(actions, |cast| cast.push(member));
+    }
+
+    /// Opens the story with a greeting, if nobody has written in it yet:
+    /// the first message of the first member in the scene whose library
+    /// character has one, as their bubble (their other greetings are kept
+    /// to swipe to). `{{user}}` and `{{char}}` are filled in.
+    pub(super) fn greet(&mut self, actions: &mut Vec<Action>) {
+        let id = self.next_id();
+        let library = &self.library;
+        let Some(conversation) = self.conversations.iter_mut().find(|c| c.id == self.current) else { return };
+        let Some(player) = conversation.player.as_ref().map(|p| p.name.clone()) else { return };
+        if !conversation.entries.is_empty() || conversation.world.is_none() || conversation.load != Load::Loaded {
+            return;
+        }
+        let greeter = conversation.cast.iter().filter(|m| m.present).find_map(|m| {
+            let greetings = &library.get(Kind::Character, &m.id)?.greetings;
+            (!greetings.is_empty()).then(|| (m.name.clone(), greetings.clone()))
+        });
+        let Some((name, greetings)) = greeter else { return };
+        let mut opening: Vec<StoredMessage> = greetings.iter().map(|g| tools::greeting(&name, &macros(g, Some(&name), &player))).collect();
+        let mut first = opening.remove(0);
+        first.swipes = opening.into_iter().map(|m| vec![m]).collect();
+        conversation.entries.push(Entry::new(id, first));
+        actions.push(Action::SaveSession(conversation.to_session()));
+    }
+
     /// The system prompt for conversation `id`: its world (as the library
     /// has it now), who the user plays, and its cast.
     pub(super) fn instructions(&self, id: u64) -> String {
@@ -40,32 +77,45 @@ impl Chat {
             return String::new();
         };
         // A story stays a story even before the library has loaded its world.
-        let world = conversation
-            .world
-            .as_deref()
-            .map(|w| self.library.get(Kind::World, w).map_or(("this world", ""), |w| (w.name.as_str(), w.description.as_str())));
+        let world = conversation.world.as_deref().map(|w| {
+            self.library.get(Kind::World, w).map_or(("this world", "", &[][..]), |w| (w.name.as_str(), w.description.as_str(), w.lore.as_slice()))
+        });
         super::stream::story_prompt(world, conversation.player.as_ref(), &conversation.cast)
     }
 
     /// The story state sent after the latest message of conversation `id`:
-    /// its scene, who is in it, memories and author's note. `None` outside
-    /// a story.
+    /// its scene, who is in it, the lore its latest turns mention, memories
+    /// and author's note. `None` outside a story.
     pub(super) fn state(&self, id: u64) -> Option<String> {
         let conversation = self.conversations.iter().find(|c| c.id == id)?;
-        conversation.world.as_ref()?;
-        Some(super::stream::story_state(&conversation.cast, &conversation.memories, &conversation.scene, &conversation.note))
+        let world = self.library.get(Kind::World, conversation.world.as_deref()?);
+        let world_lore = world.map_or(&[][..], |w| w.lore.as_slice());
+        let user = conversation.player.as_ref().map_or("the user", |p| p.name.as_str());
+        // Only a story with lore reads its latest turns for it.
+        let lore = if world_lore.is_empty() && conversation.cast.iter().all(|m| m.lore.is_empty()) {
+            Vec::new()
+        } else {
+            let from = super::stream::lore_start(&conversation.entries);
+            let recent: Vec<StoredMessage> = conversation.entries[from..].iter().map(|e| e.message.clone()).collect();
+            let text = format!("{}\n{}", conversation.scene, tools::transcript(&recent, user, usize::MAX));
+            super::stream::lore_in_play(world_lore, &conversation.cast, &text, user)
+        };
+        Some(super::stream::story_state(&conversation.cast, &lore, &conversation.memories, &conversation.scene, &conversation.note))
     }
 
-    /// Library characters that can still join the open story: (id, name).
-    pub(super) fn cast_choices(&mut self) -> Vec<(String, String)> {
-        let cast: Vec<String> = self.current().cast.iter().map(|m| m.id.clone()).collect();
-        self.library.list(Kind::Character).iter().filter(|c| !cast.contains(&c.id)).map(|c| (c.id.clone(), c.name.clone())).collect()
+    /// Library characters that can still join the open story, favourites
+    /// first.
+    pub(super) fn cast_choices(&self) -> Vec<&Record> {
+        let Some(conversation) = self.conversations.iter().find(|c| c.id == self.current) else { return Vec::new() };
+        let cast = |id: &str| conversation.cast.iter().any(|m| m.id == id);
+        let mut choices: Vec<&Record> = self.library.list(Kind::Character).iter().filter(|c| !cast(&c.id)).collect();
+        choices.sort_by_key(|c| !c.favorite);
+        choices
     }
 
     /// Rows of the add-to-cast menu.
     pub(super) fn cast_menu() -> Vec<MenuItem> {
-        let row = |label: &str, detail: &str| MenuItem { label: label.to_owned(), detail: detail.to_owned(), selected: false };
-        vec![row("From characters…", "Your library"), row("Create character…", ""), row("Generate character…", "AI")]
+        vec![MenuItem::new("From characters…", "Your library"), MenuItem::new("Create character…", ""), MenuItem::new("Generate character…", "AI")]
     }
 
     /// Applies row `index` of the add-to-cast menu.
@@ -82,30 +132,22 @@ impl Chat {
 
     /// Rows of the library menu: the characters that can join, then a way
     /// to the characters page.
-    pub(super) fn library_menu(&mut self) -> Vec<MenuItem> {
-        let mut items: Vec<MenuItem> =
-            self.cast_choices().into_iter().map(|(_, name)| MenuItem { label: name, detail: String::new(), selected: false }).collect();
+    pub(super) fn library_menu(&self) -> Vec<MenuItem> {
+        let mut items: Vec<MenuItem> = self.cast_choices().into_iter().map(MenuItem::record).collect();
         let more = if self.library.list(Kind::Character).is_empty() { "Create a character…" } else { "Manage characters…" };
-        items.push(MenuItem { label: more.to_owned(), detail: String::new(), selected: false });
+        items.push(MenuItem::new(more, ""));
         items
     }
 
     /// Applies row `index` of the library menu, which stays open while
     /// there is anyone left to add.
     pub(super) fn library_menu_picked(&mut self, index: usize, actions: &mut Vec<Action>) {
-        let picked = self.cast_choices().into_iter().nth(index).and_then(|(id, _)| self.library.get(Kind::Character, &id));
+        let picked = self.cast_choices().into_iter().nth(index).map(cast_member);
         match picked {
-            // A copy: the story keeps it whatever the library does later.
-            Some(character) => {
-                let member = CastMember {
-                    id: character.id.clone(),
-                    name: character.name.clone(),
-                    description: character.description.clone(),
-                    portrait: character.portrait.clone(),
-                    present: true,
-                    ..CastMember::default()
-                };
+            Some(member) => {
                 self.change_cast(actions, |cast| cast.push(member));
+                // The first to join a story nobody wrote in yet may open it.
+                self.greet(actions);
                 // Stays open to add more; whoever joined leaves the list.
                 if !self.cast_choices().is_empty() {
                     self.menu = Some(Menu::CastLibrary);
@@ -118,10 +160,9 @@ impl Chat {
     /// Rows of cast member `member`'s menu: storing them updates the library
     /// character they were cast from, if there is one.
     pub(super) fn member_menu(&mut self, member: usize) -> Vec<MenuItem> {
-        let row = |label: &str, detail: &str| MenuItem { label: label.to_owned(), detail: detail.to_owned(), selected: false };
         let id = self.current().cast.get(member).map(|m| m.id.clone()).unwrap_or_default();
         let store = if self.library.get(Kind::Character, &id).is_some() { "Update in Characters" } else { "Store in Characters" };
-        vec![row(store, "For other stories"), row("Edit…", ""), row("Delete", "From this story")]
+        vec![MenuItem::new(store, "For other stories"), MenuItem::new("Edit…", ""), MenuItem::new("Delete", "From this story")]
     }
 
     /// Applies row `index` of cast member `member`'s menu.
@@ -129,7 +170,7 @@ impl Chat {
         match index {
             0 => {
                 if let Some(m) = self.current().cast.get(member).cloned() {
-                    self.library.store_character(&m.id, &m.name, &m.description, &m.portrait, actions);
+                    self.library.store_character(&m, actions);
                 }
             }
             1 => self.edit_member(member),
@@ -160,7 +201,7 @@ impl Chat {
         }
         let t = p.theme;
         let cast = conversation.cast.clone();
-        let player = conversation.player.as_ref().map(|p| p.name.clone());
+        let player = conversation.player.as_ref().map(|p| (p.name.clone(), p.portrait.clone()));
         let scene = conversation.scene.clone();
         let (memories, has_note) = (conversation.memories.len(), !conversation.note.trim().is_empty());
         let reviewing = conversation.reviewing.is_some();
@@ -211,11 +252,14 @@ impl Chat {
             at_x += width + 6.0;
             rect
         };
-        // Who the user plays comes first; clicking it edits them.
-        let you = player.map(|name| {
+        // Who the user plays comes first, with their portrait if they have
+        // one; clicking it edits them.
+        let you = player.map(|(name, portrait)| {
             let mut text = p.layout(&format!("You · {name}"), theme::SMALL, None);
             text.truncate(p.fonts, 180.0);
-            (place(text.width() + 22.0), text)
+            let path = self.library.portrait_path(&portrait);
+            let photo = if path.is_some() { CHIP_H - 4.0 } else { 0.0 };
+            (place(text.width() + 22.0 + photo), text, path)
         });
         let mut chips = Vec::with_capacity(cast.len());
         for member in &cast {
@@ -230,11 +274,17 @@ impl Chat {
         p.text(&label, left, top + 5.0 + (ROW_H - label.height()) * 0.5, t.text_faint);
 
         let mut edit_you = false;
-        if let Some((chip, text)) = &you {
+        if let Some((chip, text, path)) = &you {
             let hovered = ui.hovered(*chip);
             let hover = ui.anim(id("cast-you"), f32::from(u8::from(hovered)));
             p.rect(*chip, fade(t.accent, 0.14 + 0.1 * hover), CHIP_H * 0.5);
-            p.text(text, chip.x + 11.0, chip.y + (CHIP_H - text.height()) * 0.5, t.text);
+            let mut text_x = chip.x + 11.0;
+            if let Some(path) = path {
+                let photo = Rect::new(chip.x + 3.0, chip.y + 3.0, CHIP_H - 6.0, CHIP_H - 6.0);
+                portrait(p, Some(path), "", photo, photo.w * 0.5);
+                text_x = photo.right() + 7.0;
+            }
+            p.text(text, text_x, chip.y + (CHIP_H - text.height()) * 0.5, t.text);
             if hovered {
                 ui.cursor = CursorIcon::Pointer;
                 edit_you = ui.clicked(*chip);
@@ -325,6 +375,21 @@ impl Chat {
     }
 }
 
+/// A library character as a story's cast member, in the scene: a copy, so
+/// the story keeps them whatever the library does later.
+fn cast_member(character: &Record) -> CastMember {
+    CastMember {
+        id: character.id.clone(),
+        name: character.name.clone(),
+        description: character.description.clone(),
+        portrait: character.portrait.clone(),
+        examples: character.examples.clone(),
+        lore: character.lore.clone(),
+        present: true,
+        ..CastMember::default()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use serechat::{Character, Portraits, World};
@@ -338,7 +403,7 @@ mod tests {
         let world = World { id: "w".into(), name: "Panem".into(), description: "Twelve districts.".into(), ..World::default() };
         let katniss = Character { id: "k".into(), name: "Katniss".into(), description: "A hunter.".into(), ..Character::default() };
         let peeta = Character { id: "p".into(), name: "Peeta".into(), description: "A baker.".into(), ..Character::default() };
-        chat.library_loaded(vec![world], vec![katniss, peeta], Portraits::at("portraits".into()));
+        chat.library_loaded(vec![world], vec![katniss, peeta], Vec::new(), Portraits::at("portraits".into()));
         assert!(!chat.current().playable(), "nothing to write in before Play");
 
         chat.play("w".into());
@@ -360,7 +425,7 @@ mod tests {
 
         // The cast holds copies: the library losing Katniss changes nothing.
         let world = World { id: "w".into(), name: "Panem".into(), description: "Twelve districts.".into(), ..World::default() };
-        chat.library_loaded(vec![world], Vec::new(), Portraits::at("portraits".into()));
+        chat.library_loaded(vec![world], Vec::new(), Vec::new(), Portraits::at("portraits".into()));
         let id = chat.current().id;
         let prompt = chat.instructions(id);
         assert!(prompt.contains("# World: Panem\n\nTwelve districts.") && prompt.contains("# The user's character: Gale\n\nA hunter too."));
@@ -380,6 +445,70 @@ mod tests {
         let Some(Action::Send(job)) = actions.last() else { panic!("not sent") };
         assert_eq!(job.instructions, prompt);
         assert!(job.tools, "stories offer the story's tools");
+    }
+
+    #[test]
+    fn a_characters_greeting_opens_the_story() {
+        let mut chat = Chat::new(None, Reasoning::Auto, Vec::new());
+        let world = World { id: "w".into(), name: "Ard".into(), ..World::default() };
+        let greetings = vec!["Hi, {{user}}.".into(), "Back, {{user}}?".into()];
+        let mira = Character { id: "m".into(), name: "Mira".into(), greetings, examples: "Hm.".into(), ..Character::default() };
+        chat.library_loaded(vec![world], vec![mira], Vec::new(), Portraits::at("portraits".into()));
+
+        // Play on a character: a story in the world picked, with her in the scene.
+        chat.play_character = "m".into();
+        let mut actions = Vec::new();
+        chat.play_character_in("w".into(), &mut actions);
+        assert!(chat.current().cast.iter().any(|m| m.name == "Mira" && m.examples == "Hm." && m.present), "cast with what the prompt needs");
+        chat.greet(&mut actions);
+        assert!(chat.current().entries.is_empty(), "not before the user says who they are");
+
+        // Once they do, she opens it; her other greeting can be swiped to.
+        chat.current().player = Some(serechat::Player { name: "Gale".into(), ..serechat::Player::default() });
+        chat.greet(&mut actions);
+        let said = |chat: &mut Chat| {
+            let entry = chat.current().entries.first_mut().unwrap();
+            entry.refresh_display(false, true);
+            entry.display.clone()
+        };
+        assert_eq!(said(&mut chat), "**Mira**: Hi, Gale.");
+        assert_eq!(chat.current().greetings(), Some((0, 2)));
+        assert!(matches!(actions.last(), Some(Action::SaveSession(s)) if s.messages.len() == 1 && s.messages[0].swipes.len() == 1));
+        chat.greet(&mut actions);
+        assert_eq!(chat.current().entries.len(), 1, "only once");
+        chat.swipe_greeting(1, &mut actions);
+        assert_eq!((said(&mut chat), chat.current().greetings()), ("**Mira**: Back, Gale?".to_owned(), Some((1, 2))));
+        chat.swipe_greeting(0, &mut actions);
+        assert_eq!(said(&mut chat), "**Mira**: Hi, Gale.");
+
+        // The model reads her greeting as her turn; once the user writes, it stays.
+        chat.composer.insert("Hello.");
+        chat.send(&mut actions);
+        assert!(chat.current().greetings().is_none());
+        let Some(Action::Send(job)) = actions.pop() else { panic!("not sent") };
+        assert!(job.instructions.contains("### How Mira talks"));
+        assert!(matches!(&job.input()[1], serechat::InputItem::ToolCall(call) if call.arguments.contains("Hi, Gale.")));
+    }
+
+    #[test]
+    fn stories_are_exported_once_read() {
+        let session = serechat::Session {
+            id: "s".into(),
+            title: "Night".into(),
+            world: Some("w".into()),
+            messages: vec![serechat::StoredMessage::new(serechat::Role::User, "Hi.".into())],
+            ..serechat::Session::default()
+        };
+        let mut chat = Chat::new(None, Reasoning::Auto, vec![session.summary()]);
+        let world = World { id: "w".into(), name: "Ard".into(), ..World::default() };
+        chat.library_loaded(vec![world], Vec::new(), Vec::new(), Portraits::at("portraits".into()));
+        let id = chat.conversations.iter().find(|c| c.session_id == "s").unwrap().id;
+        let mut actions = Vec::new();
+        chat.export(id, true, &mut actions);
+        assert!(matches!(&actions[..], [Action::LoadSession { .. }]), "read first");
+        let mut actions = Vec::new();
+        chat.session_loaded(id, Ok(session), &mut actions);
+        assert!(matches!(&actions[..], [Action::ExportStory { session, world, jsonl: true }] if session.messages.len() == 1 && world == "Ard"));
     }
 
     #[test]
@@ -413,7 +542,7 @@ mod tests {
         }
         // A world's page lists its stories.
         let world = |id: &str| serechat::World { id: id.into(), name: id.into(), ..serechat::World::default() };
-        chat.library_loaded(vec![world("a"), world("b")], Vec::new(), Portraits::at("portraits".into()));
+        chat.library_loaded(vec![world("a"), world("b")], Vec::new(), Vec::new(), Portraits::at("portraits".into()));
         assert!(chat.world_stories().is_empty(), "no world open");
         chat.library.open_form(Kind::World, "a");
         let stories = chat.world_stories();

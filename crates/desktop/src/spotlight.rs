@@ -1,7 +1,9 @@
 //! Spotlight: a keyboard-first search over everything (commands, stories,
-//! worlds, characters, models and themes), plus full-text search of every
-//! saved message on a worker thread. A story also matches its world's name,
-//! so typing a world lists its stories.
+//! worlds, characters, personas, models and themes), plus full-text search
+//! of every saved message on a worker thread. A story also matches its
+//! world's name, so typing a world lists its stories. Library records match
+//! by name, then by the user's comment (shown beside them), then by
+//! description.
 
 use arboard::Clipboard;
 use serechat::{Model, SearchHit};
@@ -35,12 +37,16 @@ pub enum Pick {
     Worlds,
     /// Show the characters.
     Characters,
+    /// Show the personas.
+    Personas,
     /// Open a world's page, with its stories, by id.
     World(String),
     /// Start a story in a world, by id.
     Play(String),
     /// Open a library character's form by id.
     Character(String),
+    /// Open a persona's form by id.
+    Persona(String),
     /// Open a session by id.
     Session(String),
     /// Use a model.
@@ -67,6 +73,8 @@ pub struct Context<'a> {
     pub worlds: &'a [Record],
     /// The characters in the library.
     pub characters: &'a [Record],
+    /// The user's personas.
+    pub personas: &'a [Record],
     /// Available models.
     pub models: &'a [Model],
     /// Selected model id.
@@ -172,11 +180,23 @@ impl Spotlight {
             let in_also = || (!query.is_empty() && also.to_lowercase().contains(&query)).then_some(100);
             fuzzy(&query, title).or_else(in_also).map(|score| Row { group: "", title: title.to_owned(), detail, pick, score: score + extra })
         };
+        // A library record: by name, then by its comment (which tells
+        // look-alikes apart, so it shows beside it), then by description.
+        let record = |r: &Record, kind: &str, pick: Pick| {
+            let detail = if r.comment.is_empty() { kind.to_owned() } else { format!("{kind} · {}", r.comment) };
+            let by_comment = (!r.comment.is_empty() && r.comment.to_lowercase().contains(&query)).then_some(600);
+            match (row(&r.name, &r.description, detail.clone(), pick.clone(), 0), by_comment) {
+                (Some(found), by_comment) => Some(Row { score: found.score.max(by_comment.unwrap_or(i32::MIN)), ..found }),
+                (None, Some(score)) => Some(Row { group: "", title: r.name.clone(), detail, pick, score }),
+                (None, None) => None,
+            }
+        };
 
         let commands = [
             ("Play a world", "Start a story in one of your worlds", Pick::Worlds),
             ("Worlds", "Settings for your stories", Pick::Worlds),
             ("Characters", "People the AI plays", Pick::Characters),
+            ("Personas", "Who you play", Pick::Personas),
             ("Settings", "Appearance, usage, data and account", Pick::Settings),
         ];
         group("Commands", commands.into_iter().filter_map(|(t, d, p)| row(t, d, d.to_owned(), p, 0)).collect());
@@ -204,12 +224,13 @@ impl Spotlight {
         // world to open or play, and the characters. Descriptions match too.
         if !query.is_empty() {
             let worlds = cx.worlds.iter().flat_map(|w| {
-                let open = row(&w.name, &w.description, "World".into(), Pick::World(w.id.clone()), 0);
+                let open = record(w, "World", Pick::World(w.id.clone()));
                 let play = row(&format!("Play {}", w.name), "", "Start a story".into(), Pick::Play(w.id.clone()), -10);
                 open.into_iter().chain(play)
             });
             group("Worlds", worlds.collect());
-            group("Characters", cx.characters.iter().filter_map(|c| row(&c.name, &c.description, "Character".into(), Pick::Character(c.id.clone()), 0)).collect());
+            group("Characters", cx.characters.iter().filter_map(|c| record(c, "Character", Pick::Character(c.id.clone()))).collect());
+            group("Personas", cx.personas.iter().filter_map(|c| record(c, "Persona", Pick::Persona(c.id.clone()))).collect());
             group(
                 "Models",
                 cx.models
@@ -469,6 +490,7 @@ mod tests {
             ],
             worlds: &world,
             characters: &hunter,
+            personas: &[],
             models: &[],
             model: "",
             scheme: Scheme::Dark,
@@ -499,6 +521,7 @@ mod tests {
             ],
             worlds: &world,
             characters: &hunter,
+            personas: &[],
             models: &[],
             model: "",
             scheme: Scheme::Dark,
@@ -517,5 +540,26 @@ mod tests {
         assert_eq!(picks("katn"), [("Characters", Pick::Character("c1".into()))]);
         assert!(picks("district 12").contains(&("Characters", Pick::Character("c1".into()))));
         assert!(!picks("").iter().any(|(g, _)| matches!(*g, "Worlds" | "Characters")));
+    }
+
+    #[test]
+    fn comments_find_library_records() {
+        let (world, _) = library();
+        let record = |id: &str, name: &str, comment: &str, description: &str| {
+            let c = serechat::Character { id: id.into(), name: name.into(), comment: comment.into(), description: description.into(), ..Default::default() };
+            Record::from(c)
+        };
+        let characters = [record("a", "Mira", "", "Sharp, quiet."), record("b", "Rex", "the sharp one", "")];
+        let gale = [Record::from(serechat::Persona { id: "p".into(), name: "Gale".into(), comment: "my hunter".into(), ..Default::default() })];
+        let cx = Context { sessions: Vec::new(), worlds: &world, characters: &characters, personas: &gale, models: &[], model: "", scheme: Scheme::Dark };
+        let rows = |query: &str| {
+            let mut spotlight = Spotlight::default();
+            spotlight.input.insert(query);
+            spotlight.rows(&cx).into_iter().filter(|r| r.group != "Commands").map(|r| (r.pick, r.detail)).collect::<Vec<_>>()
+        };
+        let sharp = rows("sharp");
+        assert_eq!(sharp[0], (Pick::Character("b".into()), "Character · the sharp one".into()), "a comment ranks above a description");
+        assert_eq!(sharp[1].0, Pick::Character("a".into()));
+        assert_eq!(rows("hunter"), [(Pick::Persona("p".into()), "Persona · my hunter".into())], "personas too");
     }
 }

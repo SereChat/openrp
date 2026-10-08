@@ -27,6 +27,12 @@ impl Editor {
         Self { max_chars: Some(max_chars), filter: Some(filter), ..Self::default() }
     }
 
+    /// Whether typing `c` would insert it.
+    #[must_use]
+    pub fn accepts(&self, c: char) -> bool {
+        self.filter.map_or(c == '\n' || c == '\t' || !c.is_control(), |f| f(c))
+    }
+
     /// Current contents.
     #[must_use]
     pub fn text(&self) -> &str {
@@ -62,9 +68,8 @@ impl Editor {
     pub fn insert(&mut self, input: &str) {
         self.delete_selection();
         let budget = self.max_chars.map_or(usize::MAX, |max| max.saturating_sub(self.text.chars().count()));
-        let allowed = |c: char| self.filter.map_or(c == '\n' || c == '\t' || !c.is_control(), |f| f(c));
         let filtered: String =
-            input.replace("\r\n", "\n").chars().map(|c| if c == '\r' { '\n' } else { c }).filter(|&c| allowed(c)).take(budget).collect();
+            input.replace("\r\n", "\n").chars().map(|c| if c == '\r' { '\n' } else { c }).filter(|&c| self.accepts(c)).take(budget).collect();
         self.text.insert_str(self.cursor, &filtered);
         self.cursor += filtered.len();
         self.anchor = self.cursor;

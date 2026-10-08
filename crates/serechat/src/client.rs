@@ -1,15 +1,18 @@
-//! Blocking HTTP client for the SereChat API.
+//! Blocking HTTP client for the SereChat API, or for an OpenAI-compatible
+//! provider spoken to with Chat Completions (see `completions.rs`).
 //!
 //! Every call blocks the calling thread; the desktop app runs them on worker
 //! threads so the render loop never waits on the network.
 
+use std::sync::Arc;
 use std::time::Duration;
 
 use serde::Deserialize;
-use serde_json::{Value, json};
+use serde_json::Value;
 use ureq::http::Response;
 
 use crate::error::{Error, Result};
+use crate::oauth::OAuth;
 
 /// Production API origin.
 pub const BASE_URL: &str = "https://serechat.com";
@@ -23,29 +26,23 @@ const MAX_RETRY_AFTER: Duration = Duration::from_secs(10 * 60);
 pub struct Client {
     agent: ureq::Agent,
     base: String,
+    /// A custom provider's API key.
     token: Option<String>,
+    /// The SereChat sign-in, shared by every clone (see `oauth.rs`).
+    pub(crate) oauth: Option<Arc<OAuth>>,
+    /// An OpenAI-compatible provider: `base` is its API root (the part
+    /// before `/chat/completions`), and replies use Chat Completions.
+    pub(crate) custom: bool,
 }
 
 impl std::fmt::Debug for Client {
     // Hand-written so the bearer token never ends up in logs.
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("Client").field("base", &self.base).field("authenticated", &self.token.is_some()).finish_non_exhaustive()
-    }
-}
-
-/// Result of a successful device-code exchange.
-#[derive(Clone, Deserialize)]
-pub struct AccessToken {
-    /// Bearer token for inference requests.
-    pub access_token: String,
-    /// Lifetime in seconds (currently one year).
-    pub expires_in: u64,
-}
-
-impl std::fmt::Debug for AccessToken {
-    // Hand-written so the bearer token never ends up in logs.
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("AccessToken").field("expires_in", &self.expires_in).finish_non_exhaustive()
+        f.debug_struct("Client")
+            .field("base", &self.base)
+            .field("custom", &self.custom)
+            .field("authenticated", &(self.token.is_some() || self.oauth.is_some()))
+            .finish_non_exhaustive()
     }
 }
 
@@ -72,8 +69,9 @@ pub struct Model {
     /// Accepted input kinds, e.g. `text`, `image`, `audio`.
     #[serde(default)]
     pub input_types: Vec<String>,
-    /// Prompt plus output tokens the model accepts; `0` when the server omits it.
-    #[serde(default)]
+    /// Prompt plus output tokens the model accepts; `0` when the server omits
+    /// it. OpenRouter calls it `context_length`.
+    #[serde(default, alias = "context_length")]
     pub context_window: u64,
     /// Reasoning efforts the model accepts (`none`, `minimal`, `low`,
     /// `medium`, `high`, `xhigh`, `max`); empty when it cannot reason.
@@ -98,9 +96,10 @@ impl Model {
 }
 
 impl Client {
-    /// Creates a client against [`BASE_URL`], optionally authenticated.
+    /// Creates a client against [`BASE_URL`], not signed in; see
+    /// [`Client::signed_in`] and [`crate::SignIn`].
     #[must_use]
-    pub fn new(token: Option<String>) -> Self {
+    pub fn new() -> Self {
         let agent = ureq::Agent::config_builder()
             .http_status_as_error(false)
             .timeout_connect(Some(Duration::from_secs(15)))
@@ -112,43 +111,15 @@ impl Client {
             .user_agent(concat!("openrp/", env!("CARGO_PKG_VERSION")))
             .build()
             .into();
-        Self { agent, base: BASE_URL.to_owned(), token }
+        Self { agent, base: BASE_URL.to_owned(), token: None, oauth: None, custom: false }
     }
 
-    /// Returns a copy of this client using `token` for authentication.
+    /// Creates a client for an OpenAI-compatible provider whose API root is
+    /// `base_url` (e.g. `https://openrouter.ai/api/v1`), authenticated with
+    /// `api_key` when there is one (local servers often need none).
     #[must_use]
-    pub fn with_token(&self, token: String) -> Self {
-        Self { token: Some(token), ..self.clone() }
-    }
-
-    /// The browser URL where the user approves a device-code request.
-    #[must_use]
-    pub fn authorize_url(&self, request_id: &str) -> String {
-        format!("{}/authorize-app?request_id={request_id}", self.base)
-    }
-
-    /// Step 1 of the device-code flow: registers an authorization request and
-    /// returns its `request_id` (valid for 10 minutes).
-    ///
-    /// # Errors
-    /// Network failure or a non-success response.
-    pub fn request_authorization(&self, app_name: &str) -> Result<String> {
-        #[derive(Deserialize)]
-        struct Body {
-            request_id: String,
-        }
-        let body: Body = self.post_json("/api/auth/app/request", &json!({ "app_name": app_name }), false)?;
-        Ok(body.request_id)
-    }
-
-    /// Step 2 of the device-code flow: trades the 6-digit code the user saw in
-    /// the browser for a bearer token.
-    ///
-    /// # Errors
-    /// Network failure or an API error; notable codes are `invalid_code`,
-    /// `authorization_pending`, `request_not_found` and `request_invalidated`.
-    pub fn exchange_code(&self, request_id: &str, code: &str) -> Result<AccessToken> {
-        self.post_json("/api/auth/app/exchange", &json!({ "request_id": request_id, "code": code }), false)
+    pub fn custom(base_url: &str, api_key: Option<String>) -> Self {
+        Self { base: base_url.trim_end_matches('/').to_owned(), custom: true, token: api_key, ..Self::new() }
     }
 
     /// Lists the available chat models.
@@ -160,30 +131,63 @@ impl Client {
         struct Body {
             data: Vec<Model>,
         }
-        let response = self.agent.get(format!("{}/v1/models", self.base)).call()?;
+        // SereChat lists its models to anyone; other providers want the key.
+        let path = if self.custom { "/models" } else { "/v1/models" };
+        let mut request = self.agent.get(format!("{}{path}", self.base));
+        if let Some(token) = self.token.as_deref().filter(|_| self.custom) {
+            request = request.header("Authorization", format!("Bearer {token}"));
+        }
+        let response = request.call()?;
         let body: Body = read_json(response)?;
         Ok(body.data)
     }
 
-    /// POSTs `body` as JSON and returns the raw response after checking the
-    /// status. Used by streaming calls that consume the body incrementally.
-    pub(crate) fn post(&self, path: &str, body: &Value, auth: bool) -> Result<Response<ureq::Body>> {
-        let mut request = self.agent.post(format!("{}{path}", self.base)).content_type("application/json");
-        if auth {
-            let token = self.token.as_deref().unwrap_or_default();
-            request = request.header("Authorization", format!("Bearer {token}"));
+    /// POSTs `body` as JSON, authenticated, and returns the raw response
+    /// after checking the status. Used by streaming calls that consume the
+    /// body incrementally.
+    pub(crate) fn post(&self, path: &str, body: &Value) -> Result<Response<ureq::Body>> {
+        let body = serde_json::to_vec(body)?;
+        let send = |token: Option<&str>| -> Result<Response<ureq::Body>> {
+            let mut request = self.agent.post(format!("{}{path}", self.base)).content_type("application/json");
+            if let Some(token) = token {
+                request = request.header("Authorization", format!("Bearer {token}"));
+            }
+            Ok(request.send(&body[..])?)
+        };
+        let token = self.bearer(None)?;
+        let mut response = send(token.as_deref())?;
+        // An access token can be revoked or expire early: refreshed, the
+        // request is tried once more.
+        if response.status() == 401 && self.oauth.is_some() {
+            response = send(self.bearer(token.as_deref())?.as_deref())?;
         }
-        let response = request.send(serde_json::to_vec(body)?)?;
         check_status(response)
     }
 
-    fn post_json<T: serde::de::DeserializeOwned>(&self, path: &str, body: &Value, auth: bool) -> Result<T> {
-        read_json(self.post(path, body, auth)?)
+    /// The bearer token for a request: the custom provider's key, or
+    /// SereChat's access token, refreshed first when it is about to expire
+    /// or is `rejected` (see [`OAuth::access`]).
+    pub(crate) fn bearer(&self, rejected: Option<&str>) -> Result<Option<String>> {
+        match &self.oauth {
+            Some(oauth) => oauth.access(self, rejected).map(Some),
+            None => Ok(self.token.clone()),
+        }
+    }
+
+    /// POSTs a form to one of SereChat's OAuth endpoints and checks the status.
+    pub(crate) fn post_form(&self, path: &str, form: &[(&str, &str)]) -> Result<Response<ureq::Body>> {
+        check_status(self.agent.post(format!("{}{path}", self.base)).send_form(form.iter().copied())?)
+    }
+}
+
+impl Default for Client {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
 /// Decodes a JSON body after checking the status code.
-fn read_json<T: serde::de::DeserializeOwned>(response: Response<ureq::Body>) -> Result<T> {
+pub(crate) fn read_json<T: serde::de::DeserializeOwned>(response: Response<ureq::Body>) -> Result<T> {
     let mut response = check_status(response)?;
     let text = response.body_mut().read_to_string()?;
     Ok(serde_json::from_str(&text)?)
@@ -214,7 +218,8 @@ fn parse_retry_after(value: &str) -> Option<Duration> {
 }
 
 /// Extracts `(code, message)` from an error body. Accepts both
-/// `{"error": {"code", "message"}}` and flat `{"error": "code", "message"}`.
+/// `{"error": {"code", "message"}}` and flat `{"error": "code", "message"}`,
+/// as OAuth endpoints send it (with `error_description`).
 pub(crate) fn parse_error_body(text: &str) -> (Option<String>, Option<String>) {
     let Ok(value) = serde_json::from_str::<Value>(text) else {
         return (None, None);
@@ -222,7 +227,7 @@ pub(crate) fn parse_error_body(text: &str) -> (Option<String>, Option<String>) {
     let error = value.get("error").unwrap_or(&value);
     let field = |v: &Value, key: &str| v.get(key).and_then(Value::as_str).map(str::to_owned);
     let code = field(error, "code").or_else(|| error.as_str().map(str::to_owned));
-    let message = field(error, "message").or_else(|| field(&value, "message"));
+    let message = field(error, "message").or_else(|| field(&value, "message")).or_else(|| field(&value, "error_description"));
     (code, message)
 }
 
@@ -256,6 +261,8 @@ mod tests {
         assert_eq!(parse_error_body(nested), (Some("invalid_code".into()), Some("Wrong code".into())));
         let flat = r#"{"error":"authorization_pending","message":"Not yet"}"#;
         assert_eq!(parse_error_body(flat), (Some("authorization_pending".into()), Some("Not yet".into())));
+        let oauth = r#"{"error":"invalid_grant","error_description":"Refresh token expired"}"#;
+        assert_eq!(parse_error_body(oauth), (Some("invalid_grant".into()), Some("Refresh token expired".into())));
         assert_eq!(parse_error_body("<html>"), (None, None));
     }
 

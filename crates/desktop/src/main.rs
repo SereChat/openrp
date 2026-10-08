@@ -24,6 +24,7 @@ mod login;
 mod markdown;
 mod paint;
 mod platform;
+mod provider;
 mod raster;
 mod settings;
 mod spotlight;

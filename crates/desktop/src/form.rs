@@ -2,7 +2,8 @@
 //! bordered boxes, with mouse placement and selection and the usual keys.
 //!
 //! Enter in a single-line field moves to the next field; in a multi-line
-//! one it starts a new line. Tab cycles through the fields.
+//! one it starts a new line, unless its editor takes no line breaks (a list
+//! that wraps, like tags). Tab cycles through the fields.
 
 use arboard::Clipboard;
 use winit::event::KeyEvent;
@@ -72,6 +73,17 @@ impl Fields {
         self.selecting = None;
     }
 
+    /// Adds a field holding `editor` at `index` (multi-line when
+    /// `multiline`), focused.
+    pub fn insert_field(&mut self, index: usize, editor: Editor, multiline: bool) {
+        let index = index.min(self.editors.len());
+        self.editors.insert(index, editor);
+        self.multiline.insert(index, multiline);
+        self.layouts.insert(index, None);
+        self.focus = index;
+        self.selecting = None;
+    }
+
     /// Removes field `index`; one empty field is left when it was the last.
     pub fn remove(&mut self, index: usize) {
         if index >= self.editors.len() {
@@ -94,6 +106,24 @@ impl Fields {
     #[must_use]
     pub fn text(&self, index: usize) -> &str {
         self.editors[index].text()
+    }
+
+    /// Replaces the text of field `index`.
+    pub fn replace(&mut self, index: usize, text: &str) {
+        let mut editor = Editor::default();
+        editor.insert(text);
+        self.editors[index] = editor;
+    }
+
+    /// The focused field.
+    #[must_use]
+    pub fn focused(&self) -> usize {
+        self.focus
+    }
+
+    /// Focuses field `index`.
+    pub fn focus(&mut self, index: usize) {
+        self.focus = index.min(self.editors.len() - 1);
     }
 
     /// The editor of field `index`.
@@ -123,7 +153,7 @@ impl Fields {
                 self.focus = if mods.shift_key() { (focus + n - 1) % n } else { (focus + 1) % n };
                 true
             }
-            Key::Named(NamedKey::Enter) if self.multiline[focus] && !mods.control_key() && !mods.super_key() => {
+            Key::Named(NamedKey::Enter) if self.multiline[focus] && self.editors[focus].accepts('\n') && !mods.control_key() && !mods.super_key() => {
                 self.editors[focus].insert("\n");
                 true
             }
@@ -239,5 +269,10 @@ mod tests {
         fields.remove(7);
         fields.insert("x");
         assert_eq!(fields.text(0), "x");
+
+        let mut fields = Fields::new([Editor::default(), Editor::default()], [false, true]);
+        fields.insert_field(1, Editor::default(), false);
+        fields.insert("keys");
+        assert_eq!((fields.count(), fields.text(1), fields.focus), (3, "keys", 1), "inserted in place, focused");
     }
 }

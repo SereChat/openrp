@@ -277,6 +277,34 @@ fn cover(src: &[u8], sw: u32, sh: u32, dw: u32, dh: u32) -> Vec<u8> {
     out
 }
 
+/// The image at `path` as PNG bytes, for a character card: a PNG as it is,
+/// a JPEG decoded (upright) and encoded as PNG. Slow: run it on a worker.
+///
+/// # Errors
+/// A human-readable reason: unreadable, too large, or not a PNG or JPEG.
+pub fn png_bytes(path: &std::path::Path) -> Result<Vec<u8>, String> {
+    let mut bytes = Vec::new();
+    fs::File::open(path).and_then(|f| f.take(MAX_FILE + 1).read_to_end(&mut bytes)).map_err(|e| e.to_string())?;
+    if bytes.len() as u64 > MAX_FILE {
+        return Err("the portrait is too large".into());
+    }
+    if bytes.starts_with(b"\x89PNG\r\n\x1a\n") {
+        return Ok(bytes);
+    }
+    if !bytes.starts_with(&[0xFF, 0xD8]) {
+        return Err("the portrait is not a PNG or JPEG image".into());
+    }
+    let (rgba, w, h, orientation) = decode_jpeg(&bytes)?;
+    let rgba = orient(&rgba, w, h, orientation);
+    let (w, h) = if orientation >= 5 { (h, w) } else { (w, h) };
+    let mut out = Vec::new();
+    let mut encoder = png::Encoder::new(&mut out, w, h);
+    encoder.set_color(png::ColorType::Rgba);
+    encoder.set_depth(png::BitDepth::Eight);
+    encoder.write_header().and_then(|mut writer| writer.write_image_data(&rgba)).map_err(|e| e.to_string())?;
+    Ok(out)
+}
+
 /// Applies EXIF `orientation` to `src` (`w`×`h` RGBA). Orientations 5–8
 /// return an `h`×`w` image.
 fn orient(src: &[u8], w: u32, h: u32, orientation: u8) -> Vec<u8> {

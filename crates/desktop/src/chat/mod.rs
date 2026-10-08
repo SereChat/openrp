@@ -7,11 +7,14 @@
 //! The screen never touches the disk or network itself: it emits [`Action`]s
 //! (send, save, …) that the app carries out on worker threads, and receives
 //! their results through the `*_loaded` / `stream_*` methods. Streaming,
-//! retries, compaction and the system prompt live in `stream.rs`.
+//! retries, compaction and the system prompt live in `stream.rs`; writing
+//! the user's next message for them (impersonation) in `impersonate.rs`.
 
 mod cast;
 mod composer;
 mod dialog;
+pub mod export;
+mod impersonate;
 mod menu;
 mod messages;
 mod names;
@@ -31,9 +34,9 @@ use winit::keyboard::{Key, ModifiersState, NamedKey};
 use crate::app::Action;
 use crate::doc::Doc;
 use crate::editor::Editor;
-use crate::library::{Event as LibraryEvent, Kind, LibraryView, Story};
+use crate::library::{Event as LibraryEvent, Kind, LibraryView, Record, Story};
 use crate::paint::{Painter, Rect};
-use crate::settings::{SettingsView, Totals};
+use crate::settings::{Provider, SettingsView, Totals};
 use crate::spotlight::{Outcome, Pick, Spotlight};
 use crate::text::TextLayout;
 use crate::theme::{self, Scheme};
@@ -201,6 +204,21 @@ enum Menu {
     Session(u64),
     /// The model for work beside the story (from the settings page).
     UtilityModel,
+    /// Duplicate, export or delete the record whose form is open.
+    Record,
+    /// The world to play the character in `Chat::play_character` in.
+    PlayIn,
+    /// The persona to play as, for the player form.
+    Personas,
+}
+
+/// What to do with a session once it is read from disk.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Pending {
+    /// Copy it, as a frame when `true`.
+    Duplicate(bool),
+    /// Export it, as a SillyTavern chat when `true`.
+    Export(bool),
 }
 
 /// One message in a conversation, with its cached layouts.
@@ -479,10 +497,34 @@ impl Conversation {
 type SelPos = (usize, u8, usize, usize);
 
 /// One row of a drop-down menu.
+#[derive(Default)]
 struct MenuItem {
     label: String,
+    /// Faint, on the right.
     detail: String,
+    /// Ticked.
     selected: bool,
+    /// Shows a portrait (or the label's initial): a person or a world.
+    face: bool,
+    /// Its portrait's file name; empty for none.
+    image: String,
+    /// More text a search finds it by (tags, an id).
+    search: String,
+}
+
+impl MenuItem {
+    /// A plain row.
+    fn new(label: &str, detail: &str) -> Self {
+        Self { label: label.to_owned(), detail: detail.to_owned(), ..Self::default() }
+    }
+
+    /// A library record's row: its portrait and name, and the comment that
+    /// tells it apart (or its tags), searched with its tags too.
+    fn record(record: &Record) -> Self {
+        let tags = record.tags.join(", ");
+        let detail = if record.comment.is_empty() { tags.as_str() } else { record.comment.as_str() };
+        Self { face: true, image: record.portrait.clone(), search: format!("{} {tags}", record.comment), ..Self::new(&record.name, detail) }
+    }
 }
 
 /// State of the chat screen.
@@ -509,6 +551,9 @@ pub struct Chat {
     model: String,
     /// Model for work beside the story; `None` uses `model`.
     utility_model: Option<String>,
+    /// Replies come from a custom provider: it lists no prices, so costs
+    /// would read $0 and are not shown.
+    custom: bool,
     reasoning: Reasoning,
     reasoning_view: ReasoningView,
     menu: Option<Menu>,
@@ -550,10 +595,28 @@ pub struct Chat {
     /// The entry whose turn's Delete was clicked once and waits for a
     /// second click.
     turn_confirm: Option<u64>,
-    /// A session to copy once it is read: (conversation, as a frame).
-    pending_duplicate: Option<(u64, bool)>,
+    /// A session to copy or export once it is read.
+    pending: Option<(u64, Pending)>,
     /// Where the sidebar row whose session menu is open was drawn.
     session_menu: Rect,
+    /// Where the button whose menu is open was drawn, for menus opened
+    /// from a library page or the player form.
+    menu_anchor: Rect,
+    /// What is typed to search the open menu, when it is searched.
+    menu_query: Editor,
+    /// The row of the searched menu Enter picks.
+    menu_pick: usize,
+    /// The search or the arrows were used: the picked row shows.
+    menu_keyed: bool,
+    /// Scroll the open menu to the picked row.
+    menu_follow: bool,
+    /// The menu drawn last frame, to start a newly opened one afresh.
+    menu_seen: Option<Menu>,
+    /// The library character Play was pressed for, to cast in the world
+    /// picked from [`Menu::PlayIn`].
+    play_character: String,
+    /// The AI writing the user's next message into the composer.
+    impersonation: Option<impersonate::Impersonation>,
     /// The worlds and characters pages.
     library: LibraryView,
 }
@@ -579,6 +642,7 @@ impl Chat {
             models_error: None,
             model: model.unwrap_or_else(|| DEFAULT_MODEL.to_owned()),
             utility_model: None,
+            custom: false,
             reasoning,
             reasoning_view: ReasoningView::default(),
             menu: None,
@@ -602,8 +666,16 @@ impl Chat {
             character_form: None,
             turn_edit: None,
             turn_confirm: None,
-            pending_duplicate: None,
+            pending: None,
             session_menu: Rect::default(),
+            menu_anchor: Rect::default(),
+            menu_query: Editor::restricted(120, |c| !c.is_control()),
+            menu_pick: 0,
+            menu_keyed: false,
+            menu_follow: false,
+            menu_seen: None,
+            play_character: String::new(),
+            impersonation: None,
             spotlight: None,
         };
         for summary in sessions {
@@ -654,6 +726,12 @@ impl Chat {
         self.utility_model = model;
     }
 
+    /// Tells the settings page which providers are saved and which is in use.
+    pub fn set_provider(&mut self, provider: Provider) {
+        self.custom = provider.custom;
+        self.settings.set_provider(provider);
+    }
+
     /// Tells the user about a problem, with a way to the data folder when
     /// it can help.
     pub fn notify(&mut self, text: String, folder: bool) {
@@ -685,6 +763,10 @@ impl Chat {
     }
 
     fn select(&mut self, id: u64) {
+        // What the AI writes for the user goes to the composer of its story only.
+        if id != self.current {
+            self.stop_impersonating();
+        }
         self.current = id;
         self.page = Page::Chat;
         self.menu = None;
@@ -800,6 +882,7 @@ impl Chat {
             Command::Memorize => self.review_memories(current, true, actions),
             Command::Duplicate => self.duplicate(current, false, actions),
             Command::Frame => self.duplicate(current, true, actions),
+            Command::Impersonate => self.impersonate(actions),
         }
     }
 
@@ -809,20 +892,7 @@ impl Chat {
     /// note, but nothing that happened. A session not read yet is read
     /// first, and copied once it is.
     pub(super) fn duplicate(&mut self, id: u64, frame: bool, actions: &mut Vec<Action>) {
-        let Some(source) = self.conversations.iter_mut().find(|c| c.id == id) else { return };
-        match source.load {
-            Load::Summary | Load::Loading => {
-                if source.load == Load::Summary {
-                    source.load = Load::Loading;
-                    actions.push(Action::LoadSession { conversation: id, session: source.session_id.clone() });
-                }
-                self.pending_duplicate = Some((id, frame));
-                return;
-            }
-            Load::Failed(_) => return,
-            Load::Loaded if source.is_fresh() => return,
-            Load::Loaded => {}
-        }
+        let Some(source) = self.read_first(id, Pending::Duplicate(frame), actions) else { return };
         let mut session = source.to_session();
         let now = unix_now();
         (session.id, session.created, session.updated) = (new_id(), now, now);
@@ -846,6 +916,38 @@ impl Chat {
         self.session_loaded(copy, Ok(session.clone()), actions);
         self.select(copy);
         actions.push(Action::SaveSession(session));
+        if frame {
+            self.greet(actions);
+        }
+    }
+
+    /// Conversation `id`, once its messages are in memory: one only listed
+    /// is read first, and `then` waits for it. `None` meanwhile, and for
+    /// one that could not be read or was never begun.
+    fn read_first(&mut self, id: u64, then: Pending, actions: &mut Vec<Action>) -> Option<&Conversation> {
+        let source = self.conversations.iter_mut().find(|c| c.id == id)?;
+        match source.load {
+            Load::Summary | Load::Loading => {
+                if source.load == Load::Summary {
+                    source.load = Load::Loading;
+                    actions.push(Action::LoadSession { conversation: id, session: source.session_id.clone() });
+                }
+                self.pending = Some((id, then));
+                None
+            }
+            Load::Failed(_) => None,
+            Load::Loaded if source.is_fresh() => None,
+            Load::Loaded => Some(source),
+        }
+    }
+
+    /// Asks where to save conversation `id` and saves it there: as a
+    /// SillyTavern chat when `jsonl`, as a readable transcript otherwise.
+    pub(super) fn export(&mut self, id: u64, jsonl: bool, actions: &mut Vec<Action>) {
+        let Some(conversation) = self.read_first(id, Pending::Export(jsonl), actions) else { return };
+        let session = conversation.to_session();
+        let world = session.world.as_deref().and_then(|w| self.library.get(Kind::World, w)).map_or_else(String::new, |w| w.name.clone());
+        actions.push(Action::ExportStory { session, world, jsonl });
     }
 
     /// Deletes the open story (stopping its reply) and starts it over in
@@ -867,6 +969,7 @@ impl Chat {
         if !fresh.is_fresh() {
             actions.push(Action::SaveSession(fresh.to_session()));
         }
+        self.greet(actions);
     }
 
     /// Stores the messages of a session read on a worker thread, and makes
@@ -907,8 +1010,10 @@ impl Chat {
         conversation.note = session.note;
         conversation.reviewed = session.reviewed;
         conversation.load = Load::Loaded;
-        if let Some((id, frame)) = self.pending_duplicate.take_if(|(id, _)| *id == conversation_id) {
-            self.duplicate(id, frame, actions);
+        match self.pending.take_if(|(id, _)| *id == conversation_id) {
+            Some((id, Pending::Duplicate(frame))) => self.duplicate(id, frame, actions),
+            Some((id, Pending::Export(jsonl))) => self.export(id, jsonl, actions),
+            None => {}
         }
     }
 
@@ -935,6 +1040,7 @@ impl Chat {
 
     /// Cancels every running stream (used on sign-out).
     pub fn cancel_all(&mut self) {
+        self.stop_impersonating();
         for conversation in &mut self.conversations {
             if let Some(stream) = conversation.stream.take() {
                 stream.cancel.store(true, Ordering::Relaxed);
@@ -964,6 +1070,8 @@ impl Chat {
         if self.models.is_empty() && self.models_error.is_some() {
             actions.push(Action::LoadModels);
         }
+        // What is sent is what the composer holds now.
+        self.stop_impersonating();
         let text = self.composer.take().trim().to_owned();
         let user_id = self.next_id();
         let conversation = self.current();
@@ -1003,9 +1111,43 @@ impl Chat {
         self.page = page;
     }
 
-    /// Stores the worlds and characters read from disk.
-    pub fn library_loaded(&mut self, worlds: Vec<serechat::World>, characters: Vec<serechat::Character>, portraits: serechat::Portraits) {
-        self.library.loaded(worlds, characters, portraits);
+    /// Stores the worlds, characters and personas read from disk.
+    pub fn library_loaded(
+        &mut self,
+        worlds: Vec<serechat::World>,
+        characters: Vec<serechat::Character>,
+        personas: Vec<serechat::Persona>,
+        portraits: serechat::Portraits,
+    ) {
+        self.library.loaded(worlds, characters, personas, portraits);
+    }
+
+    /// Character cards were read: they join the library (see
+    /// [`LibraryView::imported`]), and files that could not be read are told.
+    pub fn cards_imported(&mut self, characters: Vec<serechat::Character>, errors: Vec<String>, actions: &mut Vec<Action>) {
+        if !characters.is_empty() && self.page != Page::Library(Kind::Character) {
+            self.show(Page::Library(Kind::Character));
+        }
+        self.library.imported(characters, actions);
+        for error in errors {
+            self.notify(error, false);
+        }
+    }
+
+    /// A lorebook was read for the library's open form.
+    pub fn lore_imported(&mut self, result: Result<Vec<serechat::LoreEntry>, String>) {
+        self.library.lore_imported(result);
+    }
+
+    /// A card or story was exported to `path` (`None`: cancelled): said,
+    /// with a way to its folder.
+    pub fn exported(&mut self, path: Option<std::path::PathBuf>) {
+        if let Some(path) = path {
+            let name = path.file_name().map_or_else(String::new, |n| n.to_string_lossy().into_owned());
+            let text = format!("Exported {name}");
+            self.notices.retain(|n| n.text != text);
+            self.notices.push(Notice::saved(text, path.parent().map(std::path::Path::to_path_buf)));
+        }
     }
 
     /// The portrait picker closed: for the cast member dialog if it asked,
@@ -1052,6 +1194,11 @@ impl Chat {
             spotlight.insert(text);
             return;
         }
+        if self.menu.is_some_and(Menu::searchable) {
+            self.menu_query.insert(text);
+            (self.menu_pick, self.menu_keyed, self.menu_scroll) = (0, true, 0.0);
+            return;
+        }
         match self.page {
             Page::Chat => {
                 if let Some(form) = self.character_form() {
@@ -1063,7 +1210,7 @@ impl Chat {
                 }
             }
             Page::Library(_) => self.library.insert(text),
-            Page::Settings => {}
+            Page::Settings => self.settings.insert(text),
         }
     }
 
@@ -1075,9 +1222,14 @@ impl Chat {
     /// Where the input method's candidate window should appear.
     #[must_use]
     pub fn ime_area(&self) -> Option<Rect> {
+        // A searched menu takes the text, at its top.
+        if let Some(area) = self.menu_rect.filter(|_| self.menu.is_some_and(Menu::searchable)) {
+            return Some(Rect::new(area.x + 12.0, area.y + 8.0, 2.0, 22.0));
+        }
         match self.page {
             Page::Library(_) => self.library.caret(),
-            _ => match (&self.character_form, &self.turn_edit) {
+            Page::Settings => self.settings.caret(),
+            Page::Chat => match (&self.character_form, &self.turn_edit) {
                 (Some(form), _) if form.conversation == self.current => form.fields.caret(),
                 (_, Some(edit)) if edit.conversation == self.current => edit.fields.caret(),
                 _ => self.caret_rect,
@@ -1105,6 +1257,7 @@ impl Chat {
             Pick::Settings => self.show(Page::Settings),
             Pick::Worlds => self.show(Page::Library(Kind::World)),
             Pick::Characters => self.show(Page::Library(Kind::Character)),
+            Pick::Personas => self.show(Page::Library(Kind::Persona)),
             Pick::World(id) => {
                 self.show(Page::Library(Kind::World));
                 self.library.open_form(Kind::World, &id);
@@ -1112,6 +1265,10 @@ impl Chat {
             Pick::Character(id) => {
                 self.show(Page::Library(Kind::Character));
                 self.library.open_form(Kind::Character, &id);
+            }
+            Pick::Persona(id) => {
+                self.show(Page::Library(Kind::Persona));
+                self.library.open_form(Kind::Persona, &id);
             }
             Pick::Play(world) => self.play(world),
             Pick::Theme(scheme) => actions.push(Action::SetTheme(scheme)),
@@ -1138,6 +1295,10 @@ impl Chat {
             }
             return;
         }
+        // An open searched menu takes what is typed.
+        if self.menu_key(event, mods, cb, actions) {
+            return;
+        }
         let is = |c: &str, ch: &str| c.eq_ignore_ascii_case(ch);
         let commands = self.commands();
         match &event.logical_key {
@@ -1147,7 +1308,7 @@ impl Chat {
             Key::Character(c) if primary && is(c, ",") => self.toggle_settings(),
             // A story starts from a world.
             Key::Character(c) if primary && is(c, "n") => self.show(Page::Library(Kind::World)),
-            _ if self.page == Page::Settings => {}
+            _ if self.page == Page::Settings => self.settings.key(event, mods, cb, actions),
             _ if matches!(self.page, Page::Library(_)) => {
                 if !self.library.key(event, mods, cb, actions) && event.logical_key == Key::Named(NamedKey::Escape) {
                     self.page = Page::Chat;
@@ -1235,7 +1396,11 @@ impl Chat {
                 let stories = self.world_stories();
                 match self.library.draw(p, ui, main, kind, &stories, actions) {
                     Some(LibraryEvent::Play(world)) => self.play(world),
-                    Some(LibraryEvent::WorldDeleted(world)) => self.delete_world_stories(&world, actions),
+                    Some(LibraryEvent::PlayCharacter(id, anchor)) => {
+                        self.play_character = id;
+                        self.open_library_menu(Menu::PlayIn, anchor);
+                    }
+                    Some(LibraryEvent::FormMenu(anchor)) => self.open_library_menu(Menu::Record, anchor),
                     Some(LibraryEvent::Open(id)) => self.open(id, actions),
                     Some(LibraryEvent::Generate(idea)) => self.generate_for_library(idea, actions),
                     None => {}
@@ -1293,6 +1458,7 @@ impl Chat {
                     .collect(),
                 worlds: self.library.list(Kind::World),
                 characters: self.library.list(Kind::Character),
+                personas: self.library.list(Kind::Persona),
                 models: &self.models,
                 model: &self.model,
                 scheme,
@@ -1305,11 +1471,19 @@ impl Chat {
         }
     }
 
+    /// Toggles `menu`, opened from the library page below `anchor`.
+    fn open_library_menu(&mut self, menu: Menu, anchor: Rect) {
+        self.menu = if self.menu == Some(menu) { None } else { Some(menu) };
+        self.menu_scroll = 0.0;
+        self.menu_anchor = anchor;
+    }
+
     /// Title bar of the chat area: session title and cost.
     fn draw_header(&mut self, p: &mut Painter, main: Rect) {
         let t = p.theme;
         let bar = Rect::new(main.x, 0.0, main.w, theme::HEADER_HEIGHT);
         p.rect(Rect::new(bar.x, bar.bottom() - 1.0, bar.w, 1.0), t.border, 0.0);
+        let custom = self.custom;
         let conversation = self.current();
         let (tokens, cost) = (conversation.tokens(), conversation.cost());
         let (world, title) = (conversation.world.clone(), conversation.title.clone());
@@ -1324,7 +1498,12 @@ impl Chat {
 
         let mut right = bar.right() - 16.0;
         if tokens > 0 {
-            let spent = p.layout(&format!("{} tokens  ·  {}", group_digits(tokens), format_cost(cost)), theme::SMALL, None);
+            let spent = if custom {
+                format!("{} tokens", group_digits(tokens))
+            } else {
+                format!("{} tokens  ·  {}", group_digits(tokens), format_cost(cost))
+            };
+            let spent = p.layout(&spent, theme::SMALL, None);
             right -= spent.width();
             p.text(&spent, right, bar.y + (bar.h - spent.height()) * 0.5, t.text_faint);
             right -= 20.0;

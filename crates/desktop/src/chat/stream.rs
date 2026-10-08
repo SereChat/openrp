@@ -11,10 +11,12 @@
 //! its memories.
 //!
 //! The system prompt holds what rarely changes (the rules, the world, who the
-//! user plays and the whole cast), so providers can cache it with the
-//! history after it; the story state that changes every turn (the scene, who
-//! is in it, memories, the author's note) rides on the latest message only
-//! and is never saved (see [`story_state`]).
+//! user plays and the whole cast, with their example dialogue and the lore
+//! that always holds), so providers can cache it with the history after it;
+//! the story state that changes every turn (the scene, who is in it, the lore
+//! the latest turns mention, memories, the author's note) rides on the latest
+//! message only and is never saved (see [`story_state`]). Cards' `{{user}}`
+//! and `{{char}}` are filled in as both are written.
 //!
 //! Failures: dropped or silent connections, rate limits and server errors are
 //! retried after [`RETRY_DELAYS`] (or as long as the server asks). A
@@ -32,8 +34,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use serechat::{
-    CastMember, Completion, Error, InputItem, Player, Role, StoredMessage, StoryChange, StreamEvent, ToolCall, ToolChoice, ToolResult, Usage, new_id,
-    unix_now,
+    CastMember, Completion, Error, InputItem, LoreEntry, Player, Role, StoredMessage, StoryChange, StreamEvent, ToolCall, ToolChoice, ToolResult, Usage,
+    macros, new_id, unix_now,
 };
 
 use super::tools;
@@ -79,8 +81,9 @@ const PLAIN_CHAT: &str = "You are OpenRP, a helpful AI assistant in a desktop ap
 const ROLEPLAY: &str = "You play every character in an interactive roleplay story except the user's own. There is no narrator: \
     the story is told only through the characters, by what they say and do. Stay true to the world's premise, rules and tone, and \
     keep each character consistent with their description.\n\n\
-    The latest message ends with the story state: the scene, who is in it, who is elsewhere, what the story must not forget and \
-    the user's author's note. The app writes it, not the user, and it is always current: trust it over older turns.\n\n\
+    The latest message ends with the story state: the scene, who is in it, who is elsewhere, lore the latest turns call for, what \
+    the story must not forget and the user's author's note. The app writes it, not the user, and it is always current: trust it \
+    over older turns.\n\n\
     How to reply:\n\
     - Every reply is one speak call. Write nothing outside tool calls: there is no narration, ever. Never describe events, \
     surroundings or the passing of time in your own voice; the scene field holds the place and its ambiance, and everything \
@@ -109,6 +112,21 @@ const ROLEPLAY: &str = "You play every character in an interactive roleplay stor
     - Never speak, act or decide for the user's character. End where the user can respond.";
 /// Opens the cast section of a story's prompt.
 const CAST: &str = "The characters you play. The story state says which of them are in the scene now.";
+/// Opens a character's example dialogue.
+const EXAMPLES: &str = "Example dialogue, showing their voice and manner. It never happened in this story.";
+/// Opens the lore that always holds, in the prompt.
+const LORE_ALWAYS: &str = "Background that always holds in this story. Use it where it fits; never recite it.";
+/// Opens the lore the latest turns mention, in the story state.
+const LORE: &str = "Background on what the latest turns mention. Use it where it fits; never recite it.";
+/// Stands first in a history that opens with a character's greeting:
+/// some providers want a conversation to start with the user.
+const STORY_BEGINS: &str = "(The story begins.)";
+/// Prompts back from the latest whose turns are searched for lore keys.
+const LORE_TURNS: usize = 2;
+/// Most characters of lore the story state carries; entries past it wait.
+// ponytail: fixed, in characters; make it a token budget setting if
+// people load large lorebooks.
+const LORE_BUDGET: usize = 8_000;
 /// Opens the story state sent with the latest message.
 const STATE: &str = "[Story state, kept by the app: not part of the user's message]";
 /// Opens the memories section of the story state.
@@ -132,33 +150,85 @@ fn formerly(aliases: &[String]) -> String {
     if aliases.is_empty() { String::new() } else { format!("(Formerly called {}; they are the same person.)\n\n", aliases.join(", ")) }
 }
 
-/// The system prompt of a story in `world` (name and description), played
-/// by `player`, with this `cast`; `None` for a plain chat. It holds only
-/// what rarely changes, so providers can cache it: who is in the scene,
-/// memories and the note go in [`story_state`].
-pub(super) fn story_prompt(world: Option<(&str, &str)>, player: Option<&Player>, cast: &[CastMember]) -> String {
-    let Some((name, description)) = world else {
+/// A world as a story's prompt reads it: name, description and lore.
+pub(super) type WorldText<'a> = (&'a str, &'a str, &'a [LoreEntry]);
+
+/// The system prompt of a story in `world`, played by `player`, with this
+/// `cast`; `None` for a plain chat. It holds only what rarely changes, so
+/// providers can cache it: who is in the scene, the lore the latest turns
+/// mention, memories and the note go in [`story_state`].
+pub(super) fn story_prompt(world: Option<WorldText<'_>>, player: Option<&Player>, cast: &[CastMember]) -> String {
+    let Some((name, description, lore)) = world else {
         return PLAIN_CHAT.to_owned();
     };
-    let mut prompt = format!("{ROLEPLAY}\n\n# World: {name}\n\n{description}");
+    let user = player.map_or("the user", |p| p.name.as_str());
+    let mut prompt = format!("{ROLEPLAY}\n\n# World: {name}\n\n{}", macros(description, None, user));
     if let Some(player) = player {
-        let _ = write!(prompt, "\n\n# The user's character: {}\n\n{}{}", player.name, formerly(&player.aliases), player.description);
+        let _ = write!(prompt, "\n\n# The user's character: {}\n\n{}{}", player.name, formerly(&player.aliases), macros(&player.description, None, user));
     }
     if !cast.is_empty() {
         let _ = write!(prompt, "\n\n# Cast\n\n{CAST}");
         for member in cast {
             // Someone who joined by speaking has no description yet.
             let description = if member.description.trim().is_empty() { UNDESCRIBED } else { &member.description };
-            let _ = write!(prompt, "\n\n## {}\n\n{}{description}", member.name, formerly(&member.aliases));
+            let name = Some(member.name.as_str());
+            let _ = write!(prompt, "\n\n## {}\n\n{}{}", member.name, formerly(&member.aliases), macros(description, name, user));
+            let examples = examples(&member.examples);
+            if !examples.is_empty() {
+                let _ = write!(prompt, "\n\n### How {} talks\n\n{EXAMPLES}\n\n{}", member.name, macros(&examples, name, user));
+            }
         }
+    }
+    // Lore that holds whatever is said: the world's, then each member's.
+    let always: Vec<String> = lore_of(lore, cast).filter(|(_, e)| e.constant).map(|(who, e)| macros(&e.content, who, user).into_owned()).collect();
+    if !always.is_empty() {
+        let _ = write!(prompt, "\n\n# Lore\n\n{LORE_ALWAYS}\n\n{}", always.join("\n\n"));
     }
     prompt.trim_end().to_owned()
 }
 
+/// Example dialogue as the model reads it: card separators (`<START>`) and
+/// blank runs dropped.
+fn examples(text: &str) -> String {
+    let lines: Vec<&str> = text.lines().map(str::trim_end).filter(|l| !l.trim().eq_ignore_ascii_case("<start>")).collect();
+    lines.join("\n").split("\n\n\n").collect::<Vec<_>>().join("\n\n").trim().to_owned()
+}
+
+/// Every lore entry of a story, the world's (`lore`) and then each cast
+/// member's, with the name `{{char}}` means in it.
+fn lore_of<'a>(lore: &'a [LoreEntry], cast: &'a [CastMember]) -> impl Iterator<Item = (Option<&'a str>, &'a LoreEntry)> {
+    lore.iter().map(|e| (None, e)).chain(cast.iter().flat_map(|m| m.lore.iter().map(move |e| (Some(m.name.as_str()), e))))
+}
+
+/// The lore a story's latest turns call for: entries (not constant ones,
+/// which the prompt holds) with a key in `text`, the turns as plain text
+/// with the scene, filled in for `user`, within [`LORE_BUDGET`].
+pub(super) fn lore_in_play(lore: &[LoreEntry], cast: &[CastMember], text: &str, user: &str) -> Vec<String> {
+    let text = text.to_lowercase();
+    let mut spent = 0;
+    let mut found = Vec::new();
+    for (who, entry) in lore_of(lore, cast).filter(|(_, e)| !e.constant && e.mentioned_in(&text)) {
+        let content = macros(&entry.content, who, user).into_owned();
+        if spent + content.len() > LORE_BUDGET {
+            continue;
+        }
+        spent += content.len();
+        found.push(content);
+    }
+    found
+}
+
+/// Where the turns searched for lore start: [`LORE_TURNS`] prompts back.
+pub(super) fn lore_start(entries: &[Entry]) -> usize {
+    let prompts: Vec<usize> = entries.iter().enumerate().filter(|(_, e)| e.message.is_prompt()).map(|(i, _)| i).collect();
+    prompts.len().checked_sub(LORE_TURNS).map_or(0, |at| prompts[at])
+}
+
 /// What a story is like right now, sent after the latest message: the
-/// `scene`, who of the `cast` is in it and who is elsewhere, the `memories`
-/// and the author's `note`, which weighs most there, at the end.
-pub(super) fn story_state(cast: &[CastMember], memories: &[String], scene: &str, note: &str) -> String {
+/// `scene`, who of the `cast` is in it and who is elsewhere, the `lore` the
+/// latest turns call for, the `memories` and the author's `note`, which
+/// weighs most there, at the end.
+pub(super) fn story_state(cast: &[CastMember], lore: &[String], memories: &[String], scene: &str, note: &str) -> String {
     let mut state = STATE.to_owned();
     let scene = scene.trim();
     let _ = write!(state, "\n\n# The scene\n\n{}", if scene.is_empty() { "Not set yet: set it in your speak call." } else { scene });
@@ -171,6 +241,9 @@ pub(super) fn story_state(cast: &[CastMember], memories: &[String], scene: &str,
     let absent: Vec<&str> = cast.iter().filter(|m| !m.present).map(|m| m.name.as_str()).collect();
     if !absent.is_empty() {
         let _ = write!(state, "\n\n# Elsewhere\n\n{ELSEWHERE} {}", absent.join(", "));
+    }
+    if !lore.is_empty() {
+        let _ = write!(state, "\n\n# Lore\n\n{LORE}\n\n{}", lore.join("\n\n"));
     }
     if !memories.is_empty() {
         let _ = write!(state, "\n\n# Memories\n\n{MEMORIES}\n");
@@ -337,10 +410,14 @@ pub fn input_items(history: &[StoredMessage]) -> Vec<InputItem> {
         Some(at) => (Some(&history[at]), &history[at - history[at].kept.min(at)..at], &history[at + 1..]),
         None => (None, &history[..0], history),
     };
-    let mut items = Vec::with_capacity(kept.len() + after.len() + 1);
+    let mut items = Vec::with_capacity(kept.len() + after.len() + 2);
     // The summary first, then the turns it kept, then what came after.
     if let Some(summary) = summary {
         items.push(InputItem::text(Role::User, format!("{SUMMARY_INTRO}\n\n{}", summary.content)));
+    }
+    // A story opened by a character's greeting starts with the user too.
+    if summary.is_none() && kept.iter().chain(after).find(|m| !m.failed && !m.compaction).is_some_and(|m| m.role != Role::User) {
+        items.push(InputItem::text(Role::User, STORY_BEGINS));
     }
     for message in kept.iter().chain(after).filter(|m| !m.failed) {
         if message.compaction {
@@ -614,6 +691,10 @@ impl Chat {
 
     /// Applies one streamed update.
     pub fn stream_event(&mut self, conversation: u64, stream: u64, event: StreamEvent) {
+        if self.is_impersonation(conversation, stream) {
+            self.impersonated(event);
+            return;
+        }
         let Some(conversation) = Self::stream_target(&mut self.conversations, conversation, stream) else {
             return;
         };
@@ -681,6 +762,9 @@ impl Chat {
     /// Finishes a stream: saves the reply, retries, or shows why it failed.
     /// Returns `true` if the server rejected our token.
     pub fn stream_end(&mut self, conversation: u64, stream: u64, result: Result<bool, Error>, actions: &mut Vec<Action>) -> bool {
+        if self.is_impersonation(conversation, stream) {
+            return self.impersonation_ended(&result);
+        }
         let unauthorized = result.as_ref().is_err_and(Error::is_unauthorized);
         let id = conversation;
         let note_id = self.next_id();
@@ -851,8 +935,12 @@ impl Chat {
         }
     }
 
-    /// Stops the current conversation's stream and retry, keeping partial output.
+    /// Stops the current conversation's stream and retry, keeping partial
+    /// output, and the AI writing the user's message.
     pub(super) fn stop(&mut self, actions: &mut Vec<Action>) {
+        if self.impersonating() {
+            self.stop_impersonating();
+        }
         let conversation = self.current();
         let mut stopped = conversation.retry.take().is_some();
         if let Some(stream) = conversation.stream.take() {
@@ -919,7 +1007,7 @@ impl Chat {
     /// Whether anything streams, which animates the screen.
     #[must_use]
     pub fn is_busy(&self) -> bool {
-        self.conversations.iter().any(|c| c.stream.is_some())
+        self.impersonation.is_some() || self.conversations.iter().any(|c| c.stream.is_some())
     }
 }
 
@@ -937,26 +1025,57 @@ mod tests {
             ..CastMember::default()
         };
         assert_eq!(story_prompt(None, None, &[]), PLAIN_CHAT);
-        let alone = story_prompt(Some(("Panem", "Twelve districts.")), None, &[]);
+        let alone = story_prompt(Some(("Panem", "Twelve districts.", &[])), None, &[]);
         assert!(alone.starts_with(ROLEPLAY) && alone.ends_with("# World: Panem\n\nTwelve districts."));
-        let gale = Player { name: "Gale".into(), aliases: vec!["Hunter".into()], description: "A hunter.".into() };
+        let gale = Player { name: "Gale".into(), aliases: vec!["Hunter".into()], description: "A hunter.".into(), ..Player::default() };
         let cast = [member("Katniss", "A hunter.", true), member("Rue", " ", true), member("Peeta", "A baker.", false)];
-        let full = story_prompt(Some(("Panem", "")), Some(&gale), &cast);
+        let full = story_prompt(Some(("Panem", "", &[])), Some(&gale), &cast);
         assert!(full.contains("# The user's character: Gale\n\n(Formerly called Hunter; they are the same person.)\n\nA hunter."));
         assert!(full.contains(&format!("# Cast\n\n{CAST}\n\n## Katniss\n\nA hunter.\n\n## Rue\n\n{UNDESCRIBED}\n\n## Peeta\n\nA baker.")));
         // Who is here, the scene and memories change every turn: never in the prompt.
         let moved = [member("Katniss", "A hunter.", false), member("Rue", " ", true), member("Peeta", "A baker.", true)];
-        assert_eq!(story_prompt(Some(("Panem", "")), Some(&gale), &moved), full, "the prompt stays cacheable");
+        assert_eq!(story_prompt(Some(("Panem", "", &[])), Some(&gale), &moved), full, "the prompt stays cacheable");
+    }
+
+    #[test]
+    fn cards_examples_and_lore_reach_the_model() {
+        let entry = |keys: &[&str], content: &str, constant| LoreEntry { keys: keys.iter().map(|k| (*k).to_owned()).collect(), content: content.into(), constant };
+        let world_lore = [entry(&[], "Magic is rare.", true), entry(&["Lantern"], "The Lantern is {{user}}'s inn.", false)];
+        let mira = CastMember {
+            name: "Mira".into(),
+            description: "{{char}} runs a bar; she likes {{user}}.".into(),
+            examples: "<START>\n{{user}}: Hi.\n{{char}}: *nods*\n<START>\n{{char}}: Again?".into(),
+            lore: vec![entry(&["ale"], "{{char}} brews her own ale.", false)],
+            present: true,
+            ..CastMember::default()
+        };
+        let gale = Player { name: "Gale".into(), ..Player::default() };
+        let prompt = story_prompt(Some(("Ard", "", &world_lore)), Some(&gale), std::slice::from_ref(&mira));
+        assert!(prompt.contains("## Mira\n\nMira runs a bar; she likes Gale."), "{prompt}");
+        assert!(prompt.contains(&format!("### How Mira talks\n\n{EXAMPLES}\n\nGale: Hi.\nMira: *nods*\nMira: Again?")));
+        assert!(prompt.ends_with(&format!("# Lore\n\n{LORE_ALWAYS}\n\nMagic is rare.")), "only constant lore in the prompt");
+
+        let found = lore_in_play(&world_lore, std::slice::from_ref(&mira), "Gale: Two ALES at the lantern, please.", "Gale");
+        assert_eq!(found, ["The Lantern is Gale's inn.", "Mira brews her own ale."]);
+        assert!(lore_in_play(&world_lore, &[], "Nothing here.", "Gale").is_empty());
+        let state = story_state(&[], &found, &[], "", "");
+        assert!(state.contains(&format!("# Lore\n\n{LORE}\n\nThe Lantern is Gale's inn.")));
+
+        // A story opened by a greeting starts with the user, for providers that need it.
+        let greeting = super::tools::greeting("Mira", "Hello.");
+        let items = input_items(&[greeting, StoredMessage::new(Role::User, "Hi.".into())]);
+        assert!(matches!(&items[0], InputItem::Message { role: Role::User, text } if text == STORY_BEGINS));
+        assert!(matches!(&items[1], InputItem::ToolCall(_)));
     }
 
     #[test]
     fn the_story_state_rides_on_the_latest_message() {
         let member = |name: &str, present: bool| CastMember { name: name.into(), present, ..CastMember::default() };
-        let nobody = story_state(&[member("Peeta", false)], &[], "", "");
+        let nobody = story_state(&[member("Peeta", false)], &[], &[], "", "");
         assert!(nobody.starts_with(STATE) && nobody.contains(NOBODY_HERE) && nobody.ends_with(&format!("{ELSEWHERE} Peeta")));
         assert!(nobody.contains("Not set yet"), "the model is asked to set the scene");
         let memories = ["Peeta saved Katniss.".to_owned(), "Rue is hurt.".to_owned()];
-        let full = story_state(&[member("Katniss", true), member("Rue", true)], &memories, " The woods. ", " Keep it short. ");
+        let full = story_state(&[member("Katniss", true), member("Rue", true)], &[], &memories, " The woods. ", " Keep it short. ");
         let expected = format!(
             "# The scene\n\nThe woods.\n\n# In the scene\n\nKatniss, Rue\n\n# Memories\n\n{MEMORIES}\n\n- Peeta saved Katniss.\n- Rue is hurt.\n\n# Author's note\n\n{NOTE}\n\nKeep it short."
         );

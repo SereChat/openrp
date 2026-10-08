@@ -1733,6 +1733,7 @@ dependencies = [
 name = "serechat"
 version = "0.1.0"
 dependencies = [
+ "ring",
  "serde",
  "serde_json",
  "ureq",

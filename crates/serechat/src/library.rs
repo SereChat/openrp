@@ -1,10 +1,16 @@
-//! Worlds and characters, saved as one JSON file each in
-//! `~/.openrp/worlds/` and `~/.openrp/characters/`, and their portraits in
-//! `~/.openrp/portraits/`.
+//! Worlds, characters and personas, saved as one JSON file each in
+//! `~/.openrp/worlds/`, `~/.openrp/characters/` and `~/.openrp/personas/`, and
+//! their portraits in `~/.openrp/portraits/`.
 //!
 //! A world is a setting to play in (say, Panem or a galaxy far away); a
-//! character is someone the model plays and the user talks to. There are few
+//! character is someone the model plays and the user talks to; a persona is
+//! someone the user plays, kept to start stories as. There are few
 //! of them and they are small, so listing reads every file; no index.
+//!
+//! Both can hold lore: [`LoreEntry`]s the model reads only while the story
+//! mentions one of their keys (or always, when constant), so a large setting
+//! costs context only where it matters. Characters also carry what character
+//! cards do (see `card.rs`): greetings that open a story and example dialogue.
 //!
 //! Portraits are the app's own copies of PNG or JPEG files, named
 //! `<id>.png` / `<id>.jpg`, and shared: a story's cast copies them from the
@@ -46,6 +52,19 @@ pub struct World {
     /// File name of its portrait in [`Portraits`]; empty for none.
     #[serde(skip_serializing_if = "String::is_empty")]
     pub portrait: String,
+    /// The user's own note to tell it apart (say, which version of a card
+    /// it is): never sent to the model, nor written into an exported card.
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub comment: String,
+    /// Labels to find it by, as the user typed them.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub tags: Vec<String>,
+    /// Starred: listed first.
+    #[serde(skip_serializing_if = "is_false")]
+    pub favorite: bool,
+    /// Places, factions, history: read by the model when the story mentions them.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub lore: Vec<LoreEntry>,
     /// Creation time, seconds since the Unix epoch.
     pub created: u64,
     /// Last edit, seconds since the Unix epoch.
@@ -67,13 +86,65 @@ pub struct Character {
     /// File name of their portrait in [`Portraits`]; empty for none.
     #[serde(skip_serializing_if = "String::is_empty")]
     pub portrait: String,
+    /// The user's own note to tell it apart (say, which version of a card
+    /// it is): never sent to the model, nor written into an exported card.
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub comment: String,
+    /// What they say to open a story they are cast in: the first, or
+    /// another swiped to. `{{user}}` and `{{char}}` stand for the user's
+    /// character and theirs.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub greetings: Vec<String>,
+    /// Example dialogue showing how they talk, for the model.
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub examples: String,
+    /// Labels to find them by, as the user typed them.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub tags: Vec<String>,
+    /// Starred: listed first.
+    #[serde(skip_serializing_if = "is_false")]
+    pub favorite: bool,
+    /// What they know about: read by the model when the story mentions it.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub lore: Vec<LoreEntry>,
     /// Creation time, seconds since the Unix epoch.
     pub created: u64,
     /// Last edit, seconds since the Unix epoch.
     pub updated: u64,
 }
 
-impl World {
+/// Someone the user plays, kept to start stories as.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Persona {
+    /// The format version that wrote the file, as for [`World::version`].
+    pub version: u32,
+    /// Identifier, also the file name without `.json`.
+    pub id: String,
+    /// Their name.
+    pub name: String,
+    /// Who they are, for the model.
+    pub description: String,
+    /// File name of their portrait in [`Portraits`]; empty for none.
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub portrait: String,
+    /// The user's own note to tell it apart (say, which version of a card
+    /// it is): never sent to the model, nor written into an exported card.
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub comment: String,
+    /// Labels to find them by, as the user typed them.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub tags: Vec<String>,
+    /// Starred: listed first, and filled in when a story asks who the user is.
+    #[serde(skip_serializing_if = "is_false")]
+    pub favorite: bool,
+    /// Creation time, seconds since the Unix epoch.
+    pub created: u64,
+    /// Last edit, seconds since the Unix epoch.
+    pub updated: u64,
+}
+
+impl Persona {
     /// The format this version of the app writes.
     pub const VERSION: u32 = 1;
 
@@ -84,9 +155,74 @@ impl World {
     }
 }
 
+/// A piece of lore: background the model reads only while the latest turns
+/// mention one of its keys, or always when it is constant.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct LoreEntry {
+    /// Words or names that bring it in, matched as whole words in any case
+    /// (with a plural ending).
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub keys: Vec<String>,
+    /// What the model reads.
+    pub content: String,
+    /// Always read, whatever is said.
+    #[serde(skip_serializing_if = "is_false")]
+    pub constant: bool,
+}
+
+impl LoreEntry {
+    /// Whether `text` (already lower-cased) mentions one of the keys as a
+    /// whole word. Keys in scripts without spaces between words (Chinese,
+    /// Japanese) match anywhere.
+    ///
+    /// ponytail: keys are plain words: SillyTavern's `/regex/` keys and
+    /// secondary keys are read as words or dropped. Add them if imported
+    /// books need them.
+    #[must_use]
+    pub fn mentioned_in(&self, text: &str) -> bool {
+        self.keys.iter().any(|key| {
+            let key = key.trim().to_lowercase();
+            !key.is_empty() && text.match_indices(key.as_str()).any(|(at, _)| whole_word(text, at, at + key.len()))
+        })
+    }
+}
+
+/// Whether `text[start..end]` stands alone: no letter or digit runs into an
+/// ASCII letter or digit at its edges, except a plural ending (`s`, `es`,
+/// `'s`) after it.
+fn whole_word(text: &str, start: usize, end: usize) -> bool {
+    let (word, joined) = (|c: char| c.is_ascii_alphanumeric(), |s: &str| s.chars().next().is_some_and(char::is_alphanumeric));
+    let found = &text[start..end];
+    if found.chars().next().is_some_and(word) && text[..start].chars().next_back().is_some_and(char::is_alphanumeric) {
+        return false;
+    }
+    let after = &text[end..];
+    !found.chars().next_back().is_some_and(word) || ["", "s", "es", "'s"].iter().any(|ending| after.strip_prefix(ending).is_some_and(|rest| !joined(rest)))
+}
+
+/// For `skip_serializing_if`.
+#[expect(clippy::trivially_copy_pass_by_ref, reason = "serde passes a reference")]
+fn is_false(value: &bool) -> bool {
+    !*value
+}
+
+impl World {
+    /// The format this version of the app writes; 2 added tags, the
+    /// favourite star and lore.
+    pub const VERSION: u32 = 2;
+
+    /// Saved by a newer version of the app: show it, but don't save over it.
+    #[must_use]
+    pub fn is_newer(&self) -> bool {
+        self.version > Self::VERSION
+    }
+}
+
 impl Character {
-    /// The format this version of the app writes.
-    pub const VERSION: u32 = 1;
+    /// The format this version of the app writes; 2 added greetings,
+    /// examples, tags, the favourite star and lore.
+    pub const VERSION: u32 = 2;
 
     /// Saved by a newer version of the app: show it, but don't save over it.
     #[must_use]
@@ -116,6 +252,14 @@ impl Library {
     /// [`Error::NoHomeDir`] if the platform reports no home directory.
     pub fn characters() -> Result<Self> {
         Ok(Self::at(Config::dir()?.join("characters")))
+    }
+
+    /// The user's personas in `~/.openrp/personas`.
+    ///
+    /// # Errors
+    /// [`Error::NoHomeDir`] if the platform reports no home directory.
+    pub fn personas() -> Result<Self> {
+        Ok(Self::at(Config::dir()?.join("personas")))
     }
 
     /// A library in an explicit directory (created on first save).
@@ -187,6 +331,11 @@ impl Library {
 /// Largest portrait accepted, in bytes.
 const MAX_PORTRAIT: u64 = 20 << 20;
 
+/// An error for data that is not what it should be, saying why.
+pub(crate) fn invalid(message: &str) -> Error {
+    Error::Io(std::io::Error::new(ErrorKind::InvalidData, message.to_owned()))
+}
+
 /// The portrait images, in one folder.
 #[derive(Debug, Clone)]
 pub struct Portraits {
@@ -223,11 +372,21 @@ impl Portraits {
     /// The file cannot be read, is larger than 20 MB, is not a PNG or JPEG,
     /// or cannot be written.
     pub fn import(&self, source: &Path) -> Result<String> {
-        let invalid = |message: &str| Error::Io(std::io::Error::new(ErrorKind::InvalidData, message.to_owned()));
         if fs::metadata(source)?.len() > MAX_PORTRAIT {
             return Err(invalid("The image is larger than 20 MB."));
         }
-        let bytes = fs::read(source)?;
+        self.add(&fs::read(source)?)
+    }
+
+    /// Saves the PNG or JPEG `bytes` under a fresh name and returns that name.
+    ///
+    /// # Errors
+    /// The image is larger than 20 MB, is not a PNG or JPEG, or cannot be
+    /// written.
+    pub fn add(&self, bytes: &[u8]) -> Result<String> {
+        if bytes.len() as u64 > MAX_PORTRAIT {
+            return Err(invalid("The image is larger than 20 MB."));
+        }
         let ext = if bytes.starts_with(b"\x89PNG\r\n\x1a\n") {
             "png"
         } else if bytes.starts_with(&[0xFF, 0xD8, 0xFF]) {
@@ -236,7 +395,7 @@ impl Portraits {
             return Err(invalid("Only PNG and JPEG images can be portraits."));
         };
         let name = format!("{}.{ext}", crate::session::new_id());
-        write_private(&self.dir.join(&name), &bytes)?;
+        write_private(&self.dir.join(&name), bytes)?;
         Ok(name)
     }
 
@@ -301,6 +460,18 @@ mod tests {
         assert!(!copy.exists() && portraits.path(&kept).unwrap().exists() && foreign.exists());
         assert_eq!(Portraits::at(dir.join("missing")).collect_garbage(&keep, Duration::ZERO).unwrap(), 0);
         fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn lore_is_found_by_whole_words() {
+        let entry = |keys: &[&str]| LoreEntry { keys: keys.iter().map(|k| (*k).to_owned()).collect(), ..LoreEntry::default() };
+        let text = "the dragons of valyria. a cat's toy, 龍が来た.";
+        assert!(entry(&["Dragon"]).mentioned_in(text), "plural, any case");
+        assert!(entry(&["valyria"]).mentioned_in(text) && entry(&["cat"]).mentioned_in(text));
+        assert!(!entry(&["drag"]).mentioned_in(text) && !entry(&["ria"]).mentioned_in(text), "not inside a word");
+        assert!(entry(&["龍"]).mentioned_in(text), "scripts without spaces match anywhere");
+        assert!(!entry(&["", "  "]).mentioned_in(text) && !entry(&[]).mentioned_in(text));
+        assert!(entry(&["toy,"]).mentioned_in(text), "punctuation in a key");
     }
 
     #[test]

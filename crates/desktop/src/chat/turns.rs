@@ -118,6 +118,17 @@ impl Conversation {
         let message = &self.entries[prompt].message;
         Some((prompt, message.swipe.min(message.swipes.len()), message.swipes.len() + 1))
     }
+
+    /// The greeting opening the story and the others it can be swiped to:
+    /// (the one shown, from 0, and how many), while nobody wrote yet.
+    pub(super) fn greetings(&self) -> Option<(usize, usize)> {
+        if self.entries.iter().any(|e| e.message.role == Role::User) {
+            return None;
+        }
+        let first = &self.entries.first()?.message;
+        let whole = first.role == Role::Assistant && !first.swipes.is_empty() && first.swipes.iter().all(|s| s.len() == 1);
+        whole.then(|| (first.swipe.min(first.swipes.len()), first.swipes.len() + 1))
+    }
 }
 
 /// Whether `replies` showed the user anything worth swiping back to.
@@ -285,6 +296,28 @@ impl Chat {
         }
         actions.push(Action::SaveSession(conversation.to_session()));
         self.next_id += added;
+        self.selection = None;
+        self.turn_edit = None;
+    }
+
+    /// Shows greeting `target` (from 0) in place of the one opening the
+    /// story, before anyone wrote. Saves the story.
+    pub(super) fn swipe_greeting(&mut self, target: usize, actions: &mut Vec<Action>) {
+        let id = self.next_id();
+        let conversation = self.current();
+        let Some((shown, count)) = conversation.greetings() else { return };
+        if !conversation.settled() || target >= count || target == shown {
+            return;
+        }
+        let mut current = conversation.entries.remove(0).message;
+        let mut all = std::mem::take(&mut current.swipes);
+        current.swipe = 0;
+        all.insert(shown, vec![current]);
+        // Each holds one message (see `greetings`).
+        let mut chosen = all.remove(target).swap_remove(0);
+        (chosen.swipes, chosen.swipe) = (all, target);
+        conversation.entries.insert(0, Entry::new(id, chosen));
+        actions.push(Action::SaveSession(conversation.to_session()));
         self.selection = None;
         self.turn_edit = None;
     }

@@ -303,6 +303,17 @@ pub fn transcript(messages: &[StoredMessage], player: &str, limit: usize) -> Str
     }
 }
 
+/// A greeting that opens a story: `character` saying `text`, as a reply
+/// whose speak call already ran.
+#[must_use]
+pub fn greeting(character: &str, text: &str) -> StoredMessage {
+    let arguments = json!({ "scene": "", "introduce": [], "messages": [{ "character": character, "action": "", "text": text }] }).to_string();
+    let call = ToolCall { call_id: format!("call_{}", new_id()), name: SPEAK.to_owned(), arguments };
+    let mut message = StoredMessage::new(Role::Assistant, String::new());
+    message.tool_calls.push(ToolResult { call, output: "Spoken.".to_owned() });
+    message
+}
+
 /// The (name, description) a generator call made, if it made someone.
 #[must_use]
 pub fn generated(call: &ToolCall) -> Option<(String, String)> {

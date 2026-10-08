@@ -1,5 +1,6 @@
 //! The composer: the text field (with input-method preedit), the toolbar
-//! with model, reasoning and send, and the slash commands it completes.
+//! with model, reasoning, Write for me (the AI writes the user's message;
+//! see `impersonate.rs`) and send, and the slash commands it completes.
 
 use winit::window::CursorIcon;
 
@@ -30,10 +31,12 @@ pub(super) enum Command {
     Duplicate,
     /// Copies the story's setup without what happened.
     Frame,
+    /// Has the AI write the user's next message.
+    Impersonate,
 }
 
 impl Command {
-    const ALL: [Self; 7] = [Self::Ooc, Self::Note, Self::Memory, Self::Memorize, Self::Duplicate, Self::Frame, Self::Clear];
+    const ALL: [Self; 8] = [Self::Ooc, Self::Impersonate, Self::Note, Self::Memory, Self::Memorize, Self::Duplicate, Self::Frame, Self::Clear];
 
     /// What follows the slash.
     pub(super) fn name(self) -> &'static str {
@@ -45,6 +48,7 @@ impl Command {
             Self::Memorize => "memorize",
             Self::Duplicate => "duplicate",
             Self::Frame => "frame",
+            Self::Impersonate => "impersonate",
         }
     }
 
@@ -58,6 +62,7 @@ impl Command {
             Self::Memorize => "Add the latest turns to the memories",
             Self::Duplicate => "Copy this story exactly",
             Self::Frame => "New story with this cast and setup",
+            Self::Impersonate => "The AI writes your next message",
         }
     }
 
@@ -176,6 +181,33 @@ impl Chat {
         let busy = self.current().busy();
         let ready = !self.composer.text().trim().is_empty();
         let send = Rect::new(card.right() - 8.0 - 26.0, item_y, 26.0, 26.0);
+
+        // Write for me: the AI writes the user's message, from their draft.
+        let writing = self.impersonating();
+        if writing || self.can_impersonate() {
+            let label = if writing { "Writing…" } else { "Write for me" };
+            let text = p.layout(label, theme::SMALL, None);
+            let rect = Rect::new(send.x - 8.0 - text.width() - 20.0, item_y, text.width() + 20.0, 26.0);
+            // Only where the toolbar has room for it.
+            if rect.x > reasoning.right() + 8.0 {
+                let hovered = ui.hovered(rect);
+                let hover = ui.anim(id("impersonate"), f32::from(u8::from(hovered)));
+                p.rect(rect, fade(t.hover, hover), theme::RADIUS_SM);
+                let color = if writing {
+                    ui.animating = true;
+                    mix(t.text_faint, t.text, ((ui.time * 2.6).sin() * 0.5 + 0.5) * 0.75)
+                } else {
+                    mix(t.text_muted, t.text, hover)
+                };
+                p.text(&text, rect.x + 10.0, item_y + (26.0 - text.height()) * 0.5, color);
+                if hovered {
+                    ui.cursor = CursorIcon::Pointer;
+                    if ui.clicked(rect) {
+                        self.impersonate(actions);
+                    }
+                }
+            }
+        }
         let hovered = ui.hovered(send) && (busy || ready);
         let hover = ui.anim(id("send"), f32::from(u8::from(hovered)));
         if busy {
@@ -234,6 +266,7 @@ mod tests {
     fn commands_complete_a_bare_slash_word() {
         assert_eq!(Command::matching("/").len(), Command::ALL.len());
         assert_eq!(Command::matching("/d"), [Command::Duplicate]);
+        assert_eq!(Command::matching("/im"), [Command::Impersonate]);
         assert_eq!(Command::matching("/cl"), [Command::Clear]);
         assert_eq!(Command::matching("/clear"), [Command::Clear]);
         assert!(Command::matching("/clearer").is_empty());

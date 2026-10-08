@@ -1,4 +1,4 @@
-//! The sidebar: worlds and characters, every saved session, and settings.
+//! The sidebar: worlds, characters and personas, every saved session, and settings.
 
 use serechat::unix_now;
 use winit::window::CursorIcon;
@@ -24,7 +24,7 @@ impl Chat {
 
         let on_chat = self.page == Page::Chat;
         let mut row_y = top + 40.0;
-        for kind in [Kind::World, Kind::Character] {
+        for kind in Kind::ALL {
             let row = Rect::new(8.0, row_y, area.w - 16.0, 30.0);
             row_y += 32.0;
             let page = Page::Library(kind);

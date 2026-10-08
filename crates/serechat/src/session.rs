@@ -25,6 +25,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::config::{Config, write_private};
 use crate::error::{Error, Result};
+use crate::library::LoreEntry;
 use crate::responses::{Role, Usage};
 
 /// Name of the index file. The leading dot keeps it out of session scans,
@@ -99,6 +100,13 @@ pub struct CastMember {
     /// Portrait file name in [`Portraits`](crate::Portraits); empty for none.
     #[serde(skip_serializing_if = "String::is_empty")]
     pub portrait: String,
+    /// Example dialogue showing how they talk, from their library character.
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub examples: String,
+    /// What they know about, from their library character: read by the
+    /// model when the story mentions it.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub lore: Vec<LoreEntry>,
     /// In the current scene; absent characters belong to the story but are
     /// elsewhere.
     pub present: bool,
@@ -115,6 +123,9 @@ pub struct Player {
     pub aliases: Vec<String>,
     /// Who they are, for the model.
     pub description: String,
+    /// Portrait file name in [`Portraits`](crate::Portraits); empty for none.
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub portrait: String,
 }
 
 /// Renames someone known by `name` (and `aliases`) to `new_name`, keeping
@@ -144,8 +155,9 @@ pub struct ToolResult {
 }
 
 impl Session {
-    /// The format this version of the app writes.
-    pub const VERSION: u32 = 1;
+    /// The format this version of the app writes; 2 added cast members'
+    /// examples and lore, greetings swiped between and the player's portrait.
+    pub const VERSION: u32 = 2;
 
     /// Total spent on this session in USD, the replies swiped away included.
     #[must_use]
@@ -248,9 +260,11 @@ pub struct StoredMessage {
     pub kept: usize,
     /// For a prompt: the other replies it got, each a run of messages as
     /// they followed it, oldest first; the one shown follows the prompt.
+    /// For a story's greeting (a reply before any prompt): the other
+    /// greetings, one message each.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub swipes: Vec<Vec<StoredMessage>>,
-    /// For a prompt with `swipes`: where the reply shown sits among them.
+    /// For a message with `swipes`: where the one shown sits among them.
     #[serde(default, skip_serializing_if = "is_default")]
     pub swipe: usize,
     /// What a reply's tool calls changed in its story, so deleting or
