@@ -96,7 +96,7 @@ cargo clippy --workspace --all-targets
   that character from the reply). Replies edited by earlier versions, saved as text, are read
   back into bubbles. **Regenerate** sends the last prompt again and keeps the reply it had:
   **‹ 2/3 ›** on the last turn switches between every reply its prompt got. **Delete** removes
-  the prompt and its replies, on a second click. Each reply records what it changed in the
+  the prompt and its replies. Each reply records what it changed in the
   story (who joined, moved or was renamed, the scene, memories), so regenerating, swiping or
   deleting the last turn rewinds that too (and swiping to a reply makes its changes again),
   except what you changed yourself since. Deleting an earlier turn only removes its messages.
@@ -139,7 +139,7 @@ cargo clippy --workspace --all-targets
   character's next message, streaming it into the composer to edit and send, or not. What you
   typed first is its starting point. Clicking again or Esc stops it. It reads the story as a
   reply would (so the provider's cache serves it) and is billed with the next reply.
-- **Duplicate, export and delete**: a session's ⋯ in the sidebar deletes it (on a second click),
+- **Duplicate, export and delete**: a session's ⋯ in the sidebar deletes it,
   or (like `/duplicate` and `/frame`) copies it exactly, with every message, memory and the
   scene (replies are not billed twice), or as a **frame**: the world, your character, the cast
   and the author's note, ready for a new story. **Export as text** saves a readable transcript;

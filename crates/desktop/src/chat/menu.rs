@@ -10,7 +10,7 @@
 //! Long lists (characters, worlds, personas, models) are searched: typing
 //! while one is open narrows it (names first, then comments and tags), the
 //! arrows move through what is left and Enter picks; Esc clears the search,
-//! then closes. Deleting from a menu takes a second click on the same row.
+//! then closes.
 
 use arboard::Clipboard;
 use winit::event::KeyEvent;
@@ -81,11 +81,6 @@ impl Chat {
     /// buttons, the composer card and the cast strip's add button or open
     /// member's dots.
     fn menu_content(&mut self, menu: Menu, anchors: [Rect; 4]) -> Content {
-        let confirming = self.confirming == Some(menu);
-        // The row that deletes, while it waits for its second click.
-        let delete_row = |label: &str, detail: &str| {
-            if confirming { MenuItem::new("Click again to delete", "Can't be undone") } else { MenuItem::new(label, detail) }
-        };
         let content = |anchor, width, below, header: (&str, &str), items| Content {
             anchor,
             width,
@@ -128,10 +123,7 @@ impl Chat {
             }
             Menu::Member(index) => {
                 let title = self.current().cast.get(index).map(|m| m.name.clone()).unwrap_or_default();
-                let mut items = self.member_menu(index);
-                if let Some(row) = items.get_mut(2) {
-                    *row = delete_row("Delete", "From this story");
-                }
+                let items = self.member_menu(index);
                 content(anchors[3], 260.0, true, (&title, ""), items)
             }
             Menu::Session(_) => {
@@ -140,7 +132,7 @@ impl Chat {
                     MenuItem::new("Duplicate frame", "Cast and setup only"),
                     MenuItem::new("Export as text", "Readable transcript"),
                     MenuItem::new("Export as JSONL", "SillyTavern chat"),
-                    delete_row("Delete", ""),
+                    MenuItem::new("Delete", ""),
                 ];
                 content(self.session_menu, 280.0, true, ("Session", ""), items)
             }
@@ -154,9 +146,9 @@ impl Chat {
                         FormAction::Duplicate => MenuItem::new("Duplicate", "Saves this first"),
                         FormAction::Export => MenuItem::new("Export card…", "PNG or JSON"),
                         FormAction::Delete => match stories {
-                            0 => delete_row("Delete", ""),
-                            1 => delete_row("Delete", "With its story"),
-                            n => delete_row("Delete", &format!("With its {n} stories")),
+                            0 => MenuItem::new("Delete", ""),
+                            1 => MenuItem::new("Delete", "With its story"),
+                            n => MenuItem::new("Delete", &format!("With its {n} stories")),
                         },
                     })
                     .collect();
@@ -193,7 +185,7 @@ impl Chat {
     /// [`Chat::menu_content`].
     pub(super) fn draw_open_menu(&mut self, p: &mut Painter, ui: &mut Ui, anchors: [Rect; 4], actions: &mut Vec<Action>) {
         let Some(menu) = self.menu else {
-            (self.menu_rect, self.confirming, self.menu_seen) = (None, None, None);
+            (self.menu_rect, self.menu_seen) = (None, None);
             return;
         };
         // A menu opens with nothing searched.
@@ -202,14 +194,11 @@ impl Chat {
             self.menu_query.take();
             (self.menu_pick, self.menu_keyed) = (0, false);
         }
-        if self.confirming.is_some_and(|m| m != menu) {
-            self.confirming = None;
-        }
         let content = self.menu_content(menu, anchors);
         let rows = if menu.searchable() { search(&content.items, self.menu_query.text()) } else { (0..content.items.len()).collect() };
         if let Some(row) = self.draw_menu(p, ui, &content, &rows, menu.searchable()) {
             ui.released = false;
-            self.choose(menu, rows[row], content.items.len(), actions);
+            self.choose(menu, rows[row], actions);
             return;
         }
         let inside = self.menu_rect.is_some_and(|r| r.contains(ui.press_pos)) || content.anchor.contains(ui.press_pos);
@@ -233,7 +222,7 @@ impl Chat {
                 let content = self.menu_content(menu, [Rect::default(); 4]);
                 let rows = search(&content.items, self.menu_query.text());
                 if let Some(&index) = rows.get(self.menu_pick) {
-                    self.choose(menu, index, content.items.len(), actions);
+                    self.choose(menu, index, actions);
                 }
             }
             Key::Named(key @ (NamedKey::ArrowUp | NamedKey::ArrowDown)) => {
@@ -260,16 +249,9 @@ impl Chat {
         true
     }
 
-    /// Picks row `index` of `menu`, one of `count` rows (before searching).
-    fn choose(&mut self, menu: Menu, index: usize, count: usize, actions: &mut Vec<Action>) {
-        // Deleting asks for a second click on the row: always the last.
-        let deletes = index + 1 == count && matches!(menu, Menu::Session(_) | Menu::Member(_) | Menu::Record);
-        if deletes && self.confirming != Some(menu) {
-            self.confirming = Some(menu);
-            return;
-        }
+    /// Picks row `index` of `menu` (before searching).
+    fn choose(&mut self, menu: Menu, index: usize, actions: &mut Vec<Action>) {
         self.menu = None;
-        self.confirming = None;
         match menu {
             Menu::Model => {
                 if let Some(model) = self.models.get(index) {
@@ -462,7 +444,7 @@ mod tests {
         assert_eq!(rows.len(), 1);
         assert_eq!(content.items[rows[0]].detail, "barkeep v2, darker", "the comment tells the two apart");
         let mut actions = Vec::new();
-        chat.choose(Menu::CastLibrary, rows[0], content.items.len(), &mut actions);
+        chat.choose(Menu::CastLibrary, rows[0], &mut actions);
         assert!(chat.current().cast.iter().any(|m| m.id == "b"), "the one searched for joins");
         assert!(chat.menu == Some(Menu::CastLibrary), "and the menu stays open for more");
     }

@@ -560,9 +560,6 @@ pub struct Chat {
     /// Where the open menu was drawn last frame; blocks hover beneath it.
     menu_rect: Option<Rect>,
     menu_scroll: f32,
-    /// A destructive row of the open menu was clicked once and asks for a
-    /// second click.
-    confirming: Option<Menu>,
     /// Where the settings page's background model button was drawn.
     utility_anchor: Rect,
     /// Problems to tell the user about, newest last.
@@ -592,9 +589,6 @@ pub struct Chat {
     character_form: Option<dialog::CharacterForm>,
     /// Replies being edited, in one conversation.
     turn_edit: Option<turns::TurnEdit>,
-    /// The entry whose turn's Delete was clicked once and waits for a
-    /// second click.
-    turn_confirm: Option<u64>,
     /// A session to copy or export once it is read.
     pending: Option<(u64, Pending)>,
     /// Where the sidebar row whose session menu is open was drawn.
@@ -648,7 +642,6 @@ impl Chat {
             menu: None,
             menu_rect: None,
             menu_scroll: 0.0,
-            confirming: None,
             utility_anchor: Rect::default(),
             notices: Vec::new(),
             notices_rect: None,
@@ -665,7 +658,6 @@ impl Chat {
             library: LibraryView::default(),
             character_form: None,
             turn_edit: None,
-            turn_confirm: None,
             pending: None,
             session_menu: Rect::default(),
             menu_anchor: Rect::default(),

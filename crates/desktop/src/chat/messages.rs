@@ -248,7 +248,6 @@ impl Chat {
         // Or, before anyone wrote, the greetings the story can open with.
         let swipes = conversation.swipes().map(|(_, shown, count)| (shown, count)).or_else(|| conversation.greetings()).filter(|(_, count)| *count > 1);
         let greeting = conversation.greetings().is_some();
-        let confirm_delete = self.turn_confirm;
         let player = conversation.player.clone();
 
         // Measure everything (layouts are cached) to know the scroll range.
@@ -338,13 +337,7 @@ impl Chat {
                 edit: editable[index],
                 regen: turn.end == entry_count && regen_ok,
                 swipes: swipes.filter(|_| turn.end == entry_count),
-                confirm_delete: confirm_delete == Some(entry.id),
             });
-            // A Delete waiting for its second click gives up once the turn
-            // is left.
-            if confirm_delete == Some(entry.id) && actions_for.is_none() {
-                effects.unconfirm = true;
-            }
             let sel = |doc: u8, d: &Doc| selected_range(selection, index, doc, d);
             if editing.is_some() {
                 let mut top = area.y;
@@ -386,7 +379,7 @@ impl Chat {
                     targets.push(Target { entry: index, doc: 1, origin, rect: Rect::new(origin.0, origin.1, width, doc.height) });
                 }
                 if let Some(buttons) = &actions_for {
-                    let clicked = turn_buttons(p, ui, area.right(), boxed.bottom() + 6.0, buttons).map(|c| (c, index, entry.id));
+                    let clicked = turn_buttons(p, ui, area.right(), boxed.bottom() + 6.0, buttons).map(|c| (c, index));
                     effects.turn = effects.turn.take().or(clicked);
                 }
                 continue;
@@ -546,7 +539,7 @@ impl Chat {
             // The turn's actions, left of Copy (which keeps its place).
             if let Some(buttons) = &actions_for {
                 let right = area.right() - if has_copy { 76.0 } else { 0.0 };
-                effects.turn = effects.turn.take().or(turn_buttons(p, ui, right, meta_y, buttons).map(|c| (c, index, entry.id)));
+                effects.turn = effects.turn.take().or(turn_buttons(p, ui, right, meta_y, buttons).map(|c| (c, index)));
             }
         }
         if let Some(status) = &retry {
@@ -626,23 +619,12 @@ impl Chat {
         if effects.resume {
             self.resume(current, actions);
         }
-        if effects.unconfirm {
-            self.turn_confirm = None;
-        }
         match effects.turn {
-            Some((TurnClick::Edit, index, _)) => self.edit_turn(index),
+            Some((TurnClick::Edit, index)) => self.edit_turn(index),
             Some((TurnClick::Regen, ..)) => self.regenerate(actions),
             Some((TurnClick::Swipe(target), ..)) if greeting => self.swipe_greeting(target, actions),
             Some((TurnClick::Swipe(target), ..)) => self.swipe_to(target, actions),
-            // Deleting takes a second click.
-            Some((TurnClick::Delete, index, id)) => {
-                if self.turn_confirm == Some(id) {
-                    self.turn_confirm = None;
-                    self.delete_turn(index, actions);
-                } else {
-                    self.turn_confirm = Some(id);
-                }
-            }
+            Some((TurnClick::Delete, index)) => self.delete_turn(index, actions),
             None => {}
         }
         if effects.save_edit {
@@ -685,11 +667,8 @@ struct Effects {
     link: Option<String>,
     /// The Continue button was clicked.
     resume: bool,
-    /// A turn's button: what, an entry of the turn and the id of the entry
-    /// the buttons are under.
-    turn: Option<(TurnClick, usize, u64)>,
-    /// A Delete waiting for its second click lost its turn's hover.
-    unconfirm: bool,
+    /// A turn's button: what, and an entry of the turn.
+    turn: Option<(TurnClick, usize)>,
     /// The edited replies' Save or Cancel was clicked.
     save_edit: bool,
     cancel_edit: bool,
@@ -704,8 +683,6 @@ struct TurnButtons {
     /// The last turn's replies (or the greetings) to swipe between:
     /// (shown, how many).
     swipes: Option<(usize, usize)>,
-    /// Delete was clicked once and waits for a second click.
-    confirm_delete: bool,
 }
 
 /// A turn button that was clicked.
@@ -723,9 +700,8 @@ enum TurnClick {
 fn turn_buttons(p: &mut Painter, ui: &mut Ui, right: f32, y: f32, buttons: &TurnButtons) -> Option<TurnClick> {
     let mut right = right;
     let mut clicked = None;
-    let delete = if buttons.confirm_delete { ("Confirm delete", ButtonStyle::Danger, 118.0) } else { ("Delete", ButtonStyle::Ghost, 64.0) };
     let row = [
-        (true, TurnClick::Delete, delete),
+        (true, TurnClick::Delete, ("Delete", ButtonStyle::Ghost, 64.0)),
         (buttons.regen, TurnClick::Regen, ("Regenerate", ButtonStyle::Ghost, 92.0)),
         (buttons.edit, TurnClick::Edit, ("Edit", ButtonStyle::Ghost, 52.0)),
     ];
