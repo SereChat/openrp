@@ -47,6 +47,9 @@ pub struct Config {
     /// The window as last closed, e.g. `1200x800` or `1200x800 maximized`
     /// (logical pixels), interpreted by the app.
     pub window: Option<String>,
+    /// How far the interface is zoomed, in percent (e.g. `120`),
+    /// interpreted by the app; absent means 100.
+    pub zoom: Option<String>,
     /// Lines this build does not understand, kept as they were.
     pub extra: Vec<String>,
 }
@@ -64,6 +67,7 @@ impl std::fmt::Debug for Config {
             .field("reasoning_view", &self.reasoning_view)
             .field("utility_model", &self.utility_model)
             .field("window", &self.window)
+            .field("zoom", &self.zoom)
             .field("extra", &self.extra.len())
             .finish()
     }
@@ -72,7 +76,8 @@ impl std::fmt::Debug for Config {
 /// The keys this build reads; see [`Config`]. `token` held the sign-in
 /// SereChat no longer takes (it now lives in the OS keychain): read so it is
 /// dropped, never written.
-const KEYS: [&str; 10] = ["token", "provider", "base_url", "api_key", "model", "reasoning", "theme", "reasoning_view", "utility_model", "window"];
+const KEYS: [&str; 11] =
+    ["token", "provider", "base_url", "api_key", "model", "reasoning", "theme", "reasoning_view", "utility_model", "window", "zoom"];
 
 impl Config {
     /// Returns `~/.openrp`, the directory holding all local app data.
@@ -161,6 +166,7 @@ impl Config {
                 "reasoning_view" => config.reasoning_view = Some(value),
                 "utility_model" => config.utility_model = Some(value),
                 "window" => config.window = Some(value),
+                "zoom" => config.zoom = Some(value),
                 _ => {}
             }
         }
@@ -182,6 +188,7 @@ impl Config {
             ("reasoning_view", &self.reasoning_view),
             ("utility_model", &self.utility_model),
             ("window", &self.window),
+            ("zoom", &self.zoom),
         ];
         for (key, value) in fields {
             if let Some(value) = value {
@@ -348,6 +355,7 @@ mod tests {
             reasoning_view: Some("expanded".into()),
             utility_model: Some("gemma".into()),
             window: Some("1200x800 maximized".into()),
+            zoom: Some("120".into()),
             extra: Vec::new(),
         };
         assert_eq!(Config::parse(&config.serialize()).unwrap(), config);

@@ -160,6 +160,8 @@ cargo clippy --workspace --all-targets
   spoken to with Chat Completions; the model must support tool calls. Its models list no
   prices, so costs are hidden while it is in use.
 - **The window remembers** its size and whether it was maximized.
+- **Zoom** (Ctrl/Cmd + and -, Ctrl/Cmd+0 resets): everything grows or shrinks, from 50% to 200%,
+  in steps of 10%; kept for the next start.
 - **Problems are shown, not lost**: a story that could not be saved or read, or a model list
   that failed to load (retried by itself), shows as a notice under the header, with the data
   folder a click away. Everything is also logged to `~/.openrp/desktop.log`. A crash writes
@@ -235,8 +237,8 @@ straight to the OS keychain: Credential Manager on Windows, the login keychain o
 Debian and Ubuntu; without it, the sign-in lasts until the app closes). Signing out revokes
 the grant. Everything else lives in `~/.openrp/`:
 
-- `config.toml`: the provider in use and the custom provider's base URL and key, model, background model, reasoning effort and display, colour scheme, and the window's
-  size. Lines a newer version added are kept as they are.
+- `config.toml`: the provider in use and the custom provider's base URL and key, model, background model, reasoning effort and display, colour scheme, the window's
+  size and the zoom. Lines a newer version added are kept as they are.
 - `sessions/<id>.json`: one file per story, with its world, your character, its cast (copies),
   its scene, memories and author's note, each reply's tool calls, and each reply's tokens and cost at the
   prices of the time. `.index.json` next to them holds titles and totals, so startup reads
